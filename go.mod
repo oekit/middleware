@@ -24,10 +24,10 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/yi-nology/ekit-concurrency v0.1.0
-	github.com/yi-nology/ekit-core v0.1.0
-	github.com/yi-nology/ekit-logx v0.1.0
+	github.com/yi-nology/ekit-core v0.2.0
+	github.com/yi-nology/ekit-logx v0.1.1
 	github.com/yi-nology/ekit-metrics v0.1.0
-	github.com/yi-nology/ekit-registry v0.1.0
+	github.com/yi-nology/ekit-registry v0.2.0
 	github.com/yi-nology/ekit-tracing v0.1.0
 	golang.org/x/crypto v0.55.0
 	golang.org/x/time v0.15.0
@@ -88,7 +88,7 @@ require (
 	golang.org/x/sys v0.47.0 // indirect
 	golang.org/x/text v0.41.0 // indirect
 	golang.org/x/tools v0.48.0 // indirect
-	google.golang.org/protobuf v1.36.11 // indirect
+	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
 )
