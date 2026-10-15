@@ -3,6 +3,7 @@
 > Hertz 自研标准中间件栈——Recovery/Response/AccessLog/RateLimit/Auth/I18n + 社区库桥接。
 
 > 项目主页：**https://oekit.github.io/** · 名称由来：**O**pen **E**asy **Kit**（开源 · 易用 · 工具集合）
+> 🤖 AI Agent：本仓规范与硬规则见 [AGENTS.md](AGENTS.md)；机器可读索引见 [llms.txt](https://oekit.github.io/llms.txt)（接口签名以源码为准）。
 
 本仓库是 [ekit](https://git.enjoye.top/enjoydream/ekit)（`git.enjoye.top/enjoydream/ekit` v0.34.0）
 拆分出的独立 Go module，属于 **oekit** oekit（Open Easy Kit）模块矩阵。
@@ -11,6 +12,17 @@
 
 ```bash
 go get github.com/oekit/middleware@v0.1.8
+```
+
+## 快速使用
+
+```go
+import mw "github.com/oekit/middleware/middleware"
+
+// 标准栈：Prometheus → TraceID → Recovery → Response → AccessLog
+for _, m := range mw.DefaultMiddleware(mw.StackConfig{ServiceName: "my-service"}) {
+    h.Use(m)
+}
 ```
 
 ## 包清单
