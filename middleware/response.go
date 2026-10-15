@@ -136,16 +136,17 @@ func ErrorResp(c *app.RequestContext, code int, message string) {
 	c.Abort()
 }
 
-// writeBizError 是 Fail 共享的 BizError 写入逻辑：
+// writeBizError 是 Fail/FailWithData 共享的 BizError 写入逻辑：
 //   - body code 字段使用 BizCode（业务语义）
 //   - HTTP 状态码优先用 HTTPCode；为 0 时经 StatusMapper 从 BizCode 推导（向后兼容）
-func writeBizError(c *app.RequestContext, bizErr *errors.BizError) {
+//   - data 为随错误返回的业务载荷（202 业务态场景；Fail 传 nil）
+func writeBizError(c *app.RequestContext, bizErr *errors.BizError, data any) {
 	httpCode := bizErr.HTTPCode
 	if httpCode == 0 {
 		httpCode = getStatusMapper()(bizErr.BizCode)
 	}
 	c.JSON(httpCode, Response{
-		Code: bizErr.BizCode, Data: nil, Message: bizErr.Message, TraceID: hmw.FromRequestContext(c),
+		Code: bizErr.BizCode, Data: data, Message: bizErr.Message, TraceID: hmw.FromRequestContext(c),
 	})
 	c.Abort()
 }

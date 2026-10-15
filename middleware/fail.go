@@ -44,7 +44,7 @@ func WithNotFoundChecker(checker func(error) bool) FailOption {
 }
 
 // Fail 是 handler 统一错误处理, 跟 fuxi 7 service 'fail()' 同 3-tier 模式:
-//  1. err 是 *ekiterrors.BizError -> writeBizError(c, bizErr) (BizCode 入 body, HTTPCode 决定 HTTP 状态)
+//  1. err 是 *ekiterrors.BizError -> writeBizError(c, bizErr, nil) (BizCode 入 body, HTTPCode 决定 HTTP 状态)
 //  2. err 匹配 NotFoundErrChecker -> ErrorResp(c, 404, "resource not found")
 //  3. err 包装 registry.ErrNoInstances -> ErrorResp(c, 503, "service unavailable")
 //     （依赖服务无可用实例是依赖不可用而非本服务 bug，Warn 级日志避免误告警）
@@ -68,7 +68,7 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 	}
 	var bizErr *ekiterrors.BizError
 	if stderrors.As(err, &bizErr) {
-		writeBizError(c, bizErr)
+		writeBizError(c, bizErr, nil)
 		return
 	}
 	// 发现类错误：上游无可用实例 → 503（依赖不可用语义）
@@ -94,4 +94,29 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 	}
 	failLog.CtxError(ctx, "internal error", "err", err)
 	ErrorResp(c, 500, "internal server error")
+}
+
+// FailWithData 与 Fail 同 3-tier 语义，BizError 路径的响应体额外携带 data：
+// 202 业务态（如激活状态机的 VERIFYING——请求已受理、结果未知）需要按统一封套
+// 返回 BizCode + HTTPCode + message + trace_id，并附会话数据供调用方继续轮询。
+// 非 BizError 路径（not-found / 503 / 500 fallback）与 Fail 完全一致——data 不透传，
+// 内部错误细节不对外暴露。其余约定见 Fail。
+//
+// 用法:
+//
+//	res, bizErr := service.X(ctx)
+//	if bizErr != nil {
+//	    middleware.FailWithData(ctx, c, bizErr, toView(res))
+//	    return
+//	}
+func FailWithData(ctx context.Context, c *app.RequestContext, err error, data any, opts ...FailOption) {
+	if err == nil {
+		return
+	}
+	var bizErr *ekiterrors.BizError
+	if stderrors.As(err, &bizErr) {
+		writeBizError(c, bizErr, data)
+		return
+	}
+	Fail(ctx, c, err, opts...)
 }

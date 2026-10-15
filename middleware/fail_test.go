@@ -171,3 +171,71 @@ func TestFail_NoInstances_503(t *testing.T) {
 		t.Errorf("body: got %q, want contains 'service unavailable'", body)
 	}
 }
+
+// TestFailWithData_BizError 验证 FailWithData BizError 路径：响应体携带 data，
+// HTTP 状态与封套字段（code/message/trace_id）语义与 Fail 完全一致。
+func TestFailWithData_BizError(t *testing.T) {
+	tests := []struct {
+		name     string
+		err      error
+		data     any
+		wantHTTP int
+		wantHas  []string
+	}{
+		{
+			"202 业务态携带会话数据（HTTPCode 显式）",
+			ekiterrors.NewBizErrorWithStatus(20201, 202, "已受理待复核"),
+			map[string]string{"session_id": "s-1"},
+			202,
+			[]string{`"code":20201`, "session_id", "s-1", "已受理待复核"},
+		},
+		{
+			"HTTPCode=0 经 StatusMapper 推导且携带 data",
+			ekiterrors.NewBizError(40001, "invalid argument"),
+			"snapshot",
+			400,
+			[]string{`"code":40001`, "snapshot", "invalid argument"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := &app.RequestContext{}
+			FailWithData(context.Background(), c, tt.err, tt.data)
+			if c.Response.StatusCode() != tt.wantHTTP {
+				t.Errorf("HTTP status: got %d, want %d", c.Response.StatusCode(), tt.wantHTTP)
+			}
+			body := string(c.Response.Body())
+			for _, want := range tt.wantHas {
+				if !strings.Contains(body, want) {
+					t.Errorf("body: got %q, want contains %q", body, want)
+				}
+			}
+		})
+	}
+}
+
+// TestFailWithData_NilError 与 Fail 一致：nil err 不写任何响应。
+func TestFailWithData_NilError(t *testing.T) {
+	c := &app.RequestContext{}
+	FailWithData(context.Background(), c, nil, map[string]string{"k": "v"})
+	if len(c.Response.Body()) != 0 {
+		t.Errorf("nil err 不应写响应，实际 body: %q", string(c.Response.Body()))
+	}
+}
+
+// TestFailWithData_NonBizErrorDropsData 非 BizError 路径与 Fail 完全一致：
+// 500 fallback 不透传 data（内部错误细节不对外暴露）。
+func TestFailWithData_NonBizErrorDropsData(t *testing.T) {
+	c := &app.RequestContext{}
+	FailWithData(context.Background(), c, stderrors.New("boom"), map[string]string{"secret": "s-1"})
+	if c.Response.StatusCode() != 500 {
+		t.Errorf("HTTP status: got %d, want 500", c.Response.StatusCode())
+	}
+	body := string(c.Response.Body())
+	if strings.Contains(body, "s-1") {
+		t.Errorf("内部错误不得透传 data，实际 body: %q", body)
+	}
+	if !strings.Contains(body, "internal server error") {
+		t.Errorf("body: got %q, want contains 'internal server error'", body)
+	}
+}
