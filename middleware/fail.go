@@ -19,7 +19,7 @@ type NotFoundErrChecker func(err error) bool
 
 var notFoundChecker atomic.Pointer[NotFoundErrChecker]
 
-// failLog 带 component 属性的 scoped logger（PLATFORM_CONTRACT §3：
+// failLog 带 component 属性的 scoped logger（平台契约 §3：
 // SDK 组件日志以 component 标识来源；此前直接用包级 logx 无 component）。
 var failLog = logx.Delegating("middleware-fail")
 
