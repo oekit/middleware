@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/middleware
 
 > 自研标准中间件栈（包名 mw：Recovery/Response/AccessLog/RateLimit/Auth/I18n/Fail）+ contrib 桥接 + hmw
-> 当前版本：`v0.1.8` · module：`github.com/oekit/middleware` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.2.0` · module：`github.com/oekit/middleware` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `contrib/`、`hmw/`、`middleware/`、`middleware/contrib/`、`middleware/traceid/hmw/`

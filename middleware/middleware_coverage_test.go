@@ -119,22 +119,20 @@ func TestDefaultMiddleware_EmptyConfig(t *testing.T) {
 	if len(stack) == 0 {
 		t.Fatal("expected non-empty middleware stack")
 	}
-	// Should contain Prometheus + TraceID(s) + Recovery + Response + AccessLog = 6
+	// Should contain TraceID(s) + Recovery + Response + AccessLog = 5
 	// （v0.28.1 起 Recovery 纳入标准栈：引擎无默认 PanicHandler，无 Recovery
-	// 的 handler panic 直接断连）
-	if len(stack) != 6 {
-		t.Errorf("expected 6 middlewares, got %d", len(stack))
+	// 的 handler panic 直接断连；v0.2.0 起 Prometheus 从默认栈拆出）
+	if len(stack) != 5 {
+		t.Errorf("expected 5 middlewares, got %d", len(stack))
 	}
 }
 
 func TestDefaultMiddleware_FullConfig(t *testing.T) {
 	stack := DefaultMiddleware(StackConfig{
-		ServiceName: "svc",
-		Namespace:   "ns",
-		SkipPaths:   []string{"/healthz"},
+		SkipPaths: []string{"/healthz"},
 	})
-	if len(stack) != 6 {
-		t.Errorf("expected 6 middlewares, got %d", len(stack))
+	if len(stack) != 5 {
+		t.Errorf("expected 5 middlewares, got %d", len(stack))
 	}
 }
 

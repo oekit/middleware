@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/oekit/metrics"
+
 	prom "github.com/prometheus/client_golang/prometheus"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -25,7 +27,8 @@ type PrometheusConfig struct {
 	SkipPaths []string
 
 	// Registry 是自定义的 Prometheus 注册器。
-	// 传入 nil 则使用 prom.DefaultRegisterer（默认全局 Registry）。
+	// 传入 nil 则使用 ekit 统一注册表 metrics.Registry（/metrics 端点默认
+	// 暴露的就是它）；需要隔离时可显式传入其他 Registerer。
 	Registry prom.Registerer
 
 	// Buckets 自定义 Histogram 的桶边界。
@@ -88,7 +91,10 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 
 	reg := cfg.Registry
 	if reg == nil {
-		reg = prom.DefaultRegisterer
+		// 缺省使用 ekit 统一注册表：/metrics 端点（hertz/metrics）默认暴露的
+		// 就是它。此前缺省 prom.DefaultRegisterer 会导致标准组装下
+		// HTTP 指标无人暴露。
+		reg = metrics.Registry
 	}
 
 	buckets := cfg.Buckets

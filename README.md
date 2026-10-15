@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/middleware@v0.1.9
+go get github.com/oekit/middleware@v0.2.0
 ```
 
 ## 这个仓库做什么
@@ -20,7 +20,7 @@ go get github.com/oekit/middleware@v0.1.9
 
 | 包 | 做什么 |
 |---|---|
-| `middleware`（包名 `mw`） | `DefaultMiddleware` 一键标准栈：Prometheus → TraceID → Recovery → Response → AccessLog；另有 RateLimit/BearerTokenAuth/I18n/Fail 等 |
+| `middleware`（包名 `mw`） | `DefaultMiddleware` 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制）；另有 Prometheus 指标/RateLimit/BearerTokenAuth/I18n/Fail 等 |
 | `contrib` | hertz-contrib 桥接：JWT/Sessions/Swagger/CSRF/pprof/Debug/Gzip/ETag/BasicAuth/ReverseProxy/Sentinel/Lark |
 | `hmw` | requestid/trace_id 注入 RequestContext |
 
@@ -29,10 +29,14 @@ go get github.com/oekit/middleware@v0.1.9
 ```go
 import mw "github.com/oekit/middleware/middleware"
 
-// 标准栈一键注册（顺序已调好）
-for _, m := range mw.DefaultMiddleware(mw.StackConfig{ServiceName: "my-service"}) {
+// 标准栈一键注册（顺序已调好，零指标强制）
+for _, m := range mw.DefaultMiddleware(mw.StackConfig{SkipPaths: []string{"/healthz"}}) {
     h.Use(m)
 }
+
+// 需要 HTTP 指标时显式拼在栈最前（Registry 缺省 nil = ekit 统一注册表）
+pm := mw.NewPrometheusMetrics(mw.PrometheusConfig{Namespace: "myapp", ServiceName: "my-service"})
+h.Use(pm.Middleware())
 ```
 
 ### 统一错误出口

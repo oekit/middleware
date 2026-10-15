@@ -7,11 +7,11 @@
 //
 // # 组件总览
 //
-//   - DefaultMiddleware  — 一键标准栈（Prometheus → TraceID → Recovery → Response → AccessLog）
+//   - DefaultMiddleware  — 一键标准栈（TraceID → Recovery → Response → AccessLog，零指标强制）
 //   - ResponseMiddleware — 统一 JSON 响应格式 {code, data, message, trace_id}
 //   - traceid/hmw.Middleware — trace_id 生成/透传（middleware/traceid/hmw 子包）
 //   - AccessLogMiddleware — 请求访问日志（method, path, status, latency, ip）
-//   - PrometheusMetrics  — Prometheus HTTP 指标采集（请求数 / 延迟 / 并发 / 体积）
+//   - PrometheusMetrics  — Prometheus HTTP 指标采集（请求数 / 延迟 / 并发 / 体积；显式拼装）
 //   - RecoveryMiddleware — panic recovery（可选 SentryReporter 监控钩子）
 //   - RateLimitMiddleware — 令牌桶限流（默认按 RemoteAddr 分键）
 //   - BearerTokenAuth   — Bearer Token 认证（Authorizer 鉴权钩子）
@@ -23,9 +23,21 @@
 // 在 main.go 中注册中间件（推荐用 DefaultMiddleware 一键注册，或手动按顺序）：
 //
 //	h := server.Default(...)
-//	stack := mw.DefaultMiddleware(mw.StackConfig{ServiceName: "svc"})
-//	for _, m := range stack { h.Use(m) }
-//	// 顺序: Prometheus → TraceID → Recovery → Response → AccessLog
+//	for _, m := range mw.DefaultMiddleware(mw.StackConfig{SkipPaths: []string{"/healthz"}}) {
+//	    h.Use(m)
+//	}
+//	// 顺序: TraceID → Recovery → Response → AccessLog
+//
+// 需要 HTTP 指标时显式拼在栈最前（v0.2.0 起 Prometheus 从默认栈拆出）：
+//
+//	metrics.Init("my-service")
+//	pm := mw.NewPrometheusMetrics(mw.PrometheusConfig{
+//	    Namespace: "myapp",
+//	    SkipPaths: []string{"/metrics", "/ping"},
+//	    Registry:  metrics.Registry,
+//	})
+//	h.Use(pm.Middleware())
+//	r.GET("/metrics", hertz.MetricsHandler())  // 暴露 /metrics 端点
 //
 // # CORS 与安全响应头
 //
@@ -52,17 +64,6 @@
 //	    secure.WithContentTypeNosniff(true),
 //	    secure.WithReferrerPolicy("no-referrer"),
 //	))
-//
-// 如需 Prometheus 指标：
-//
-//	metrics.Init("my-service")
-//	pm := mw.NewPrometheusMetrics(mw.PrometheusConfig{
-//	    Namespace: "myapp",
-//	    SkipPaths: []string{"/metrics", "/ping"},
-//	    Registry:  metrics.Registry,
-//	})
-//	h.Use(pm.Middleware())
-//	r.GET("/metrics", hertz.MetricsHandler())  // 暴露 /metrics 端点
 //
 // 如需请求体/响应体大小指标：
 //
