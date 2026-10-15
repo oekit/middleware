@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	bizerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/middleware/hmw"
+	bizerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/tracing/traceid"
 
 	"github.com/cloudwego/hertz/pkg/app"
