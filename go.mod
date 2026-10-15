@@ -21,16 +21,18 @@ require (
 	github.com/hertz-contrib/reverseproxy v1.0.6
 	github.com/hertz-contrib/sessions v1.0.1
 	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
-	github.com/oekit/concurrency v0.1.3
-	github.com/oekit/logx v0.1.6
-	github.com/oekit/metrics v0.1.4
-	github.com/oekit/registry v0.2.5
+	github.com/oekit/concurrency v0.1.5
+	github.com/oekit/logx v0.1.9
+	github.com/oekit/metrics v0.1.5
+	github.com/oekit/registry v0.2.6
 	github.com/oekit/tracing v0.1.5
-	github.com/prometheus/client_golang v1.24.1
+	github.com/prometheus/client_golang v1.23.2
 	github.com/swaggo/http-swagger v1.3.4
-	golang.org/x/crypto v0.57.0
-	golang.org/x/time v0.15.0
+	golang.org/x/crypto v0.55.0
+	golang.org/x/time v0.14.0
 )
+
+require go.yaml.in/yaml/v2 v2.4.3 // indirect
 
 require (
 	github.com/KyleBanks/depth v1.2.1 // indirect
@@ -66,12 +68,12 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/mailru/easyjson v0.7.6 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/oekit/core v0.3.2 // indirect
-	github.com/oekit/pkg v0.1.1
+	github.com/oekit/core v0.3.3 // indirect
+	github.com/oekit/pkg v0.1.3
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
-	github.com/prometheus/common v0.70.1 // indirect
-	github.com/prometheus/procfs v0.21.1 // indirect
+	github.com/prometheus/common v0.67.5 // indirect
+	github.com/prometheus/procfs v0.19.2 // indirect
 	github.com/savsgio/gotils v0.0.0-20220530130905-52f3993e8d6d // indirect
 	github.com/shirou/gopsutil/v3 v3.21.6 // indirect
 	github.com/stretchr/objx v0.5.3 // indirect
@@ -85,10 +87,10 @@ require (
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
 	golang.org/x/arch v0.14.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
-	golang.org/x/sync v0.23.0 // indirect
-	golang.org/x/sys v0.48.0 // indirect
-	golang.org/x/text v0.42.0 // indirect
-	golang.org/x/tools v0.49.0 // indirect
+	golang.org/x/sync v0.22.0 // indirect
+	golang.org/x/sys v0.47.0 // indirect
+	golang.org/x/text v0.41.0 // indirect
+	golang.org/x/tools v0.48.0 // indirect
 	google.golang.org/protobuf v1.36.12 // indirect
 	gopkg.in/natefinch/lumberjack.v2 v2.2.1 // indirect
 	gopkg.in/yaml.v2 v2.4.0 // indirect
