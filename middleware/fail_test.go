@@ -8,7 +8,7 @@ import (
 	"testing"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	ekiterrors "github.com/oekit/errors"
+	ekiterrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/registry/registry"
 )
 

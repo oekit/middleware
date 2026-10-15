@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	bizerrors "github.com/oekit/errors"
+	bizerrors "github.com/oekit/pkg/errors"
 	"github.com/oekit/middleware/hmw"
 	"github.com/oekit/tracing/traceid"
 

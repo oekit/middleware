@@ -22,10 +22,8 @@ require (
 	github.com/hertz-contrib/sessions v1.0.1
 	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
 	github.com/oekit/concurrency v0.1.3
-	github.com/oekit/errors v0.1.2
 	github.com/oekit/logx v0.1.6
 	github.com/oekit/metrics v0.1.4
-	github.com/oekit/pathx v0.1.2
 	github.com/oekit/registry v0.2.5
 	github.com/oekit/tracing v0.1.5
 	github.com/prometheus/client_golang v1.24.1
@@ -69,6 +67,7 @@ require (
 	github.com/mailru/easyjson v0.7.6 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/oekit/core v0.3.2 // indirect
+	github.com/oekit/pkg v0.1.0
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect

@@ -8,7 +8,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/oekit/errors"
+	"github.com/oekit/pkg/errors"
 	"github.com/oekit/middleware/hmw"
 )
 

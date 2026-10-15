@@ -6,7 +6,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/oekit/logx"
-	"github.com/oekit/pathx"
+	"github.com/oekit/pkg/pathx"
 )
 
 // AccessLogOptions 是访问日志中间件的配置。
