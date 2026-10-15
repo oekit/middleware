@@ -19,7 +19,7 @@ require (
 	github.com/hertz-contrib/pprof v0.1.2
 	github.com/hertz-contrib/requestid v1.1.0
 	github.com/hertz-contrib/reverseproxy v1.0.6
-	github.com/hertz-contrib/sessions v1.0.1
+	github.com/hertz-contrib/sessions v1.0.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.1
 	github.com/oekit/concurrency v0.1.5
 	github.com/oekit/logx v0.1.9
@@ -57,9 +57,9 @@ require (
 	github.com/go-openapi/swag v0.19.15 // indirect
 	github.com/go-redis/redis/v8 v8.11.5 // indirect
 	github.com/google/pprof v0.0.0-20240727154555-813a5fbdbec8 // indirect
-	github.com/gorilla/context v1.1.1 // indirect
-	github.com/gorilla/securecookie v1.1.1 // indirect
-	github.com/gorilla/sessions v1.2.1 // indirect
+	github.com/gorilla/context v1.1.2 // indirect
+	github.com/gorilla/securecookie v1.1.2 // indirect
+	github.com/gorilla/sessions v1.2.2 // indirect
 	github.com/gorilla/websocket v1.5.3 // indirect
 	github.com/hertz-contrib/websocket v0.0.1 // indirect
 	github.com/jellydator/ttlcache/v2 v2.11.1 // indirect
