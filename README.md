@@ -10,7 +10,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/middleware@v0.1.4
+go get github.com/oekit/middleware@v0.1.8
 ```
 
 ## 包清单
