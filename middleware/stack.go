@@ -1,8 +1,8 @@
 package mw
 
 import (
-	"github.com/yi-nology/ekit-metrics"
-	"github.com/yi-nology/ekit-middleware/hmw"
+	"github.com/oekit/metrics"
+	"github.com/oekit/middleware/hmw"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/prometheus/client_golang/prometheus"

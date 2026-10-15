@@ -10,7 +10,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/route"
 	hertzcontribpprof "github.com/hertz-contrib/pprof"
 
-	"github.com/yi-nology/ekit-logx"
+	"github.com/oekit/logx"
 )
 
 // debugLog 是 debug 端点组件专用 logger(空 token 等配置告警)。

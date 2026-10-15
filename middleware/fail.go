@@ -6,9 +6,9 @@ import (
 	"sync/atomic"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	ekiterrors "github.com/yi-nology/ekit-errors"
-	"github.com/yi-nology/ekit-logx"
-	"github.com/yi-nology/ekit-registry/registry"
+	ekiterrors "github.com/oekit/errors"
+	"github.com/oekit/logx"
+	"github.com/oekit/registry/registry"
 )
 
 // NotFoundErrChecker 是可注入的"资源未找到"错误检查函数。

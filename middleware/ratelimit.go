@@ -5,7 +5,7 @@ import (
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	"github.com/yi-nology/ekit-concurrency/ratelimit"
+	"github.com/oekit/concurrency/ratelimit"
 	"golang.org/x/time/rate"
 )
 

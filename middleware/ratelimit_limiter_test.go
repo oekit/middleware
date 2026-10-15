@@ -8,7 +8,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/common/test/assert"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/yi-nology/ekit-concurrency/ratelimit"
+	"github.com/oekit/concurrency/ratelimit"
 	"golang.org/x/time/rate"
 )
 

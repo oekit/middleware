@@ -15,7 +15,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/google/uuid"
 	"github.com/hertz-contrib/requestid"
-	"github.com/yi-nology/ekit-tracing/traceid"
+	"github.com/oekit/tracing/traceid"
 )
 
 // FromRequestContext 从 Hertz RequestContext 中提取 trace_id。

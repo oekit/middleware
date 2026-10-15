@@ -9,7 +9,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 
-	"github.com/yi-nology/ekit-logx"
+	"github.com/oekit/logx"
 )
 
 // i18nLog 是 i18n 组件专用 loader 告警 logger。

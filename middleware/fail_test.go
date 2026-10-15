@@ -8,8 +8,8 @@ import (
 	"testing"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	ekiterrors "github.com/yi-nology/ekit-errors"
-	"github.com/yi-nology/ekit-registry/registry"
+	ekiterrors "github.com/oekit/errors"
+	"github.com/oekit/registry/registry"
 )
 
 // TestFail_BizError 验证 Fail 函数 3-tier 第 1 层: BizError 提取.

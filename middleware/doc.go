@@ -35,7 +35,7 @@
 //	import (
 //	    "github.com/hertz-contrib/cors"
 //	    "github.com/hertz-contrib/secure"
-//	    contrib "github.com/yi-nology/ekit-middleware/contrib"
+//	    contrib "github.com/oekit/middleware/contrib"
 //	)
 //
 //	// CORS（如需前端直连）

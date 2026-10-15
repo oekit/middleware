@@ -28,7 +28,7 @@ import (
 //	import (
 //	    _ "github.com/go-project-name/docs" // 4a. import 生成的 docs 包
 //	    httpSwagger "github.com/swaggo/http-swagger"
-//	    mw "github.com/yi-nology/ekit-middleware/middleware"
+//	    mw "github.com/oekit/middleware/middleware"
 //	    "github.com/swaggo/files"
 //	)
 //

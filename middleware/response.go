@@ -8,8 +8,8 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/yi-nology/ekit-errors"
-	"github.com/yi-nology/ekit-middleware/hmw"
+	"github.com/oekit/errors"
+	"github.com/oekit/middleware/hmw"
 )
 
 // Response 是所有 HTTP API 的统一响应结构。

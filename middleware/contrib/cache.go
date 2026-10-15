@@ -2,7 +2,7 @@ package contrib
 
 import (
 	"context"
-	logx "github.com/yi-nology/ekit-logx"
+	logx "github.com/oekit/logx"
 	"net/http"
 	"sync"
 	"time"

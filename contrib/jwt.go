@@ -9,7 +9,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/golang-jwt/jwt/v4"
 	jwthertz "github.com/hertz-contrib/jwt"
-	"github.com/yi-nology/ekit-logx"
+	"github.com/oekit/logx"
 )
 
 const (

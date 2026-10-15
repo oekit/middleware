@@ -25,7 +25,7 @@ type SessionOptions = hertzcontribsessions.Options
 // 用法:
 //
 //	import "github.com/hertz-contrib/sessions/cookie"
-//	import contrib "github.com/yi-nology/ekit-middleware/contrib"
+//	import contrib "github.com/oekit/middleware/contrib"
 //
 //	store := cookie.NewStore([]byte("secret"))
 //	h.Use(contrib.Sessions("mysession", store))

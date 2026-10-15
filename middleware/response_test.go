@@ -6,9 +6,9 @@ import (
 	"testing"
 	"time"
 
-	bizerrors "github.com/yi-nology/ekit-errors"
-	"github.com/yi-nology/ekit-middleware/hmw"
-	"github.com/yi-nology/ekit-tracing/traceid"
+	bizerrors "github.com/oekit/errors"
+	"github.com/oekit/middleware/hmw"
+	"github.com/oekit/tracing/traceid"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/common/test/assert"

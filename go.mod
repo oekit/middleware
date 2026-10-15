@@ -1,4 +1,4 @@
-module github.com/yi-nology/ekit-middleware
+module github.com/oekit/middleware
 
 go 1.26.0
 
@@ -21,15 +21,15 @@ require (
 	github.com/hertz-contrib/reverseproxy v1.0.6
 	github.com/hertz-contrib/sessions v1.0.1
 	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
+	github.com/oekit/concurrency v0.1.3
+	github.com/oekit/errors v0.1.2
+	github.com/oekit/logx v0.1.6
+	github.com/oekit/metrics v0.1.4
+	github.com/oekit/pathx v0.1.2
+	github.com/oekit/registry v0.2.5
+	github.com/oekit/tracing v0.1.5
 	github.com/prometheus/client_golang v1.24.1
 	github.com/swaggo/http-swagger v1.3.4
-	github.com/yi-nology/ekit-concurrency v0.1.1
-	github.com/yi-nology/ekit-errors v0.1.0
-	github.com/yi-nology/ekit-logx v0.1.4
-	github.com/yi-nology/ekit-metrics v0.1.2
-	github.com/yi-nology/ekit-pathx v0.1.0
-	github.com/yi-nology/ekit-registry v0.2.2
-	github.com/yi-nology/ekit-tracing v0.1.2
 	golang.org/x/crypto v0.55.0
 	golang.org/x/time v0.15.0
 )
@@ -68,6 +68,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/mailru/easyjson v0.7.6 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
+	github.com/oekit/core v0.3.2 // indirect
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.2 // indirect
 	github.com/prometheus/common v0.70.1 // indirect
@@ -83,7 +84,6 @@ require (
 	github.com/tklauser/go-sysconf v0.3.6 // indirect
 	github.com/tklauser/numcpus v0.2.2 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
-	github.com/yi-nology/ekit-core v0.3.0 // indirect
 	golang.org/x/arch v0.14.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
