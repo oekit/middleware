@@ -14,17 +14,34 @@
 go get github.com/oekit/middleware@v0.1.8
 ```
 
-## 快速使用
+## 能做什么
 
+- **标准栈一键注册**：Prometheus → TraceID → Recovery → Response → AccessLog
+- **Fail 统一出口**：BizError 映射 HTTP 码，500 自动结构化日志
+- **限流/认证**：令牌桶（RemoteAddr key）、Bearer Token、可插拔 Authorizer
+- **contrib 桥接**：JWT/Sessions/Swagger/CSRF/pprof/Debug/Gzip/ETag/BasicAuth/Lark/Sentinel/AutoTLS/ReverseProxy
+- **governance**：动态限流/超时中间件（配 oekit/core 的治理 schema）
+
+## 使用示例
+
+### 一键标准栈
 ```go
 import mw "github.com/oekit/middleware/middleware"
 
-// 标准栈：Prometheus → TraceID → Recovery → Response → AccessLog
-for _, m := range mw.DefaultMiddleware(mw.StackConfig{ServiceName: "my-service"}) {
+for _, m := range mw.DefaultMiddleware(mw.StackConfig{
+    ServiceName: "my-service",
+    Namespace:   "order", // 指标前缀
+    SkipPaths:   []string{"/healthz"},
+}) {
     h.Use(m)
 }
 ```
+### 统一错误出口
+```go
+mw.Fail(ctx, c, err) // BizError→对应码；ErrNotFound→404；ErrNoInstances→503；兜底 500
+```
 
+> ⚠️ **v0.28.1 起**：Recovery 已入标准栈（引擎无默认 PanicHandler，裸奔会断连）；限流默认 key 为 RemoteAddr（hertz 默认信任任意 XFF 可被伪造）。
 ## 包清单
 
 - \`middleware/\` — 标准栈：RecoveryMiddleware/ResponseMiddleware/AccessLogMiddleware/RateLimitMiddleware/BearerTokenAuth/Prometheus/I18n/Fail（DefaultMiddleware 一键注册）
