@@ -20,7 +20,7 @@ require (
 	github.com/hertz-contrib/requestid v1.1.0
 	github.com/hertz-contrib/reverseproxy v1.0.6
 	github.com/hertz-contrib/sessions v1.0.1
-	github.com/larksuite/oapi-sdk-go/v3 v3.11.0
+	github.com/larksuite/oapi-sdk-go/v3 v3.12.1
 	github.com/prometheus/client_golang v1.24.1
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/yi-nology/ekit-concurrency v0.1.1
