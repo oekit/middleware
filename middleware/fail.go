@@ -6,7 +6,7 @@ import (
 	"sync/atomic"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	ekiterrors "github.com/yi-nology/ekit-core/pkg/errors"
+	ekiterrors "github.com/yi-nology/ekit-errors"
 	"github.com/yi-nology/ekit-logx"
 	"github.com/yi-nology/ekit-registry/registry"
 )

@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	"github.com/yi-nology/ekit-core/pkg/pathx"
 	"github.com/yi-nology/ekit-logx"
+	"github.com/yi-nology/ekit-pathx"
 )
 
 // AccessLogOptions 是访问日志中间件的配置。

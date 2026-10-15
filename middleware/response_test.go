@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	bizerrors "github.com/yi-nology/ekit-core/pkg/errors"
+	bizerrors "github.com/yi-nology/ekit-errors"
 	"github.com/yi-nology/ekit-middleware/hmw"
 	"github.com/yi-nology/ekit-tracing/traceid"
 

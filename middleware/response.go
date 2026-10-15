@@ -8,7 +8,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
-	"github.com/yi-nology/ekit-core/pkg/errors"
+	"github.com/yi-nology/ekit-errors"
 	"github.com/yi-nology/ekit-middleware/hmw"
 )
 

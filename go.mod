@@ -24,11 +24,12 @@ require (
 	github.com/prometheus/client_golang v1.24.1
 	github.com/swaggo/http-swagger v1.3.4
 	github.com/yi-nology/ekit-concurrency v0.1.0
-	github.com/yi-nology/ekit-core v0.2.0
+	github.com/yi-nology/ekit-errors v0.1.0
 	github.com/yi-nology/ekit-logx v0.1.1
-	github.com/yi-nology/ekit-metrics v0.1.0
-	github.com/yi-nology/ekit-registry v0.2.0
-	github.com/yi-nology/ekit-tracing v0.1.0
+	github.com/yi-nology/ekit-metrics v0.1.1
+	github.com/yi-nology/ekit-pathx v0.1.0
+	github.com/yi-nology/ekit-registry v0.2.2
+	github.com/yi-nology/ekit-tracing v0.1.1
 	golang.org/x/crypto v0.55.0
 	golang.org/x/time v0.15.0
 )
@@ -82,6 +83,7 @@ require (
 	github.com/tklauser/go-sysconf v0.3.6 // indirect
 	github.com/tklauser/numcpus v0.2.2 // indirect
 	github.com/twitchyliquid64/golang-asm v0.15.1 // indirect
+	github.com/yi-nology/ekit-core v0.3.0 // indirect
 	golang.org/x/arch v0.14.0 // indirect
 	golang.org/x/net v0.58.0 // indirect
 	golang.org/x/sync v0.22.0 // indirect
