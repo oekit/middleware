@@ -29,7 +29,7 @@ require (
 	github.com/prometheus/client_golang v1.23.2
 	github.com/swaggo/http-swagger v1.3.4
 	golang.org/x/crypto v0.55.0
-	golang.org/x/time v0.14.0
+	golang.org/x/time v0.16.0
 )
 
 require go.yaml.in/yaml/v2 v2.4.3 // indirect
