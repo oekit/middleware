@@ -2,6 +2,21 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.6.0] — 2026-10-17
+
+- **fix(ratelimit)**：默认 KeyFunc 去端口——`RemoteAddr().String()` 含端口，
+  限流桶按 TCP 连接而非按客户端：直连场景客户端新建连接即新桶（绕过限流），
+  代理场景全体折叠进网关连接（[#13](https://github.com/oekit/middleware/issues/13)）。
+  保留直连地址语义（防伪造 XFF 造无限桶）不变；代理拓扑按真实客户端 IP
+  限流仍走 `engine.SetClientIPFunc` + 自定义 `KeyFunc`（godoc 已写明）
+- **feat(accesslog)**：新增 `WithAccessLogRedactPathPrefixes`——「URL 路径即
+  凭证」的路由（webhook/{token} 类）命中前缀后日志只记前缀、其余替换为
+  `/ ***`，token 不再落日志；SkipPaths 判定不受脱敏影响
+  （[#12](https://github.com/oekit/middleware/issues/12)）
+- docs(hmw)：README 明确 `MinimalMiddleware`（TraceID → Recovery）为最小
+  安全栈——hertz 无默认 PanicHandler，只挂非 Recovery 栈的消费方 handler
+  panic 即进程崩溃（[#10](https://github.com/oekit/middleware/issues/10)）
+
 ## [v0.5.0] — 2026-10-17
 
 仓库结构重置后的首个版本（历史与旧版本号 v0.1.0–v0.4.0 已清空重做，从 v0.5.0 起算）。

@@ -2,6 +2,7 @@ package mw
 
 import (
 	"context"
+	"net"
 	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -131,10 +132,21 @@ func newRateLimitHandler(keyed *ratelimit.KeyedLimiter, keyFunc func(c *app.Requ
 	}
 }
 
-// defaultIPKey 用直连地址而非 ClientIP：hertz 默认信任任意网段的
+// defaultIPKey 用直连地址（去端口）而非 ClientIP：hertz 默认信任任意网段的
 // X-Forwarded-For，攻击者每请求换一个伪造 XFF 即可让 ClientIP key 生成
-// 无限个新桶（限流形同虚设）。需要按真实客户端 IP 限流的业务应先通过
+// 无限个新桶（限流形同虚设）。去端口则消除「客户端新建连接即新桶」的绕过
+// 面——同一源地址的所有连接共享一个桶（[#13](https://github.com/oekit/middleware/issues/13)）。
+// 代理拓扑（RemoteAddr=上游网关地址）下按真实客户端 IP 限流：先通过
 // engine.SetClientIPFunc 配置可信网段，再注入自定义 KeyFunc。
 func defaultIPKey(c *app.RequestContext) string {
-	return c.RemoteAddr().String()
+	return hostOnly(c.RemoteAddr().String())
+}
+
+// hostOnly 从 "host:port" 拆出 host；无端口地址（unix socket/零值）原样返回。
+func hostOnly(addr string) string {
+	host, _, err := net.SplitHostPort(addr)
+	if err != nil {
+		return addr
+	}
+	return host
 }
