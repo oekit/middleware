@@ -2,6 +2,10 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.6.2] — 2026-10-17
+
+- pkg 地板 v0.11.0；concurrency 地板 v0.5.4
+
 ## [v0.6.1] — 2026-10-17
 
 - fix(deps): pkg 地板 v0.9.3 → v0.10.0（拆分版，零代码改动）；concurrency 地板 v0.5.2 → v0.5.3
