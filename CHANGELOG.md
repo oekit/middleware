@@ -2,6 +2,15 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
+## [v0.7.0] — 2026-10-17
+
+### Added（go-kratos 对齐）
+- `chainmw` 新子包：transport 感知的框架无关中间件（基于 core/chain + core/transport）——
+  `AccessLog`（Kind/Operation/耗时/错误，经 transport 上下文）、`MetadataPropagate`（req→resp
+  header 透传）。一份实现可经 hertz/kitex 桥接跨协议复用；与根包 mw（Hertz 栈）互补
+### Changed
+- 依赖升级：registry v0.4.0（SPI 包提升至模块根）、core v0.7.0
+
 ## [v0.6.2] — 2026-10-17
 
 - pkg 地板 v0.11.0；concurrency 地板 v0.5.4

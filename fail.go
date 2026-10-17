@@ -8,7 +8,7 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/oekit/logx"
 	ekiterrors "github.com/oekit/pkg/errors"
-	"github.com/oekit/registry/registry"
+	"github.com/oekit/registry"
 )
 
 // NotFoundErrChecker 是可注入的"资源未找到"错误检查函数。

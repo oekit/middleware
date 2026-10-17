@@ -24,7 +24,7 @@ require (
 	github.com/oekit/concurrency v0.5.4
 	github.com/oekit/logx v0.5.0
 	github.com/oekit/metrics v0.1.6
-	github.com/oekit/registry v0.3.1
+	github.com/oekit/registry v0.4.0
 	github.com/oekit/tracing v0.2.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/swaggo/http-swagger v1.3.4
@@ -75,7 +75,7 @@ require (
 	github.com/jellydator/ttlcache/v2 v2.11.1 // indirect
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
-	github.com/oekit/core v0.6.0 // indirect
+	github.com/oekit/core v0.7.0
 	github.com/oekit/pkg v0.11.0
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
