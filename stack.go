@@ -8,7 +8,9 @@ import (
 
 // StackConfig 是中间件栈配置。
 type StackConfig struct {
-	// SkipPaths 是不需要记录日志的路径（如 /healthz、/metrics）。
+	// SkipPaths 是跳过标准栈处理的路径（如 /metrics、/healthz、OpenAPI）——
+	// v0.8.0 起贯通 AccessLog 与 Response（原实现只作用于 AccessLog，
+	// 导致 /metrics 被包成 {"code":0,...} 信封，Prometheus 解析失败）。
 	SkipPaths []string
 }
 
@@ -46,7 +48,10 @@ func DefaultMiddleware(cfg StackConfig) []app.HandlerFunc {
 	stack = append(stack, hmw.Middleware()...)
 	stack = append(stack,
 		RecoveryMiddleware(),
-		ResponseMiddleware(),
+		// SkipPaths 贯通全栈（#15）：/metrics、健康探针、OpenAPI 等
+		// 不能被 {"code":0,...} 信封包裹的端点，一键栈即可正确服务——
+		// Response 命中跳过路径时整请求不包装（原实现只喂给 AccessLog）
+		ResponseMiddleware(WithSkipPaths(cfg.SkipPaths...)),
 		AccessLogMiddleware(WithAccessLogSkipPaths(cfg.SkipPaths...)),
 	)
 	return stack

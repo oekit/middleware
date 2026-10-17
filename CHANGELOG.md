@@ -2,7 +2,8 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [- fix(deps): metrics vv0.1.7、tracing vv0.2.2 地板对齐（零代码改动）
+## [- fix(mw): `StackConfig.SkipPaths` 贯通 ResponseMiddleware（#15）——原实现只喂给 AccessLog，「一键标准栈」把 /metrics 包成 {"code":0,...} 信封导致 Prometheus 解析失败；SkipPaths 语义更新为「跳过标准栈处理的路径」（引擎级功能测试钉住）
+- fix(deps): metrics vv0.1.7、tracing vv0.2.2 地板对齐（零代码改动）
 
 ## [- fix(deps): logx 地板 v0.5.0 → v0.6.0、registry 地板 v0.4.0 → v0.4.1（零代码改动）
 
