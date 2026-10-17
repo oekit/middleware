@@ -311,6 +311,8 @@ func hasCodeField(body []byte) bool {
 
 // skipWrapCtxKey 是包装豁免标记的 RequestContext kv 键（首选机制，
 // 不落响应头、外部不可见）。SkipResponseWrap 置位，ResponseMiddleware 读取。
+//
+//nolint:gosec // G101 误报：这是 RequestContext kv 的键名常量，非凭证
 const skipWrapCtxKey = "oekit_skip_response_wrap"
 
 // skipResponseWrapHeader 是包装豁免标记的兼容响应头（kv 的次级兼容层）。
