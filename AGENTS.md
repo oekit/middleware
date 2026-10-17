@@ -1,12 +1,10 @@
 # AGENTS.md — oekit/middleware
 
-> 自研标准中间件栈（包名 mw：Recovery/Response/AccessLog/RateLimit/Shedding/Auth/I18n/Fail）+ contrib 桥接 + hmw
-> 当前版本：`v0.5.0` · module：`github.com/oekit/middleware` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> Hertz 自研标准中间件栈 + contrib 桥接 + hmw + SheddingMiddleware 自适应降载
+> 当前版本：`v0.6.0` · module：`github.com/oekit/middleware` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
-- `mw`（模块根包，import `github.com/oekit/middleware`）— 自研标准中间件栈
-- `contrib/` — hertz-contrib 社区库桥接
-- `hmw/` — trace_id 注入（正典实现）
+`./`、`contrib/`、`hmw/`
 
 ## 硬规则速览（全矩阵适用）
 
@@ -31,14 +29,6 @@
 - 禁止裸 `go func`：用 `github.com/oekit/concurrency/async` 的 GoSafe 系列（panic 被 recover）
 - 共享状态 mutex / atomic 保护；包级全局可变状态用 `atomic.Pointer[T]`
 
-### HTTP 中间件栈（硬规则）
-- **任何自定义 HTTP 中间件栈必须包含 `mw.RecoveryMiddleware`**（或直接用
-  `mw.MinimalMiddleware` / `mw.DefaultMiddleware`，均已内置）。
-  Hertz 无默认 PanicHandler（`engine.PanicHandler` nil → ServeHTTP 不挂 recover，
-  见 hertz pkg/route/engine.go）且 netpoll 连接层不 recover
-  （cloudwego/netpoll connection_onevent.go）——缺失 Recovery 的 handler panic
-  = 断连/进程死，不是"最好有"
-
 ### 生命周期
 - 组件 Close 统一 `Close(ctx) error` 签名 + sync.Once 幂等
 - 应用骨架用 `github.com/oekit/bootstrap/bootstrap.Run`；**userFn 返回即服务结束，
@@ -58,8 +48,4 @@
 - 历史完整规范见 ekit 单体仓（git.enjoye.top/enjoydream/ekit，冻结维护）的 AGENTS.md 与 docs/
 
 ## 本仓范围
-
-- `mw` 根包只含自研标准中间件；`SheddingMiddleware`（CPU 自适应降载，消费
-  `concurrency/shedding`）为 **opt-in**——不加入 `DefaultMiddleware` 栈，
-  丢弃请求的中间件不能默认开；拒绝路径统一 `Fail` + BizError(50300, 503)。
 
