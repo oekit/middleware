@@ -22,9 +22,9 @@ require (
 	github.com/hertz-contrib/sessions v1.0.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.1
 	github.com/oekit/concurrency v0.5.4
-	github.com/oekit/logx v0.5.0
+	github.com/oekit/logx v0.6.0
 	github.com/oekit/metrics v0.1.6
-	github.com/oekit/registry v0.4.0
+	github.com/oekit/registry v0.4.1
 	github.com/oekit/tracing v0.2.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/swaggo/http-swagger v1.3.4
