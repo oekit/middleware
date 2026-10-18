@@ -62,10 +62,6 @@
 
 - fix(deps): pkg 地板 v0.9.3 → v0.10.0（拆分版，零代码改动）；concurrency 地板 v0.5.2 → v0.5.3
 
-## [v0.5.1] — 2026-10-17
-
-- fix(deps): 内部依赖地板全量对齐最新——concurrency v0.5.2、logx v0.5.0、metrics v0.1.6、registry v0.3.1、tracing v0.2.1、pkg v0.9.3；go 维持 1.26.0（tracing/OTel 生态传导）
-
 ## [v0.6.0] — 2026-10-17
 
 - **fix(ratelimit)**：默认 KeyFunc 去端口——`RemoteAddr().String()` 含端口，
@@ -80,6 +76,10 @@
 - docs(hmw)：README 明确 `MinimalMiddleware`（TraceID → Recovery）为最小
   安全栈——hertz 无默认 PanicHandler，只挂非 Recovery 栈的消费方 handler
   panic 即进程崩溃（[#10](https://github.com/oekit/middleware/issues/10)）
+
+## [v0.5.1] — 2026-10-17
+
+- fix(deps): 内部依赖地板全量对齐最新——concurrency v0.5.2、logx v0.5.0、metrics v0.1.6、registry v0.3.1、tracing v0.2.1、pkg v0.9.3；go 维持 1.26.0（tracing/OTel 生态传导）
 
 ## [v0.5.0] — 2026-10-17
 
