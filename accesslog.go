@@ -2,12 +2,11 @@ package mw
 
 import (
 	"context"
-	"strings"
-	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/oekit/core/chain"
 	"github.com/oekit/logx"
-	"github.com/oekit/pkg/pathx"
+	"github.com/oekit/middleware/chainmw"
 )
 
 // AccessLogOptions 是访问日志中间件的配置。
@@ -65,6 +64,14 @@ var accessLog = logx.Delegating("access")
 //     （webhook/{token} 类）做路径脱敏，token 不落日志
 //   - 无参调用即启用默认配置（不跳过任何路径、不脱敏）
 //
+// # 实现说明（#14）
+//
+// 本中间件是 chainmw.AccessLog 内核的 Hertz 薄壳：SkipPaths 匹配、路径
+// 脱敏、耗时采集收敛在内核单点维护（kitex 侧经 ToKitex 桥接同步获得同等
+// 能力），本层只注入 hertz→transport 服务端上下文并保持既有日志格式
+// （logger、消息、字段与顺序不变）。下游 handler 可经
+// transport.FromServerContext 读取协议无关传输信息。
+//
 // 使用方式:
 //
 //	// 默认配置（不跳过任何路径）
@@ -78,43 +85,33 @@ var accessLog = logx.Delegating("access")
 func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 	cfg := newAccessLogOptions(opts...)
 
-	return func(ctx context.Context, c *app.RequestContext) {
-		path := string(c.Request.URI().Path())
-		if pathx.MatchesPath(cfg.SkipPaths, path) {
+	kernel := chainmw.AccessLog(
+		chainmw.WithLogger(accessLog),
+		chainmw.WithLogMessage("request"),
+		chainmw.WithSkipPaths(cfg.SkipPaths...),
+		chainmw.WithRedactPathPrefixes(cfg.RedactPathPrefixes...),
+		chainmw.WithLogFields(func(_ context.Context, req any, rec chainmw.AccessRecord) []any {
+			c, ok := req.(*app.RequestContext)
+			if !ok {
+				return nil
+			}
+			return []any{
+				"method", string(c.Method()),
+				"path", rec.Operation,
+				"status", c.Response.StatusCode(),
+				"latency_ms", rec.Latency.Milliseconds(),
+				"ip", c.ClientIP(),
+			}
+		}),
+	)
+	handled := kernel(chain.Handler(func(ctx context.Context, req any) (any, error) {
+		if c, ok := req.(*app.RequestContext); ok {
 			c.Next(ctx)
-			return
 		}
-		if len(cfg.RedactPathPrefixes) > 0 {
-			path = redactPath(path, cfg.RedactPathPrefixes)
-		}
+		return nil, nil
+	}))
 
-		start := time.Now()
-		c.Next(ctx)
-
-		latency := time.Since(start)
-		statusCode := c.Response.StatusCode()
-		method := string(c.Method())
-		clientIP := c.ClientIP()
-
-		accessLog.CtxInfo(ctx, "request",
-			"method", method,
-			"path", path,
-			"status", statusCode,
-			"latency_ms", latency.Milliseconds(),
-			"ip", clientIP,
-		)
+	return func(ctx context.Context, c *app.RequestContext) {
+		_, _ = handled(newHertzServerContext(ctx, c), c)
 	}
-}
-
-// redactPath 命中任一前缀则保留前缀、其余替换为 "/***"；未命中原样返回。
-// 前缀按字节匹配（"/alert" 也会命中 "/alert-x"，多脱敏无副作用）；前缀
-// 恰好等于完整路径（len 相等）视为无敏感尾段，原样返回。
-func redactPath(path string, prefixes []string) string {
-	for _, p := range prefixes {
-		if p == "" || !strings.HasPrefix(path, p) || len(path) == len(p) {
-			continue
-		}
-		return p + "/***"
-	}
-	return path
 }

@@ -8,6 +8,8 @@
 //
 //   - DefaultMiddleware  — 一键标准栈（TraceID → Recovery → Response → AccessLog，零指标强制）
 //   - MinimalMiddleware  — 最小安全栈（TraceID → Recovery；零指标/零日志，供自定义栈下限）
+//   - chainmw 子包 — transport 感知的框架无关中间件内核（github.com/oekit/middleware/chainmw；
+//     AccessLog/Recovery/MetadataPropagate——本包 Recovery/AccessLog 为其薄壳，kitex 桥接复用同一份实现）
 //   - ResponseMiddleware — 统一 JSON 响应格式 {code, data, message, trace_id}
 //     （支持 WithSkipPaths / WithSkipPrefixes 声明式跳过 + SkipResponseWrap handler 级逃生舱）
 //   - hmw.Middleware — trace_id 生成/透传（hmw 子包，路径 github.com/oekit/middleware/hmw）

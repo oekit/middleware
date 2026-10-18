@@ -2,10 +2,48 @@
 
 所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
 
-## [- fix(mw): `StackConfig.SkipPaths` 贯通 ResponseMiddleware（#15）——原实现只喂给 AccessLog，「一键标准栈」把 /metrics 包成 {"code":0,...} 信封导致 Prometheus 解析失败；SkipPaths 语义更新为「跳过标准栈处理的路径」（引擎级功能测试钉住）
-- fix(deps): metrics vv0.1.7、tracing vv0.2.2 地板对齐（零代码改动）
+## [v0.9.0] — 2026-10-18
 
-## [- fix(deps): logx 地板 v0.5.0 → v0.6.0、registry 地板 v0.4.0 → v0.4.1（零代码改动）
+### Added（[#14](https://github.com/oekit/middleware/issues/14)：主栈复用 chain 内核，一份逻辑两端跑）
+
+- **`chainmw.Recovery` 新中间件**（transport 无关内核）：panic 捕获为
+  `*chain.PanicError` + Error 日志 + panic 隔离的监控上报钩子
+  （`WithRecoveryReporter`；钩子内部 panic 被隔离记日志、上报丢弃，不影响
+  原始 panic 语义）。kitex 经 `kitex/chainmw.ToKitex` 桥接即同步获得同等
+  能力——此前链侧只有 core/chain.Recovery（无日志、reporter 无 panic 隔离，
+  而第三方监控 SDK 恰是最可能 panic 的代码）；`WithRecoveryLogFields`/
+  `WithRecoveryLogger` 支持框架桥接定制日志
+- **`chainmw.AccessLog` 增强**：`WithSkipPaths`（glob，按原始 Operation 匹配、
+  不受脱敏影响）、`WithRedactPathPrefixes`（webhook/{token} 类路径脱敏）、
+  `WithLogMessage`/`WithLogFields`（自定义日志消息与字段构建器）；日志升级
+  为 `Ctx*` 系（自动携带 trace_id）
+- **`chainmw.RedactPath` 导出**：路径前缀脱敏原语（原根包私有实现上收，
+  #12 语义不变）
+
+### Changed（内部重构，对外行为零变化）
+
+- 根包 `RecoveryMiddleware`/`AccessLogMiddleware` 改为 chainmw 内核薄壳：
+  panic 捕获/日志/上报隔离、SkipPaths 匹配、脱敏、耗时采集收敛到 chainmw
+  单点维护；SkipPaths、SentryReporter、响应格式、日志 logger/消息/字段与
+  顺序、公开 API 签名全部不变（reporter 隔离日志文案与 v0.8.0 前一致）
+- 根包内置 hertz→core/transport 服务端适配器（与 hertz/transportx 同构；
+  不能 import hertz/transportx——hertz/chainmw 反向依赖本仓成环）；经
+  AccessLogMiddleware 的下游 handler 现可经 `transport.FromServerContext`
+  读协议无关传输信息（纯增益，ctx 新增一个键）
+
+### Fixed
+
+- docs: CHANGELOG v0.7.2/v0.8.0 版本头补齐（heredoc 事故残留的 `## [` 坏头
+  与 `vv0.1.7` 笔误）
+
+## [v0.8.0] — 2026-10-18
+
+- fix(mw): `StackConfig.SkipPaths` 贯通 ResponseMiddleware（#15）——原实现只喂给 AccessLog，「一键标准栈」把 /metrics 包成 {"code":0,...} 信封导致 Prometheus 解析失败；SkipPaths 语义更新为「跳过标准栈处理的路径」（引擎级功能测试钉住）
+- fix(deps): metrics v0.1.7、tracing v0.2.2 地板对齐（零代码改动）
+
+## [v0.7.2] — 2026-10-17
+
+- fix(deps): logx 地板 v0.5.0 → v0.6.0、registry 地板 v0.4.0 → v0.4.1（零代码改动）
 
 ## [v0.7.0] — 2026-10-17
 

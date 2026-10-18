@@ -7,9 +7,12 @@ import (
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/common/test/assert"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
+	"github.com/oekit/middleware/chainmw"
 )
 
-// TestRedactPath 前缀命中脱敏语义（#12：webhook/{token} 类路径的 token 不落日志）。
+// TestRedactPath 前缀命中脱敏语义（#12：webhook/{token} 类路径的 token 不落
+// 日志）。实现已上收至 chainmw.RedactPath（#14 一份逻辑两端跑），此处经导出
+// 符号钉住根包栈依赖的语义。
 func TestRedactPath(t *testing.T) {
 	prefixes := []string{"/api/v2/webhook/alert", "/api/v2/task/trigger", "/hooks/slack"}
 
@@ -26,11 +29,11 @@ func TestRedactPath(t *testing.T) {
 		{"空前缀不命中", "/anything/here", "/anything/here"},
 	}
 	for _, tc := range cases {
-		if got := redactPath(tc.path, prefixes); got != tc.want {
-			t.Errorf("%s: redactPath(%q) = %q, want %q", tc.name, tc.path, got, tc.want)
+		if got := chainmw.RedactPath(tc.path, prefixes); got != tc.want {
+			t.Errorf("%s: RedactPath(%q) = %q, want %q", tc.name, tc.path, got, tc.want)
 		}
 	}
-	if got := redactPath("/no/config", nil); got != "/no/config" {
+	if got := chainmw.RedactPath("/no/config", nil); got != "/no/config" {
 		t.Errorf("无前缀配置应原样返回，got %q", got)
 	}
 }

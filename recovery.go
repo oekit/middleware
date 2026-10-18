@@ -2,10 +2,12 @@ package mw
 
 import (
 	"context"
-	"runtime/debug"
+	"errors"
 
 	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/oekit/core/chain"
 	"github.com/oekit/logx"
+	"github.com/oekit/middleware/chainmw"
 )
 
 // recoveryLog 带 component 属性的 scoped logger（同 failLog）。
@@ -100,6 +102,13 @@ func newRecoveryOptions(opts ...RecoveryOption) *RecoveryOptions {
 // 栈都必须包含本中间件**（或 mw.MinimalMiddleware / mw.DefaultMiddleware，
 // 均已内置）。见 AGENTS.md 硬规则。
 //
+// # 实现说明（#14）
+//
+// 本中间件是 chainmw.Recovery 内核的 Hertz 薄壳：panic 捕获/日志/上报
+// 隔离收敛在内核单点维护（kitex 侧经 ToKitex 桥接同步获得同等能力），
+// 本层只做 SentryReporter 签名适配（带 *app.RequestContext）与响应写出。
+// 日志文案、字段与顺序、reporter panic 隔离语义与 v0.8.0 前实现一致。
+//
 // 使用方式:
 //
 //	// 默认配置(仅 logx 记录 + 500 响应)
@@ -115,38 +124,41 @@ func newRecoveryOptions(opts ...RecoveryOption) *RecoveryOptions {
 func RecoveryMiddleware(opts ...RecoveryOption) app.HandlerFunc {
 	cfg := newRecoveryOptions(opts...)
 
-	return func(ctx context.Context, c *app.RequestContext) {
-		defer func() {
-			if r := recover(); r != nil {
-				stack := string(debug.Stack())
-				recoveryLog.CtxError(ctx, "[panic] recovered",
-					"err", r,
+	kernel := chainmw.Recovery(
+		chainmw.WithRecoveryLogger(recoveryLog),
+		chainmw.WithRecoveryLogFields(func(_ context.Context, req any, pv *chain.PanicError) []any {
+			kvs := []any{"err", pv.Value}
+			if c, ok := req.(*app.RequestContext); ok {
+				kvs = append(kvs,
 					"method", string(c.Method()),
 					"path", string(c.Request.URI().Path()),
-					"stack", stack,
 				)
-				if cfg.PanicReporter != nil {
-					safeReport(ctx, cfg.PanicReporter, c, r, stack)
-				}
-				cfg.ErrorHandler(c, r, stack)
 			}
-		}()
-		c.Next(ctx)
-	}
-}
-
-// safeReport 调 Reporter 并隔离其内部 panic(2026-09-05 复审修复:此处
-// 已在 deferred 函数内、外层 recover() 消费之后,Reporter panic 原本会
-// 替换业务原始 panic 且跳过 ErrorHandler/响应 — 第三方监控 SDK 恰是最
-// 可能 panic 的代码)。上报失败只记日志,不影响错误响应。
-func safeReport(ctx context.Context, r SentryReporter, c *app.RequestContext, panicVal any, stack string) {
-	defer func() {
-		if rp := recover(); rp != nil {
-			recoveryLog.CtxError(ctx, "[panic] panic reporter panicked; report dropped",
-				"reporter_panic", rp,
-				"original_panic", panicVal,
-			)
+			return append(kvs, "stack", pv.Stack)
+		}),
+		// SentryReporter 桥接：内核已做上报 panic 隔离（隔离日志文案/字段
+		// 与 v0.8.0 前 safeReport 一致），此处直接透传调用。
+		chainmw.WithRecoveryReporter(func(ctx context.Context, req any, pv *chain.PanicError) {
+			if cfg.PanicReporter == nil {
+				return
+			}
+			if c, ok := req.(*app.RequestContext); ok {
+				cfg.PanicReporter.Report(ctx, c, pv.Value, pv.Stack)
+			}
+		}),
+	)
+	handled := kernel(chain.Handler(func(ctx context.Context, req any) (any, error) {
+		if c, ok := req.(*app.RequestContext); ok {
+			c.Next(ctx)
 		}
-	}()
-	r.Report(ctx, c, panicVal, stack)
+		return nil, nil
+	}))
+
+	return func(ctx context.Context, c *app.RequestContext) {
+		_, err := handled(ctx, c)
+		var pv *chain.PanicError
+		if errors.As(err, &pv) {
+			cfg.ErrorHandler(c, pv.Value, pv.Stack)
+		}
+	}
 }

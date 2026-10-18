@@ -149,3 +149,138 @@ func TestMetadataPropagateNoTransport(t *testing.T) {
 		t.Fatalf("no-op path errored: %v", err)
 	}
 }
+
+// TestAccessLogSkipPaths 验证命中 skip 模式的 op 不记日志、下游照常执行。
+func TestAccessLogSkipPaths(t *testing.T) {
+	rec := &captureLogger{}
+	ran := false
+	tr := &stubTransporter{kind: transport.KindHTTP, op: "/metrics"}
+	ctx := transport.NewServerContext(context.Background(), tr)
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) {
+		ran = true
+		return "ok", nil
+	}, AccessLog(WithLogger(rec), WithSkipPaths("/metrics", "/health*")))
+	h(ctx, "req")
+
+	if !ran {
+		t.Error("downstream should still run on skipped op")
+	}
+	if len(rec.entries) != 0 {
+		t.Errorf("skipped op should not log: %v", rec.entries)
+	}
+
+	// 未命中 skip 的 op 照常记录
+	rec2 := &captureLogger{}
+	tr2 := &stubTransporter{kind: transport.KindHTTP, op: "/api/orders"}
+	h2 := chain.Finalize(func(ctx context.Context, req any) (any, error) { return "ok", nil },
+		AccessLog(WithLogger(rec2), WithSkipPaths("/metrics")))
+	h2(transport.NewServerContext(context.Background(), tr2), "req")
+	if len(rec2.entries) != 1 {
+		t.Errorf("non-skipped op should log once: %v", rec2.entries)
+	}
+}
+
+// TestAccessLogRedactPrefixes 验证脱敏前缀：日志只含前缀+/***，token 不落日志。
+func TestAccessLogRedactPrefixes(t *testing.T) {
+	rec := &captureLogger{}
+	tr := &stubTransporter{kind: transport.KindHTTP, op: "/api/v2/webhook/alert/tk-SECRET-123"}
+	ctx := transport.NewServerContext(context.Background(), tr)
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) { return "ok", nil },
+		AccessLog(WithLogger(rec), WithRedactPathPrefixes("/api/v2/webhook/alert")))
+	h(ctx, "req")
+
+	out := rec.text()
+	if !strings.Contains(out, "/api/v2/webhook/alert/***") {
+		t.Fatalf("redacted op missing: %s", out)
+	}
+	if strings.Contains(out, "tk-SECRET-123") {
+		t.Errorf("token leaked into log: %s", out)
+	}
+}
+
+// TestAccessLogSkipUsesRawOp 验证 skip 判定用原始 op（不受脱敏影响）。
+func TestAccessLogSkipUsesRawOp(t *testing.T) {
+	rec := &captureLogger{}
+	op := "/api/v2/webhook/alert/tk-1"
+	tr := &stubTransporter{kind: transport.KindHTTP, op: op}
+	ctx := transport.NewServerContext(context.Background(), tr)
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) { return "ok", nil },
+		AccessLog(WithLogger(rec),
+			WithSkipPaths(op), // 按原始值匹配
+			WithRedactPathPrefixes("/api/v2/webhook/alert"), // 若误用脱敏值则匹配失败
+		))
+	h(ctx, "req")
+
+	if len(rec.entries) != 0 {
+		t.Errorf("skip should match raw op before redaction: %v", rec.entries)
+	}
+}
+
+// TestAccessLogMessageAndFields 验证自定义消息与字段构建器（根包薄壳依赖）。
+func TestAccessLogMessageAndFields(t *testing.T) {
+	rec := &captureLogger{}
+	tr := &stubTransporter{kind: transport.KindHTTP, op: "/api/ping"}
+	ctx := transport.NewServerContext(context.Background(), tr)
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) { return "ok", nil },
+		AccessLog(
+			WithLogger(rec),
+			WithLogMessage("request"),
+			WithLogFields(func(_ context.Context, req any, rec AccessRecord) []any {
+				return []any{"method", "GET", "path", rec.Operation, "status", 200}
+			}),
+		))
+	h(ctx, "req")
+
+	out := rec.text()
+	if !strings.Contains(out, "INFO request") {
+		t.Fatalf("custom message missing: %s", out)
+	}
+	for _, want := range []string{"method=GET", "path=/api/ping", "status=200"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("custom field %s missing: %s", want, out)
+		}
+	}
+	if strings.Contains(out, "cost=") {
+		t.Errorf("default fields should be replaced: %s", out)
+	}
+}
+
+// TestAccessLogNoTransport 验证无 transport 上下文时不 panic、kind/op 记 "-"。
+func TestAccessLogNoTransport(t *testing.T) {
+	rec := &captureLogger{}
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) { return "ok", nil },
+		AccessLog(WithLogger(rec)))
+	if _, err := h(context.Background(), "req"); err != nil {
+		t.Fatalf("unexpected err: %v", err)
+	}
+	out := rec.text()
+	if !strings.Contains(out, "kind=-") || !strings.Contains(out, "op=-") {
+		t.Fatalf("expected kind=-/op=- without transport: %s", out)
+	}
+}
+
+// TestRedactPath 前缀命中脱敏语义（与根包 mw #12 行为一致，单实现双栈复用）。
+func TestRedactPath(t *testing.T) {
+	prefixes := []string{"/api/v2/webhook/alert", "/api/v2/task/trigger", "/hooks/slack"}
+
+	cases := []struct {
+		name string
+		path string
+		want string
+	}{
+		{"命中前缀-尾段脱敏", "/api/v2/webhook/alert/tk-secret-123", "/api/v2/webhook/alert/***"},
+		{"命中前缀-多段全脱", "/api/v2/task/trigger/ops/9f8e7d", "/api/v2/task/trigger/***"},
+		{"恰好等于前缀-无敏感尾段原样", "/hooks/slack", "/hooks/slack"},
+		{"未命中原样", "/api/v1/orders", "/api/v1/orders"},
+		{"前缀字节撞车-宁可多脱敏", "/api/v2/webhook/alert-x/ok", "/api/v2/webhook/alert/***"},
+		{"空前缀不命中", "/anything/here", "/anything/here"},
+	}
+	for _, tc := range cases {
+		if got := RedactPath(tc.path, prefixes); got != tc.want {
+			t.Errorf("%s: RedactPath(%q) = %q, want %q", tc.name, tc.path, got, tc.want)
+		}
+	}
+	if got := RedactPath("/no/config", nil); got != "/no/config" {
+		t.Errorf("无前缀配置应原样返回，got %q", got)
+	}
+}

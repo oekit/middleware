@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/middleware@v0.8.0
+go get github.com/oekit/middleware@v0.9.0
 ```
 
 ## 这个仓库做什么
@@ -21,6 +21,7 @@ go get github.com/oekit/middleware@v0.8.0
 | 包 | import 路径 | 做什么 |
 |---|---|---|
 | `mw`（模块根包） | `github.com/oekit/middleware` | `DefaultMiddleware` 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制）；`MinimalMiddleware` 最小安全栈（TraceID → Recovery）；另有 Prometheus 指标/RateLimit/BearerTokenAuth/I18n/Fail/Shedding 等 |
+| `chainmw` | `github.com/oekit/middleware/chainmw` | transport 感知的框架无关中间件（core/chain 内核）：`AccessLog`/`Recovery`/`MetadataPropagate`——根包 mw 栈复用其内核（薄壳），kitex 经 ToKitex 桥接同步获得同等能力 |
 | `contrib` | `github.com/oekit/middleware/contrib` | hertz-contrib 桥接：JWT/Sessions/Swagger/CSRF/pprof/Debug/Gzip/ETag/BasicAuth/ReverseProxy/Sentinel/Lark |
 | `hmw` | `github.com/oekit/middleware/hmw` | requestid/trace_id 注入 RequestContext 与标准 context |
 
