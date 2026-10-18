@@ -12,6 +12,12 @@ type StackConfig struct {
 	// v0.8.0 起贯通 AccessLog 与 Response（原实现只作用于 AccessLog，
 	// 导致 /metrics 被包成 {"code":0,...} 信封，Prometheus 解析失败）。
 	SkipPaths []string
+
+	// Prometheus 指标配置（middleware#16，nil = 维持零指标，行为与现状一致）。
+	// 非 nil 时 Prometheus 中间件保证挂**栈首**（先于 TraceID 才能精确记录
+	// 耗时——手抄两步装配时最常见的就是忘挂栈首或 SkipPaths 两处传参不一致），
+	// SkipPaths 单点传入同步作用于指标中间件，杜绝半手抄状态。
+	Prometheus *PrometheusConfig
 }
 
 // DefaultMiddleware 返回标准化中间件栈：TraceID → Recovery → Response → AccessLog。
@@ -39,12 +45,23 @@ type StackConfig struct {
 //   - AccessLog 记录请求日志（含 trace_id）
 //
 // 只要安全下限、不需要统一包壳/访问日志时用 MinimalMiddleware。
+//
+// 指标一步形态（middleware#16）：StackConfig.Prometheus 非 nil 时 Prometheus
+// 中间件保证挂栈首（精确耗时），SkipPaths 单点传入；nil = 维持零指标。
+// 旧两步写法（NewPrometheusMetrics + 手动 h.Use 在前）保留可用。
 func DefaultMiddleware(cfg StackConfig) []app.HandlerFunc {
-	// 预分配：TraceID(2) + Recovery(1) + Response(1) + AccessLog(1) = 5
+	// 预分配：Prometheus(1) + TraceID(2) + Recovery(1) + Response(1) + AccessLog(1) = 6
 	// Recovery 必须在栈内：hertz 引擎级 recover 仅在 PanicHandler 非nil 时
 	// 生效而 server.New 不设默认值——无 Recovery 的 handler panic 直接断连
 	// （客户端 connection reset，无 500/无统一错误体/无 access log）
-	stack := make([]app.HandlerFunc, 0, 5)
+	stack := make([]app.HandlerFunc, 0, 6)
+	if cfg.Prometheus != nil {
+		pcfg := *cfg.Prometheus
+		if pcfg.SkipPaths == nil {
+			pcfg.SkipPaths = cfg.SkipPaths // SkipPaths 单点传入，杜绝两处不一致
+		}
+		stack = append(stack, NewPrometheusMetrics(pcfg).Middleware())
+	}
 	stack = append(stack, hmw.Middleware()...)
 	stack = append(stack,
 		RecoveryMiddleware(),

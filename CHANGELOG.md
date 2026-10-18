@@ -1,6 +1,12 @@
-# Changelog — oekit/middleware
+## [v0.10.0] — 2026-10-18
 
-所有 notable 变更记录如下。格式参考 [Keep a Changelog](https://keepachangelog.com/)。
+### feat(stack)：指标一步形态 `StackConfig.Prometheus`（[#16](https://github.com/oekit/middleware/issues/16)）
+- `DefaultMiddleware(StackConfig{Prometheus: &PrometheusConfig{...}})`——非 nil 时
+  Prometheus 中间件**保证挂栈首**（先于 TraceID 精确记录耗时），SkipPaths 单点传入
+  （未显式设置时同步全栈 SkipPaths，杜绝「两处传参不一致」「忘挂栈首」两类手抄漂移）
+- nil = 维持零指标，行为与现状逐位一致；旧两步写法（NewPrometheusMetrics + 手动
+  h.Use 在前）保留可用
+- 10+ 服务各自手抄的两步装配（含已实际观察到的漂移）可收敛为一行
 
 ## [v0.9.0] — 2026-10-18
 

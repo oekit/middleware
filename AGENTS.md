@@ -1,7 +1,7 @@
 # AGENTS.md — oekit/middleware
 
 > Hertz 自研标准中间件栈 + contrib 桥接 + hmw + SheddingMiddleware 自适应降载
-> 当前版本：`v0.9.0` · module：`github.com/oekit/middleware` · org：[oekit = Open Easy Kit](https://oekit.github.io)
+> 当前版本：`v0.10.0` · module：`github.com/oekit/middleware` · org：[oekit = Open Easy Kit](https://oekit.github.io)
 
 ## 本仓包含
 `./`、`chainmw/`、`contrib/`、`hmw/`
