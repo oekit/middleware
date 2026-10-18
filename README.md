@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/middleware@v0.10.0
+go get github.com/oekit/middleware@v0.11.0
 ```
 
 ## 这个仓库做什么
@@ -20,7 +20,7 @@ go get github.com/oekit/middleware@v0.10.0
 
 | 包 | import 路径 | 做什么 |
 |---|---|---|
-| `mw`（模块根包） | `github.com/oekit/middleware` | `DefaultMiddleware` 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制）；`MinimalMiddleware` 最小安全栈（TraceID → Recovery）；另有 Prometheus 指标/RateLimit/BearerTokenAuth/I18n/Fail/Shedding 等 |
+| `mw`（模块根包） | `github.com/oekit/middleware` | `DefaultMiddleware` 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制；`DisableResponseWrap` 响应自管形态、`AccessLogOptions` 透传落库 sink）；`MinimalMiddleware` 最小安全栈（TraceID → Recovery）；另有 Prometheus 指标/RateLimit/BearerTokenAuth/I18n/Fail/Shedding 等 |
 | `chainmw` | `github.com/oekit/middleware/chainmw` | transport 感知的框架无关中间件（core/chain 内核）：`AccessLog`/`Recovery`/`MetadataPropagate`——根包 mw 栈复用其内核（薄壳），kitex 经 ToKitex 桥接同步获得同等能力 |
 | `contrib` | `github.com/oekit/middleware/contrib` | hertz-contrib 桥接：JWT/Sessions/Swagger/CSRF/pprof/Debug/Gzip/ETag/BasicAuth/ReverseProxy/Sentinel/Lark |
 | `hmw` | `github.com/oekit/middleware/hmw` | requestid/trace_id 注入 RequestContext 与标准 context |
@@ -51,6 +51,52 @@ func getOrder(ctx context.Context, c *app.RequestContext) {
     }
 }
 ```
+
+### 适用边界：响应体自管的服务
+
+`DefaultMiddleware` 面向「响应契约统一、由中间件包装」的服务——handler 用 `SuccessResp`/`ErrorResp`
+或返回裸 JSON，`ResponseMiddleware` 统一成 `{code, data, message, trace_id}`。
+
+如果你的响应由各 handler **自己构造**（与既有 API 对齐、自定义字段名如 `msg`、null 字段整个不出现等），
+不要让中间件接管响应——`ResponseMiddleware` 对顶层无 `code` 的裸 JSON 会包壳，对已含 `code` 的原样放行，
+但你没必要押在这条启发式判定上。两条路：
+
+```go
+// 一键：TraceID → Recovery → AccessLog，响应构造权完全留在 handler
+h.Use(mw.DefaultMiddleware(mw.StackConfig{DisableResponseWrap: true})...)
+
+// 手拼：最小安全栈 + 按需挂访问日志
+h.Use(mw.MinimalMiddleware()...)
+h.Use(mw.AccessLogMiddleware())
+```
+
+访问日志要落到自家 `access_log` 表（而不只是日志 sink）——`WithAccessLogSink` 把同一份记录
+（method/path/status/latency/ip/ua/trace_id）交给你的 DAO，`c` 可读鉴权中间件注入的 userId；
+sink 出错或 panic 只记 Warn、不影响响应，`SkipPaths` 命中的请求不触发：
+
+```go
+h.Use(mw.DefaultMiddleware(mw.StackConfig{
+    DisableResponseWrap: true,
+    SkipPaths:           []string{"/healthz", "/metrics"},
+    AccessLogOptions: []mw.AccessLogOption{mw.WithAccessLogSink(
+        func(ctx context.Context, c *app.RequestContext, rec mw.AccessRecord) error {
+            uid, _ := c.Get("userId")
+            return accessLogDAO.Save(ctx, uid, rec) // 失败不拖垮请求
+        })},
+})...)
+```
+
+中间件可按路由组装配——Hertz 的 `Use`/`Group` 都接受变参，栈切片直接 `...` 展开，组内再叠自家鉴权：
+
+```go
+api := h.Group("/api", mw.DefaultMiddleware(cfg)...)
+openapi := api.Group("/open", apikey.Required())        // Bearer xm_sk_* 校验
+user := api.Group("/user", auth.Required(svc))           // JWT → userId
+user.POST("/history", charge.RateLimit(...), charge.GetHistory)
+```
+
+无论哪种形态 **Recovery 都是硬性要求**：Hertz 无默认 PanicHandler，缺失则 panic 直接断连；
+`RecoveryMiddleware(WithRecoveryErrorHandler(...))` 可换成你自己的 500 响应体。
 
 ## 边界
 

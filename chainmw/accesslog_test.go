@@ -284,3 +284,101 @@ func TestRedactPath(t *testing.T) {
 		t.Errorf("无前缀配置应原样返回，got %q", got)
 	}
 }
+
+// TestAccessLogSink 钉住 #18：sink 在日志写出后拿到与日志同源的记录，按注册
+// 顺序调用，返回值不受影响。
+func TestAccessLogSink(t *testing.T) {
+	rec := &captureLogger{}
+	tr := &stubTransporter{kind: transport.KindHTTP, op: "/api/order"}
+	ctx := transport.NewServerContext(context.Background(), tr)
+
+	var order []string
+	var got AccessRecord
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) {
+		return "ok", errTest
+	}, AccessLog(WithLogger(rec),
+		WithSink(func(_ context.Context, req any, r AccessRecord) error {
+			order = append(order, "first")
+			got = r
+			if req != "req" {
+				t.Errorf("sink 应拿到原始 req，got %v", req)
+			}
+			return nil
+		}),
+		WithSink(func(context.Context, any, AccessRecord) error {
+			order = append(order, "second")
+			return nil
+		}),
+		WithSink(nil), // nil sink 忽略，不 panic
+	))
+	resp, err := h(ctx, "req")
+
+	if resp != "ok" || !errors.Is(err, errTest) {
+		t.Fatalf("sink 不得改变返回值，got %v %v", resp, err)
+	}
+	if strings.Join(order, ",") != "first,second" {
+		t.Fatalf("sink 应按注册顺序各调一次，got %v", order)
+	}
+	if got.Kind != "http" || got.Operation != "/api/order" || !errors.Is(got.Err, errTest) {
+		t.Fatalf("sink 记录应与日志同源：%+v", got)
+	}
+	if got.Latency < 0 {
+		t.Fatalf("latency 不应为负：%v", got.Latency)
+	}
+}
+
+// TestAccessLogSinkRespectsSkipAndRedact：SkipPaths 命中不触发 sink（跳过 =
+// 不记录，日志与 sink 口径一致）；脱敏后的 Operation 同样进 sink。
+func TestAccessLogSinkRespectsSkipAndRedact(t *testing.T) {
+	calls := 0
+	var ops []string
+	mw := AccessLog(WithLogger(&captureLogger{}),
+		WithSkipPaths("/metrics"),
+		WithRedactPathPrefixes("/hook"),
+		WithSink(func(_ context.Context, _ any, r AccessRecord) error {
+			calls++
+			ops = append(ops, r.Operation)
+			return nil
+		}))
+	h := chain.Finalize(func(context.Context, any) (any, error) { return nil, nil }, mw)
+
+	for _, op := range []string{"/metrics", "/hook/secret-token", "/plain"} {
+		ctx := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: op})
+		h(ctx, nil)
+	}
+	if calls != 2 {
+		t.Fatalf("跳过路径不应触发 sink，期望 2 次调用，got %d", calls)
+	}
+	if strings.Join(ops, ",") != "/hook/***,/plain" {
+		t.Fatalf("sink 应拿到脱敏后的 Operation，got %v", ops)
+	}
+}
+
+// TestAccessLogSinkIsolated：sink 出错只记 Warn；sink panic 被隔离、后续 sink
+// 照常执行；两者都不影响主链路返回值。
+func TestAccessLogSinkIsolated(t *testing.T) {
+	rec := &captureLogger{}
+	ctx := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: "/x"})
+	third := false
+	h := chain.Finalize(func(context.Context, any) (any, error) { return "fine", nil },
+		AccessLog(WithLogger(rec),
+			WithSink(func(context.Context, any, AccessRecord) error { return errors.New("db down") }),
+			WithSink(func(context.Context, any, AccessRecord) error { panic("sink boom") }),
+			WithSink(func(context.Context, any, AccessRecord) error { third = true; return nil }),
+		))
+	resp, err := h(ctx, nil)
+
+	if resp != "fine" || err != nil {
+		t.Fatalf("sink 故障不得影响主链路，got %v %v", resp, err)
+	}
+	if !third {
+		t.Fatal("前一个 sink panic 不应阻断后续 sink")
+	}
+	out := rec.text()
+	if !strings.Contains(out, "access sink failed") || !strings.Contains(out, "db down") {
+		t.Fatalf("sink error 应记 Warn：%s", out)
+	}
+	if !strings.Contains(out, "access sink panic") || !strings.Contains(out, "sink boom") {
+		t.Fatalf("sink panic 应记 Warn：%s", out)
+	}
+}

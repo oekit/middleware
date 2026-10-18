@@ -18,9 +18,44 @@ type StackConfig struct {
 	// 耗时——手抄两步装配时最常见的就是忘挂栈首或 SkipPaths 两处传参不一致），
 	// SkipPaths 单点传入同步作用于指标中间件，杜绝半手抄状态。
 	Prometheus *PrometheusConfig
+
+	// DisableResponseWrap 为 true 时栈内不挂 ResponseMiddleware（#18，
+	// 「响应体自管」场景一键形态：TraceID → Recovery → AccessLog）。
+	//
+	// 适用：响应由各 handler 自己构造、与既有 API 契约对齐（如 {code,msg,data}
+	// 自定义字段名、null 字段整个不出现等），不希望任何中间件接管响应构造。
+	// 不设时裸 JSON（顶层无 "code" 字段）会被包成 {code,data,message,trace_id}；
+	// 顶层已含 "code" 的响应本来就原样放行，见 ResponseMiddleware 文档。
+	DisableResponseWrap bool
+
+	// AccessLogOptions 透传给栈内 AccessLogMiddleware 的额外选项（追加在
+	// SkipPaths 之后）：WithAccessLogSink 落库、WithAccessLogRedactPathPrefixes
+	// 脱敏等。SkipPaths 仍由上面的字段单点传入，此处勿重复设置。
+	AccessLogOptions []AccessLogOption
 }
 
 // DefaultMiddleware 返回标准化中间件栈：TraceID → Recovery → Response → AccessLog。
+//
+// # 适用边界（#18）
+//
+// 本栈面向「响应契约统一、由中间件包装」的服务：handler 用 SuccessResp/ErrorResp
+// 或返回裸 JSON，ResponseMiddleware 统一成 {code, data, message, trace_id}。
+// 如果你的响应体由各 handler 自己构造（与既有 API 对齐、自定义字段名、
+// null 字段整个不出现等），不要让中间件接管响应——两条路：
+//
+//   - 一键：DefaultMiddleware(StackConfig{DisableResponseWrap: true})，得到
+//     TraceID → Recovery → AccessLog，响应构造权完全留在 handler；
+//   - 手拼：MinimalMiddleware()（TraceID → Recovery）再按需 h.Use(AccessLogMiddleware(...))。
+//
+// 中间件可按路由组装配——Hertz 的 Use/Group 都接受变参，栈切片直接展开：
+//
+//	h.Use(mw.DefaultMiddleware(cfg)...)                         // 全局
+//	api := h.Group("/api", mw.DefaultMiddleware(cfg)...)        // 仅 /api 子树
+//	admin := api.Group("/admin", auth.Required(), auth.ApiKey()) // 组内再叠自家鉴权
+//
+// 无论哪种形态 Recovery 都是硬性要求：Hertz 无默认 PanicHandler，缺失则 panic 直接断连。
+//
+// # 指标
 //
 // 零指标强制（v0.2.0 起 Prometheus 中间件从默认栈拆出）——需要 HTTP 指标时
 // 用 NewPrometheusMetrics 显式拼装在栈最前（精确记录请求耗时）：
@@ -41,8 +76,8 @@ type StackConfig struct {
 // 顺序说明：
 //   - TraceID 生成 trace_id 并注入 context（供后续所有中间件与 handler 使用）
 //   - Recovery 捕获 handler panic（引擎无默认 PanicHandler，缺失则 panic 直接断连）
-//   - Response 包装响应格式（从 context 读取 trace_id 写入响应体）
-//   - AccessLog 记录请求日志（含 trace_id）
+//   - Response 包装响应格式（从 context 读取 trace_id 写入响应体；DisableResponseWrap 时不挂）
+//   - AccessLog 记录请求日志（含 trace_id；AccessLogOptions 可追加落库 sink / 脱敏）
 //
 // 只要安全下限、不需要统一包壳/访问日志时用 MinimalMiddleware。
 //
@@ -63,14 +98,17 @@ func DefaultMiddleware(cfg StackConfig) []app.HandlerFunc {
 		stack = append(stack, NewPrometheusMetrics(pcfg).Middleware())
 	}
 	stack = append(stack, hmw.Middleware()...)
-	stack = append(stack,
-		RecoveryMiddleware(),
+	stack = append(stack, RecoveryMiddleware())
+	if !cfg.DisableResponseWrap {
 		// SkipPaths 贯通全栈（#15）：/metrics、健康探针、OpenAPI 等
 		// 不能被 {"code":0,...} 信封包裹的端点，一键栈即可正确服务——
 		// Response 命中跳过路径时整请求不包装（原实现只喂给 AccessLog）
-		ResponseMiddleware(WithSkipPaths(cfg.SkipPaths...)),
-		AccessLogMiddleware(WithAccessLogSkipPaths(cfg.SkipPaths...)),
-	)
+		stack = append(stack, ResponseMiddleware(WithSkipPaths(cfg.SkipPaths...)))
+	}
+	alOpts := make([]AccessLogOption, 0, 1+len(cfg.AccessLogOptions))
+	alOpts = append(alOpts, WithAccessLogSkipPaths(cfg.SkipPaths...))
+	alOpts = append(alOpts, cfg.AccessLogOptions...)
+	stack = append(stack, AccessLogMiddleware(alOpts...))
 	return stack
 }
 

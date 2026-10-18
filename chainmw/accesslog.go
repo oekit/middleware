@@ -17,6 +17,7 @@ package chainmw
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"time"
 
@@ -59,12 +60,19 @@ type AccessRecord struct {
 // AccessLogOption 配置 AccessLog 中间件。
 type AccessLogOption func(*accessLogConfig)
 
+// AccessSink 是访问记录的旁路消费者（落库 / 上报 / 统计），每条记录产出后
+// 按注册顺序同步调用；SkipPaths 命中的请求不触发（跳过 = 不记录，日志与
+// sink 口径一致）。返回 error 或 panic 都只记 Warn 日志、绝不影响主链路——
+// 访问记录是旁路，落库失败不能把请求拖垮。
+type AccessSink func(ctx context.Context, req any, rec AccessRecord) error
+
 type accessLogConfig struct {
 	logger  logx.Logger
 	message string
 	fields  func(ctx context.Context, req any, rec AccessRecord) []any
 	skip    []string
 	redact  []string
+	sinks   []AccessSink
 }
 
 // WithLogger 注入 logger（默认 logx.Delegating("chainmw-accesslog")）。
@@ -100,9 +108,34 @@ func WithRedactPathPrefixes(prefixes ...string) AccessLogOption {
 	return func(c *accessLogConfig) { c.redact = append(c.redact, prefixes...) }
 }
 
+// WithSink 追加访问记录旁路消费者（可多次调用，按注册顺序同步调用；
+// 多个 sink 彼此隔离——前一个 panic 不影响后一个）。需要异步落库时在 sink
+// 内自行入队：rec 是纯值可安全跨 goroutine 持有，req 则随框架生命周期
+// （如 Hertz RequestContext 池化复用）不得逸出本次调用。
+func WithSink(sink AccessSink) AccessLogOption {
+	return func(c *accessLogConfig) {
+		if sink != nil {
+			c.sinks = append(c.sinks, sink)
+		}
+	}
+}
+
+// runSink 隔离执行单个 sink：error 与 panic 都只记 Warn，不向调用方传播。
+func runSink(ctx context.Context, logger logx.Logger, sink AccessSink, req any, rec AccessRecord) {
+	defer func() {
+		if r := recover(); r != nil {
+			logger.CtxWarn(ctx, "access sink panic", "op", rec.Operation, "panic", fmt.Sprint(r))
+		}
+	}()
+	if err := sink(ctx, req, rec); err != nil {
+		logger.CtxWarn(ctx, "access sink failed", "op", rec.Operation, "err", err.Error())
+	}
+}
+
 // AccessLog 返回访问日志中间件：从 transport 上下文读取 Kind/Operation，
 // 记录耗时、错误与 panic（配合 Recovery 使用时 panic 已在上游转换，此处
-// 记录 error）。无 transport 上下文时相应字段记 "-"。
+// 记录 error）。无 transport 上下文时相应字段记 "-"。日志写出后依次调用
+// WithSink 注册的旁路消费者（隔离执行，不影响返回值）。
 func AccessLog(opts ...AccessLogOption) chain.Middleware {
 	cfg := &accessLogConfig{logger: accessLog, message: "access"}
 	for _, opt := range opts {
@@ -133,9 +166,12 @@ func AccessLog(opts ...AccessLogOption) chain.Middleware {
 			if rec.Err != nil {
 				kvs = append(kvs, "err", rec.Err.Error())
 				logger.CtxWarn(ctx, cfg.message, kvs...)
-				return resp, err
+			} else {
+				logger.CtxInfo(ctx, cfg.message, kvs...)
 			}
-			logger.CtxInfo(ctx, cfg.message, kvs...)
+			for _, sink := range cfg.sinks {
+				runSink(ctx, logger, sink, req, rec)
+			}
 			return resp, err
 		}
 	}
