@@ -382,3 +382,56 @@ func TestAccessLogSinkIsolated(t *testing.T) {
 		t.Fatalf("sink panic 应记 Warn：%s", out)
 	}
 }
+
+// TestAccessLogPanicRecord 钉住 #20：下游 panic 时恢复点产出记录（Panic 标记 +
+// Err 摘要），记 Warn 并喂 sink 后按原值重抛；skip 命中的 panic 不记录。
+func TestAccessLogPanicRecord(t *testing.T) {
+	rec := &captureLogger{}
+	var got AccessRecord
+	sinkCalled := false
+	ctx := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: "/boom"})
+	h := chain.Finalize(func(context.Context, any) (any, error) { panic("db explode") },
+		AccessLog(WithLogger(rec),
+			WithSink(func(_ context.Context, _ any, r AccessRecord) error {
+				sinkCalled = true
+				got = r
+				return nil
+			})))
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = h(ctx, nil)
+	}()
+
+	if recovered != "db explode" {
+		t.Fatalf("panic 应按原值重抛，got %v", recovered)
+	}
+	if !sinkCalled {
+		t.Fatal("panic 请求应喂 sink")
+	}
+	if !got.Panic || got.Err == nil || !strings.Contains(got.Err.Error(), "db explode") {
+		t.Fatalf("panic 记录字段不匹配：%+v", got)
+	}
+	if got.Latency < 0 {
+		t.Fatalf("latency 不应为负：%v", got.Latency)
+	}
+	out := rec.text()
+	if !strings.Contains(out, "WARN") || !strings.Contains(out, "panic=true") || !strings.Contains(out, "/boom") {
+		t.Fatalf("panic 应记 Warn 并带 panic 标记：%s", out)
+	}
+
+	// skip 命中：panic 照常重抛但不产出记录
+	skipCalls := 0
+	h2 := chain.Finalize(func(context.Context, any) (any, error) { panic("x") },
+		AccessLog(WithLogger(rec), WithSkipPaths("/boom2"),
+			WithSink(func(context.Context, any, AccessRecord) error { skipCalls++; return nil })))
+	func() {
+		defer func() { _ = recover() }()
+		c2 := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: "/boom2"})
+		_, _ = h2(c2, nil)
+	}()
+	if skipCalls != 0 {
+		t.Fatal("skip 命中的 panic 不应触发 sink")
+	}
+}

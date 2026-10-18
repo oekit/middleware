@@ -1,3 +1,20 @@
+## [v0.12.0] — 2026-10-18
+
+### fix(accesslog)：panic 请求同样产出访问记录（[#20](https://github.com/oekit/middleware/issues/20)）
+- 此前栈序 Recovery → AccessLog 下 handler panic 直接穿过 AccessLog 到达外层
+  Recovery——**状态码、耗时、路径全部无记录**，最需要观测的请求反而零记录，
+  故障时段 access log 完全失明
+- `chainmw.AccessLog` 内核在 **panic 恢复点**产出
+  `AccessRecord{Panic: true, Err: "panic: <摘要>"}`——记 Warn 日志（Hertz 薄壳
+  status 按 Recovery 缺省 500，字段含 `panic=true`）、照常喂 `WithAccessLogSink`
+  （落库场景 panic 请求同样留痕）——随后**按原值重新抛出**，外层 Recovery
+  （或框架自身 recover）照常处理；kitex 经 ToKitex 桥接同步获得
+- 根包 `mw.AccessRecord` 新增 `Panic bool` 字段；`SkipPaths` 命中的 panic 不记录
+  （跳过 = 不记录口径不变）；v0.11.0 CHANGELOG 的「panic 零访问记录」行为澄清
+  自本版起废止
+- 测试：内核 1 例（恢复点记录 + 重抛 + skip 不触发）+ 端到端 2 例
+  （DefaultMiddleware 下 panic 记录 Status=500/Panic=true 且响应仍为统一错误体）
+
 ## [v0.11.0] — 2026-10-18
 
 ### feat(accesslog)：落库 sink + 响应自管一键形态 + 适用边界文档（[#18](https://github.com/oekit/middleware/issues/18)）

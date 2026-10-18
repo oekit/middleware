@@ -134,13 +134,19 @@ func TestDefaultMiddleware_DisableResponseWrap(t *testing.T) {
 	ut.PerformRequest(h, http.MethodGet, "/metrics", nil)
 	ut.PerformRequest(h, http.MethodGet, "/missing", nil)
 
-	// /api + /missing；/metrics 命中 SkipPaths 不记；/boom 的 panic 穿过 AccessLog
-	// 直达外层 Recovery、无访问记录（既有栈序行为，与 sink 无关）
-	if len(seen) != 2 {
-		t.Fatalf("sink 应收到 2 条记录（SkipPaths 贯通到 sink），got %d: %+v", len(seen), seen)
+	// /api + /boom + /missing；/metrics 命中 SkipPaths 不记。
+	// v0.12.0 起 panic 请求同样产出记录（#20）：Status 按 Recovery 缺省 500、Panic 标记
+	if len(seen) != 3 {
+		t.Fatalf("sink 应收到 3 条记录（SkipPaths 贯通到 sink），got %d: %+v", len(seen), seen)
 	}
-	if seen[0].Path != "/api" || seen[0].Status != 200 || seen[1].Path != "/missing" || seen[1].Status != 404 {
-		t.Fatalf("sink 记录字段不匹配：%+v", seen)
+	if seen[0].Path != "/api" || seen[0].Status != 200 {
+		t.Fatalf("正常请求记录不匹配：%+v", seen[0])
+	}
+	if !seen[1].Panic || seen[1].Path != "/boom" || seen[1].Status != 500 {
+		t.Fatalf("panic 请求应有记录（Status=500, Panic=true）：%+v", seen[1])
+	}
+	if seen[2].Path != "/missing" || seen[2].Status != 404 {
+		t.Fatalf("sink 记录字段不匹配：%+v", seen[2])
 	}
 }
 

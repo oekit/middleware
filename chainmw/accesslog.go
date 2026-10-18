@@ -53,8 +53,13 @@ type AccessRecord struct {
 	Operation string
 	// Latency 下游处理耗时。
 	Latency time.Duration
-	// Err 下游返回的错误（nil = 成功）。
+	// Err 下游返回的错误；Panic 为 true 时携带 panic 摘要（"panic: ..."）。
 	Err error
+	// Panic 为 true 表示本记录来自 panic 恢复点（#20）：中间件已记日志/喂 sink
+	// 并向原 panic 重新抛出，交由外层 Recovery 处理。响应状态码在记录时点尚未
+	// 写出——Hertz 薄壳按 Recovery 缺省 500 记（自定义 ErrorHandler 时以
+	// Recovery 自身日志为准）。
+	Panic bool
 }
 
 // AccessLogOption 配置 AccessLog 中间件。
@@ -133,9 +138,16 @@ func runSink(ctx context.Context, logger logx.Logger, sink AccessSink, req any, 
 }
 
 // AccessLog 返回访问日志中间件：从 transport 上下文读取 Kind/Operation，
-// 记录耗时、错误与 panic（配合 Recovery 使用时 panic 已在上游转换，此处
-// 记录 error）。无 transport 上下文时相应字段记 "-"。日志写出后依次调用
-// WithSink 注册的旁路消费者（隔离执行，不影响返回值）。
+// 记录耗时、错误与 panic。无 transport 上下文时相应字段记 "-"。日志写出后
+// 依次调用 WithSink 注册的旁路消费者（隔离执行，不影响返回值）。
+//
+// # panic 请求同样产出记录（#20）
+//
+// 下游 panic 时本中间件在恢复点产出 AccessRecord{Panic: true, Err: panic 摘要}
+// ——记日志、喂 sink——随后按原值重新抛出，交由外层 Recovery（或框架自身的
+// recover 机制）处理。此前 panic 请求零访问记录，故障时段 access log 完全失明。
+// 日志级别 Warn、字段经 WithLogFields 构建（Hertz 薄壳按 Recovery 缺省 500 记
+// 状态码）。
 func AccessLog(opts ...AccessLogOption) chain.Middleware {
 	cfg := &accessLogConfig{logger: accessLog, message: "access"}
 	for _, opt := range opts {
@@ -154,8 +166,22 @@ func AccessLog(opts ...AccessLogOption) chain.Middleware {
 			}
 
 			start := time.Now()
-			resp, err := next(ctx, req)
-			rec := AccessRecord{Kind: kind, Operation: display, Latency: time.Since(start), Err: err}
+			var (
+				resp     any
+				err      error
+				panicked bool
+				panicVal any
+			)
+			func() {
+				defer func() {
+					if r := recover(); r != nil {
+						panicked, panicVal = true, r
+						err = fmt.Errorf("panic: %v", r)
+					}
+				}()
+				resp, err = next(ctx, req)
+			}()
+			rec := AccessRecord{Kind: kind, Operation: display, Latency: time.Since(start), Err: err, Panic: panicked}
 
 			var kvs []any
 			if cfg.fields != nil {
@@ -165,12 +191,18 @@ func AccessLog(opts ...AccessLogOption) chain.Middleware {
 			}
 			if rec.Err != nil {
 				kvs = append(kvs, "err", rec.Err.Error())
+				if rec.Panic {
+					kvs = append(kvs, "panic", true)
+				}
 				logger.CtxWarn(ctx, cfg.message, kvs...)
 			} else {
 				logger.CtxInfo(ctx, cfg.message, kvs...)
 			}
 			for _, sink := range cfg.sinks {
 				runSink(ctx, logger, sink, req, rec)
+			}
+			if panicked {
+				panic(panicVal) // 记录已产出，按原值重抛交外层 Recovery
 			}
 			return resp, err
 		}
