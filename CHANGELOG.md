@@ -1,3 +1,26 @@
+## [v0.11.0] — 2026-10-18
+
+### feat(accesslog)：落库 sink + 响应自管一键形态 + 适用边界文档（[#18](https://github.com/oekit/middleware/issues/18)）
+- **`WithAccessLogSink(AccessSink)`**：访问记录旁路消费者——同一份记录
+  `AccessRecord{Method, Path, Status, Latency, ClientIP, UserAgent, TraceID}`
+  （与日志字段同源，Path 已脱敏）交给调用方自己的 access_log 表 / 审计上报；
+  `c *app.RequestContext` 同传，可读鉴权中间件注入的 userId 等业务键（仅本次调用内
+  有效，异步落库只持有 rec）。sink 返回 error 或 panic 都只记 Warn、**绝不影响主链路**；
+  多个 sink 彼此隔离按序调用；`SkipPaths` 命中不触发（跳过 = 不记录，日志与落库口径一致）
+- **`chainmw.WithSink`** 内核级同构能力（`AccessSink func(ctx, req any, rec AccessRecord) error`，
+  `runSink` 隔离 error/panic）——根包 Hertz 薄壳逐 sink 注册进内核，kitex 经 ToKitex
+  桥接同步获得（一份逻辑两端跑，#14 口径）
+- **`StackConfig.DisableResponseWrap`**：栈内不挂 ResponseMiddleware，得到
+  TraceID → Recovery → AccessLog——「响应体由各 handler 自己构造、与既有 API 契约对齐」
+  的服务一键形态；**`StackConfig.AccessLogOptions`** 透传 sink/脱敏等额外选项
+  （SkipPaths 仍单点传入）
+- 文档（doc.go / README / DefaultMiddleware godoc）新增「适用边界」：本栈面向响应契约
+  统一的服务；响应自管请用 DisableResponseWrap 或 MinimalMiddleware + AccessLog；
+  ResponseMiddleware 只包顶层无 `code` 的裸 JSON、已含 `code` 原样放行；中间件可按
+  路由组装配（Hertz `Use`/`Group` 接受变参，栈切片直接 `...` 展开，组内再叠自家 JWT/ApiKey）
+- 既有行为澄清（测试钉住）：panic 请求在栈序 Recovery → AccessLog 下无访问记录
+  （panic 穿过 AccessLog 直达外层 Recovery），与 sink 无关
+
 ## [v0.10.0] — 2026-10-18
 
 ### feat(stack)：指标一步形态 `StackConfig.Prometheus`（[#16](https://github.com/oekit/middleware/issues/16)）

@@ -6,14 +6,16 @@
 //
 // # 组件总览
 //
-//   - DefaultMiddleware  — 一键标准栈（TraceID → Recovery → Response → AccessLog，零指标强制）
+//   - DefaultMiddleware  — 一键标准栈（TraceID → Recovery → Response → AccessLog，零指标强制；
+//     StackConfig.DisableResponseWrap 响应自管形态、AccessLogOptions 透传落库 sink）
 //   - MinimalMiddleware  — 最小安全栈（TraceID → Recovery；零指标/零日志，供自定义栈下限）
 //   - chainmw 子包 — transport 感知的框架无关中间件内核（github.com/oekit/middleware/chainmw；
 //     AccessLog/Recovery/MetadataPropagate——本包 Recovery/AccessLog 为其薄壳，kitex 桥接复用同一份实现）
 //   - ResponseMiddleware — 统一 JSON 响应格式 {code, data, message, trace_id}
 //     （支持 WithSkipPaths / WithSkipPrefixes 声明式跳过 + SkipResponseWrap handler 级逃生舱）
 //   - hmw.Middleware — trace_id 生成/透传（hmw 子包，路径 github.com/oekit/middleware/hmw）
-//   - AccessLogMiddleware — 请求访问日志（method, path, status, latency, ip）
+//   - AccessLogMiddleware — 请求访问日志（method, path, status, latency, ip；
+//     WithAccessLogSink 同一份记录旁路落库/上报，sink 故障隔离不影响主链路）
 //   - PrometheusMetrics  — Prometheus HTTP 指标采集（请求数 / 延迟 / 并发 / 体积；显式拼装）
 //   - RecoveryMiddleware — panic recovery（可选 SentryReporter 监控钩子）
 //   - RateLimitMiddleware — 令牌桶限流（默认按 RemoteAddr 分键）
@@ -32,6 +34,41 @@
 //	    h.Use(m)
 //	}
 //	// 顺序: TraceID → Recovery → Response → AccessLog
+//
+// # 适用边界：响应体自管的服务（#18）
+//
+// DefaultMiddleware 面向「响应契约统一、由中间件包装」的服务。如果你的响应体由
+// 各 handler 自己构造（与既有 API 对齐、自定义字段名、null 字段整个不出现等），
+// 不要让中间件接管响应——ResponseMiddleware 对顶层无 "code" 的裸 JSON 会包壳
+// （顶层已含 "code" 的原样放行），没必要押在这条启发式判定上：
+//
+//	// 一键：TraceID → Recovery → AccessLog，响应构造权完全留在 handler
+//	h.Use(mw.DefaultMiddleware(mw.StackConfig{DisableResponseWrap: true})...)
+//
+//	// 手拼：最小安全栈 + 按需挂访问日志
+//	h.Use(mw.MinimalMiddleware()...)
+//	h.Use(mw.AccessLogMiddleware())
+//
+// 访问日志要落到自家 access_log 表时用 WithAccessLogSink（同一份记录旁路交给
+// DAO，c 可读鉴权中间件注入的 userId；sink 出错/panic 只记 Warn，不影响响应）：
+//
+//	h.Use(mw.DefaultMiddleware(mw.StackConfig{
+//	    DisableResponseWrap: true,
+//	    AccessLogOptions: []mw.AccessLogOption{mw.WithAccessLogSink(
+//	        func(ctx context.Context, c *app.RequestContext, rec mw.AccessRecord) error {
+//	            uid, _ := c.Get("userId")
+//	            return accessLogDAO.Save(ctx, uid, rec)
+//	        })},
+//	})...)
+//
+// 中间件可按路由组装配——Hertz 的 Use/Group 接受变参，栈切片直接展开，组内再叠
+// 自家 JWT / ApiKey 鉴权：
+//
+//	api := h.Group("/api", mw.DefaultMiddleware(cfg)...)
+//	user := api.Group("/user", auth.Required(svc))
+//
+// 任何形态 Recovery 都是硬性要求（Hertz 无默认 PanicHandler，缺失则 panic 直接断连）；
+// RecoveryMiddleware(WithRecoveryErrorHandler(...)) 可换成自己的 500 响应体。
 //
 // 需要 HTTP 指标时显式拼在栈最前（v0.2.0 起 Prometheus 从默认栈拆出）：
 //
