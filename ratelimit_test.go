@@ -91,9 +91,9 @@ func TestWithLimiterTTL(t *testing.T) {
 }
 
 func TestDefaultIPKey(t *testing.T) {
-	// defaultIPKey delegates to c.ClientIP(); just ensure the function
-	// runs without panic and returns a non-empty string for an HTTP/1.1
-	// request with a typical remote address.
+	// defaultIPKey keys by the host part of RemoteAddr (port stripped via
+	// hostOnly); just ensure the function runs without panic and returns a
+	// non-empty string for an HTTP/1.1 request with a typical remote address.
 	c := newTestContext("")
 	got := defaultIPKey(c)
 	if got == "" {
