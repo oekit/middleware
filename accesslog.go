@@ -48,6 +48,9 @@ type AccessRecord struct {
 	UserAgent string
 	// TraceID hmw 注入的 trace_id；未挂 hmw.Middleware 时为空串。
 	TraceID string
+	// Panic 为 true 表示本记录来自 panic 恢复点（#20）：请求已被记日志/喂 sink
+	// 后按原值重抛给外层 Recovery；Status 按 Recovery 缺省 500 记。
+	Panic bool
 }
 
 // AccessSink 接收单次请求的访问记录（[#18](https://github.com/oekit/middleware/issues/18)），
@@ -108,14 +111,19 @@ var accessLog = logx.Delegating("access")
 
 // accessRecordOf 由 Hertz 请求上下文与内核采集结果拼出 HTTP 语义的访问记录。
 func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecord {
+	status := c.Response.StatusCode()
+	if rec.Panic {
+		status = 500 // panic 恢复点状态码尚未写出，按 Recovery 缺省 500 记（#20）
+	}
 	return AccessRecord{
 		Method:    string(c.Method()),
 		Path:      rec.Operation,
-		Status:    c.Response.StatusCode(),
+		Status:    status,
 		Latency:   rec.Latency,
 		ClientIP:  c.ClientIP(),
 		UserAgent: string(c.UserAgent()),
 		TraceID:   hmw.FromRequestContext(c),
+		Panic:     rec.Panic,
 	}
 }
 
@@ -128,6 +136,9 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecor
 //     （webhook/{token} 类）做路径脱敏，token 不落日志
 //   - 可通过 WithAccessLogSink 把同一份记录（AccessRecord）旁路交给落库/上报
 //     消费者；sink 出错或 panic 只记 Warn，不影响主链路（#18）
+//   - panic 请求同样产出记录（#20）：恢复点记 Warn 日志（status 按 Recovery
+//     缺省 500）并喂 sink（AccessRecord.Panic 标记）后按原值重抛，外层 Recovery
+//     照常处理——落库场景 panic 请求同样留痕
 //   - 无参调用即启用默认配置（不跳过任何路径、不脱敏、不落库）
 //
 // # 实现说明（#14）
@@ -167,10 +178,17 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 			if !ok {
 				return nil
 			}
+			status := c.Response.StatusCode()
+			if rec.Panic {
+				// panic 恢复点记录：状态码尚未写出（Recovery 在外侧、稍后写缺省
+				// 500 统一错误体），按 500 记（#20；自定义 ErrorHandler 时以
+				// Recovery 自身日志为准）
+				status = 500
+			}
 			return []any{
 				"method", string(c.Method()),
 				"path", rec.Operation,
-				"status", c.Response.StatusCode(),
+				"status", status,
 				"latency_ms", rec.Latency.Milliseconds(),
 				"ip", c.ClientIP(),
 			}

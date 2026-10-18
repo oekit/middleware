@@ -1,6 +1,7 @@
 package mw
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"net/http"
@@ -110,5 +111,32 @@ func TestAccessLogMiddleware_SinkFailureIsolated(t *testing.T) {
 	}
 	if !third {
 		t.Fatal("前一个 sink panic 不应阻断后续 sink")
+	}
+}
+
+// TestAccessLogMiddleware_PanicRecord 钉住 #20：panic 请求产出访问记录
+// （Status 按 Recovery 缺省 500、Panic 标记进 sink），响应仍由 Recovery 写统一错误体。
+func TestAccessLogMiddleware_PanicRecord(t *testing.T) {
+	var got AccessRecord
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(hmw.Middleware()...)
+	h.Use(DefaultMiddleware(StackConfig{
+		AccessLogOptions: []AccessLogOption{WithAccessLogSink(
+			func(_ context.Context, _ *app.RequestContext, rec AccessRecord) error {
+				got = rec
+				return nil
+			})},
+	})...)
+	h.GET("/boom", func(ctx context.Context, c *app.RequestContext) { panic("db explode") })
+
+	r := ut.PerformRequest(h, http.MethodGet, "/boom", nil).Result()
+	if r.StatusCode() != 500 || !bytes.Contains(r.Body(), []byte(`"code"`)) {
+		t.Fatalf("Recovery 应照常写 500 统一错误体：%d %s", r.StatusCode(), r.Body())
+	}
+	if !got.Panic || got.Status != 500 || got.Path != "/boom" {
+		t.Fatalf("panic 请求的 sink 记录应 Panic=true / Status=500：%+v", got)
+	}
+	if got.TraceID == "" {
+		t.Error("panic 请求记录也应携带 trace_id")
 	}
 }
