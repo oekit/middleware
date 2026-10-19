@@ -1,3 +1,7 @@
+## [v0.12.1] — 2026-10-19
+
+- build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.5.4 → v0.17.0、logx v0.6.0 → v0.7.0、core v0.7.0 → v0.9.2、pkg v0.11.0 → v0.15.1
+
 ## [v0.12.0] — 2026-10-18
 
 ### fix(accesslog)：panic 请求同样产出访问记录（[#20](https://github.com/oekit/middleware/issues/20)）
