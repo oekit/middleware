@@ -435,3 +435,71 @@ func TestAccessLogPanicRecord(t *testing.T) {
 		t.Fatal("skip 命中的 panic 不应触发 sink")
 	}
 }
+
+// TestAccessLogSilent 钉住 #38：静默下不写任何日志，但采集行为完全不变——
+// 脱敏、sink 调用照常。
+func TestAccessLogSilent(t *testing.T) {
+	rec := &captureLogger{}
+	ctx := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: "/api/v2/webhook/alert/tk-1"})
+
+	var got AccessRecord
+	calls := 0
+	h := chain.Finalize(func(context.Context, any) (any, error) { return "ok", nil },
+		AccessLog(WithLogger(rec), WithSilent(),
+			WithRedactPathPrefixes("/api/v2/webhook/alert"),
+			WithSink(func(_ context.Context, _ any, r AccessRecord) error {
+				calls++
+				got = r
+				return nil
+			}),
+		))
+	h(ctx, "req")
+
+	if out := rec.text(); out != "" {
+		t.Errorf("静默不应写任何日志：%s", out)
+	}
+	if calls != 1 {
+		t.Fatalf("静默下 sink 仍应被调用，got %d", calls)
+	}
+	if got.Operation != "/api/v2/webhook/alert/***" {
+		t.Errorf("静默下脱敏仍应生效：%q", got.Operation)
+	}
+}
+
+// TestAccessLogSilentSkipAndPanic 钉住 #38：静默下跳过判定与 panic 记录照常
+// （panic 请求仍产出 Panic 记录并按原值重抛）。
+func TestAccessLogSilentSkipAndPanic(t *testing.T) {
+	rec := &captureLogger{}
+
+	// skip 命中的请求：不写日志、不喂 sink
+	skipCalls := 0
+	ctx := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: "/metrics"})
+	h := chain.Finalize(func(context.Context, any) (any, error) { return "ok", nil },
+		AccessLog(WithLogger(rec), WithSilent(), WithSkipPaths("/metrics"),
+			WithSink(func(context.Context, any, AccessRecord) error { skipCalls++; return nil })))
+	h(ctx, "req")
+	if skipCalls != 0 {
+		t.Fatalf("skip 命中不应触发 sink，got %d", skipCalls)
+	}
+
+	// panic 请求：仍产出记录并按原值重抛
+	var got AccessRecord
+	pctx := transport.NewServerContext(context.Background(), &stubTransporter{kind: transport.KindHTTP, op: "/boom"})
+	ph := chain.Finalize(func(context.Context, any) (any, error) { panic("db explode") },
+		AccessLog(WithLogger(rec), WithSilent(),
+			WithSink(func(_ context.Context, _ any, r AccessRecord) error { got = r; return nil })))
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		_, _ = ph(pctx, nil)
+	}()
+	if recovered != "db explode" {
+		t.Fatalf("panic 应按原值重抛，got %v", recovered)
+	}
+	if !got.Panic || got.Err == nil {
+		t.Fatalf("静默下 panic 记录仍应产出：%+v", got)
+	}
+	if out := rec.text(); out != "" {
+		t.Errorf("静默下不应写任何日志：%s", out)
+	}
+}

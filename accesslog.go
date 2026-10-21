@@ -28,6 +28,19 @@ type AccessLogOptions struct {
 
 	// Sinks 是访问记录的旁路消费者列表（落库 / 上报），见 WithAccessLogSink。
 	Sinks []AccessSink
+
+	// Silent 开启「只采不写」模式（#38）：本中间件不写任何日志（访问日志
+	// 本身与 sink 故障告警都不写），但采集行为完全不变——SkipPaths 判定、
+	// 路径脱敏、sink 调用、panic 请求的记录产出与原值重抛都照常。
+	// 适用于宿主自带 logger 输出同一份记录、不想双写的场景。
+	Silent bool
+
+	// Logger 是访问日志的输出 logger；nil 表示用内建 logx.Delegating("access")
+	// （默认行为）。注入宿主自己的 logger 后，访问记录仍由本中间件写出
+	// （消息与字段不变），只是落到宿主的后端——宿主无需再写一份造成双写
+	// （#38）。宿主用 zap 等非 logx 后端时可自行实现 logx.Logger 适配，
+	// 或改用 logx.SetDefault 整体替换后端。
+	Logger logx.Logger
 }
 
 // AccessRecord 是 AccessLogMiddleware 单次请求的 HTTP 采集结果，与日志字段
@@ -99,6 +112,49 @@ func WithAccessLogSink(sink AccessSink) AccessLogOption {
 	}
 }
 
+// WithAccessLogSilent 开启「只采不写」模式（#38）。
+//
+// 中间件不再写任何日志：访问日志本身、以及 sink 失败/panic 的告警日志都
+// 不写。**采集行为完全不变**——SkipPaths 判定、路径脱敏、sink 调用（时机与
+// 顺序不变）、panic 请求的记录产出（AccessRecord.Panic=true）与按原值重抛
+// 都照常，因此库的 redaction / skip 能力在静默下依然可用。
+//
+// 典型用法：宿主有自己的 logger（含业务字段、按状态码分级），想复用库的
+// 脱敏与跳过能力、但不想让库再写一行造成双写——此时由 sink 或宿主自己的
+// 采集逻辑输出记录，中间件只负责采集：
+//
+//	h.Use(mw.AccessLogMiddleware(
+//	    mw.WithAccessLogSilent(),
+//	    mw.WithAccessLogRedactPathPrefixes("/api/v2/webhook/alert"),
+//	    mw.WithAccessLogSink(func(ctx context.Context, c *app.RequestContext, rec mw.AccessRecord) error {
+//	        return dao.SaveAccessLog(ctx, rec)
+//	    }),
+//	))
+//
+// 与 WithAccessLogLogger 同时使用时静默优先：注入的 logger 只用于 sink 告警，
+// 静默下也不写。
+func WithAccessLogSilent() AccessLogOption {
+	return func(o *AccessLogOptions) {
+		o.Silent = true
+	}
+}
+
+// WithAccessLogLogger 注入访问日志的输出 logger（#38）。
+//
+// 默认用内建 logx.Delegating("access")；注入后访问记录仍由本中间件写出
+// （消息 "request" 与字段 method/path/status/latency_ms/ip 不变），只是落到
+// 宿主的后端——宿主不必再写一份，避免双写。nil 被忽略（保持默认 logger）。
+//
+// 宿主用 zap 等非 logx 后端时，可自行实现 logx.Logger 接口做适配；若只是
+// 想换后端而不改字段，用 logx.SetDefault 整体替换更省事。
+func WithAccessLogLogger(l logx.Logger) AccessLogOption {
+	return func(o *AccessLogOptions) {
+		if l != nil {
+			o.Logger = l
+		}
+	}
+}
+
 func newAccessLogOptions(opts ...AccessLogOption) *AccessLogOptions {
 	cfg := &AccessLogOptions{}
 	for _, opt := range opts {
@@ -139,6 +195,9 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecor
 //   - panic 请求同样产出记录（#20）：恢复点记 Warn 日志（status 按 Recovery
 //     缺省 500）并喂 sink（AccessRecord.Panic 标记）后按原值重抛，外层 Recovery
 //     照常处理——落库场景 panic 请求同样留痕
+//   - 可通过 WithAccessLogSilent 关闭内建日志输出（只采不写，采集行为不变）
+//     或通过 WithAccessLogLogger 注入宿主 logger（避免宿主再写一份造成双写）
+//     （#38）
 //   - 无参调用即启用默认配置（不跳过任何路径、不脱敏、不落库）
 //
 // # 实现说明（#14）
@@ -164,12 +223,31 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecor
 //	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSink(func(ctx context.Context, c *app.RequestContext, rec mw.AccessRecord) error {
 //	    return dao.SaveAccessLog(ctx, rec)
 //	})))
+//
+//	// 宿主自带 logger 输出同一份记录：静默关闭内建日志，只采不写（#38）
+//	h.Use(mw.AccessLogMiddleware(
+//	    mw.WithAccessLogSilent(),
+//	    mw.WithAccessLogRedactPathPrefixes("/api/v2/webhook/alert"),
+//	    mw.WithAccessLogSink(func(ctx context.Context, c *app.RequestContext, rec mw.AccessRecord) error {
+//	        return dao.SaveAccessLog(ctx, rec)
+//	    }),
+//	))
+//
+//	// 或把内建日志改道到宿主的 logger（宿主不再自己写一份）
+//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogLogger(hostLogger)))
 func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 	cfg := newAccessLogOptions(opts...)
 
-	kernelOpts := make([]chainmw.AccessLogOption, 0, 5+len(cfg.Sinks))
+	// logger 解析顺序：显式注入 > 内建 Delegating（#38）。静默模式下 logger
+	// 只用于 sink 故障告警，且静默优先——告警也不写。
+	logger := cfg.Logger
+	if logger == nil {
+		logger = accessLog
+	}
+
+	kernelOpts := make([]chainmw.AccessLogOption, 0, 6+len(cfg.Sinks))
 	kernelOpts = append(kernelOpts,
-		chainmw.WithLogger(accessLog),
+		chainmw.WithLogger(logger),
 		chainmw.WithLogMessage("request"),
 		chainmw.WithSkipPaths(cfg.SkipPaths...),
 		chainmw.WithRedactPathPrefixes(cfg.RedactPathPrefixes...),
@@ -194,6 +272,9 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 			}
 		}),
 	)
+	if cfg.Silent {
+		kernelOpts = append(kernelOpts, chainmw.WithSilent())
+	}
 	// 每个 sink 单独注册进内核：内核逐个隔离执行，前一个 panic 不影响后一个。
 	for _, sink := range cfg.Sinks {
 		sink := sink

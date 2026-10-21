@@ -78,6 +78,7 @@ type accessLogConfig struct {
 	skip    []string
 	redact  []string
 	sinks   []AccessSink
+	silent  bool
 }
 
 // WithLogger 注入 logger（默认 logx.Delegating("chainmw-accesslog")）。
@@ -125,14 +126,31 @@ func WithSink(sink AccessSink) AccessLogOption {
 	}
 }
 
+// WithSilent 开启「只采不写」模式（#38）。
+//
+// 静默时本中间件不写任何日志：访问日志本身、以及 sink 失败/panic 的告警
+// 日志都不写。采集行为完全不变——SkipPaths 判定、路径脱敏、耗时采集、
+// sink 调用（时机与顺序不变）、panic 请求的记录产出与按原值重抛都照常。
+//
+// 适用于宿主自带 logger 输出同一份记录的场景：记录由 sink 或宿主自己的
+// 采集逻辑产出，本中间件不再额外写一行，避免双写。与 WithLogger 注入的
+// logger 叠加时静默优先（logger 仅用于 sink 告警，静默下也不写）。
+func WithSilent() AccessLogOption {
+	return func(c *accessLogConfig) { c.silent = true }
+}
+
 // runSink 隔离执行单个 sink：error 与 panic 都只记 Warn，不向调用方传播。
-func runSink(ctx context.Context, logger logx.Logger, sink AccessSink, req any, rec AccessRecord) {
+// 静默模式下不记 Warn（只采不写），但 panic 隔离与 error 吞掉照常——
+// sink 的故障绝不能影响主链路。
+func runSink(ctx context.Context, logger logx.Logger, sink AccessSink, req any, rec AccessRecord, silent bool) {
 	defer func() {
 		if r := recover(); r != nil {
-			logger.CtxWarn(ctx, "access sink panic", "op", rec.Operation, "panic", fmt.Sprint(r))
+			if !silent {
+				logger.CtxWarn(ctx, "access sink panic", "op", rec.Operation, "panic", fmt.Sprint(r))
+			}
 		}
 	}()
-	if err := sink(ctx, req, rec); err != nil {
+	if err := sink(ctx, req, rec); err != nil && !silent {
 		logger.CtxWarn(ctx, "access sink failed", "op", rec.Operation, "err", err.Error())
 	}
 }
@@ -148,6 +166,12 @@ func runSink(ctx context.Context, logger logx.Logger, sink AccessSink, req any, 
 // recover 机制）处理。此前 panic 请求零访问记录，故障时段 access log 完全失明。
 // 日志级别 Warn、字段经 WithLogFields 构建（Hertz 薄壳按 Recovery 缺省 500 记
 // 状态码）。
+//
+// # 静默模式（#38）
+//
+// WithSilent 开启「只采不写」：不写任何日志（访问日志与 sink 告警都不写），
+// 采集行为完全不变（SkipPaths / 脱敏 / sink / panic 记录与重抛照常）。
+// 宿主自带 logger 输出同一份记录时用它避免双写。
 func AccessLog(opts ...AccessLogOption) chain.Middleware {
 	cfg := &accessLogConfig{logger: accessLog, message: "access"}
 	for _, opt := range opts {
@@ -183,23 +207,25 @@ func AccessLog(opts ...AccessLogOption) chain.Middleware {
 			}()
 			rec := AccessRecord{Kind: kind, Operation: display, Latency: time.Since(start), Err: err, Panic: panicked}
 
-			var kvs []any
-			if cfg.fields != nil {
-				kvs = cfg.fields(ctx, req, rec)
-			} else {
-				kvs = []any{"kind", rec.Kind, "op", rec.Operation, "cost", rec.Latency.String()}
-			}
-			if rec.Err != nil {
-				kvs = append(kvs, "err", rec.Err.Error())
-				if rec.Panic {
-					kvs = append(kvs, "panic", true)
+			if !cfg.silent {
+				var kvs []any
+				if cfg.fields != nil {
+					kvs = cfg.fields(ctx, req, rec)
+				} else {
+					kvs = []any{"kind", rec.Kind, "op", rec.Operation, "cost", rec.Latency.String()}
 				}
-				logger.CtxWarn(ctx, cfg.message, kvs...)
-			} else {
-				logger.CtxInfo(ctx, cfg.message, kvs...)
+				if rec.Err != nil {
+					kvs = append(kvs, "err", rec.Err.Error())
+					if rec.Panic {
+						kvs = append(kvs, "panic", true)
+					}
+					logger.CtxWarn(ctx, cfg.message, kvs...)
+				} else {
+					logger.CtxInfo(ctx, cfg.message, kvs...)
+				}
 			}
 			for _, sink := range cfg.sinks {
-				runSink(ctx, logger, sink, req, rec)
+				runSink(ctx, logger, sink, req, rec, cfg.silent)
 			}
 			if panicked {
 				panic(panicVal) // 记录已产出，按原值重抛交外层 Recovery
