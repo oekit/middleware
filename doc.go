@@ -15,7 +15,8 @@
 //     （支持 WithSkipPaths / WithSkipPrefixes 声明式跳过 + SkipResponseWrap handler 级逃生舱）
 //   - hmw.Middleware — trace_id 生成/透传（hmw 子包，路径 github.com/oekit/middleware/hmw）
 //   - AccessLogMiddleware — 请求访问日志（method, path, status, latency, ip；
-//     WithAccessLogSink 同一份记录旁路落库/上报，sink 故障隔离不影响主链路）
+//     WithAccessLogSink 同一份记录旁路落库/上报，sink 故障隔离不影响主链路；
+//     WithAccessLogSilent 只采不写 / WithAccessLogLogger 注入宿主 logger 避免双写）
 //   - PrometheusMetrics  — Prometheus HTTP 指标采集（请求数 / 延迟 / 并发 / 体积；显式拼装）
 //   - RecoveryMiddleware — panic recovery（可选 SentryReporter 监控钩子）
 //   - RateLimitMiddleware — 令牌桶限流（默认按 RemoteAddr 分键）
@@ -60,6 +61,18 @@
 //	            return accessLogDAO.Save(ctx, uid, rec)
 //	        })},
 //	})...)
+//
+// 宿主自带 logger 输出同一份记录时，用 WithAccessLogSilent 关闭内建日志
+// （只采不写，采集行为不变）或用 WithAccessLogLogger 把日志改道到宿主 logger，
+// 避免双写（#38）：
+//
+//	h.Use(mw.AccessLogMiddleware(
+//	    mw.WithAccessLogSilent(),
+//	    mw.WithAccessLogRedactPathPrefixes("/api/v2/webhook/alert"),
+//	    mw.WithAccessLogSink(func(ctx context.Context, c *app.RequestContext, rec mw.AccessRecord) error {
+//	        return accessLogDAO.Save(ctx, rec)
+//	    }),
+//	))
 //
 // 中间件可按路由组装配——Hertz 的 Use/Group 接受变参，栈切片直接展开，组内再叠
 // 自家 JWT / ApiKey 鉴权：

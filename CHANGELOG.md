@@ -1,3 +1,31 @@
+## [v0.13.0] — 2026-10-22
+
+### feat(accesslog)：内建日志可关闭/改道——只采不写或注入宿主 logger（[#38](https://github.com/oekit/middleware/issues/38)）
+- `mw.AccessLogMiddleware` 此前**总是自己写一行日志**（`logx.Delegating("access")` 写死），
+  宿主想用自己的 logger 输出同一份记录就会**双写**——想用库的
+  `WithAccessLogRedactPathPrefixes`（防「URL 路径即凭证」路由把 token 写进日志）
+  与 `WithAccessLogSkipPaths`，又不能接受库那行输出，只能整段手搓、库的 redaction
+  能力用不上
+- 新增两个入口（issue 给的两个方案都做了）：
+  - `mw.WithAccessLogSilent() AccessLogOption`——**只采不写**：不写任何日志
+    （访问日志本身与 sink 失败/panic 的告警日志都不写），**采集行为完全不变**：
+    SkipPaths 判定、路径脱敏、sink 调用（时机与顺序不变）、panic 请求的记录
+    产出（`AccessRecord.Panic=true`）与按原值重抛都照常——所以库的脱敏与跳过
+    能力在静默下依然可用，宿主拿 sink 或自己的采集逻辑输出记录即可
+  - `mw.WithAccessLogLogger(l logx.Logger) AccessLogOption`——把内建日志改道到
+    宿主 logger（消息 `request` 与字段 method/path/status/latency_ms/ip 不变），
+    宿主不必再写一份；`nil` 被忽略（保持默认 logger）。宿主用 zap 等非 logx
+    后端时自行实现 `logx.Logger` 适配，或用 `logx.SetDefault` 整体换后端
+- 内核 `chainmw` 新增同构的 `chainmw.WithSilent()`（kitex 经 `ToKitex` 桥接
+  同步获得）；根包薄壳按 `Silent`/`Logger` 装配进内核选项
+- 与 `WithAccessLogLogger` 叠加时静默优先：注入的 logger 只用于 sink 告警，
+  静默下也不写
+- 行为变更：无参调用与既有配置的输出**逐字不变**（默认仍用内建 Delegating
+  logger、仍写日志）——新增能力均为 opt-in
+- 测试：内核 2 例（静默不写日志 + sink/脱敏照常、skip 与 panic 记录照常）+
+  根包 4 例（静默下采集不变、sink 故障静默且不影响响应、静默下 panic 记录
+  Panic=true、注入 logger 只写一条且字段不变、选项装配）
+
 ## [v0.12.1] — 2026-10-19
 
 - build: 矩阵内依赖地板对齐（align_floors 不动点）：concurrency v0.5.4 → v0.17.0、logx v0.6.0 → v0.7.0、core v0.7.0 → v0.9.2、pkg v0.11.0 → v0.15.1
