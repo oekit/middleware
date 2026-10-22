@@ -1,3 +1,7 @@
+## [v0.13.1] — 2026-10-22
+
+- build(deps): larksuite/oapi-sdk-go/v3 v3.12.1 → v3.12.2（零代码改动）
+
 ## [v0.13.0] — 2026-10-22
 
 ### feat(accesslog)：内建日志可关闭/改道——只采不写或注入宿主 logger（[#38](https://github.com/oekit/middleware/issues/38)）
