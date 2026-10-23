@@ -163,6 +163,15 @@
 
 - fix(deps): 内部依赖地板全量对齐最新——concurrency v0.5.2、logx v0.5.0、metrics v0.1.6、registry v0.3.1、tracing v0.2.1、pkg v0.9.3；go 维持 1.26.0（tracing/OTel 生态传导）
 
+> **⚠️ 本版本不在主线版本线上**（旁支版本，事实声明见 [oekit/middleware#46](https://github.com/oekit/middleware/issues/46)）
+>
+> - 本仓主线自 **v0.5.0**（「仓库结构重置后的首个版本（历史与旧版本号 v0.1.0–v0.4.0 已清空重做）」）起算；**v0.5.1 不是该主线上的版本**。
+> - 发布时刻 **2026-10-17 16:52:47 +0800**，**晚于**同线的 `v0.6.0`（16:08:29）——版本号在时间线上回退，系发布时的笔误。
+> - 内容为一次依赖地板对齐（自带 `registry v0.3.1` 地板——该版本仍有 `registry/registry`），现路径 `github.com/oekit/middleware` 可安装可编译。
+> - **当前请使用主线版本**（`v0.13.1+`）。
+> - tag **保留不删**：已发布 tag 在 Go module proxy 上有缓存，删 tag / 重推 = 已缓存消费方集体中毒。
+> - 跨仓门禁口径见 [oekit/matrix-tools#88](https://github.com/oekit/matrix-tools/issues/88)（发布序列倒挂检测）。
+
 ## [v0.5.0] — 2026-10-17
 
 仓库结构重置后的首个版本（历史与旧版本号 v0.1.0–v0.4.0 已清空重做，从 v0.5.0 起算）。
