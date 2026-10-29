@@ -361,8 +361,8 @@ github.com/nats-io/nuid v1.0.1/go.mod h1:19wcPz3Ph3q0Jbyiqsd0kePYG7A95tJPxeL+1OS
 github.com/nxadm/tail v1.4.8 h1:nPr65rt6Y5JFSKQO7qToXr7pePgD6Gwiw05lkbyAQTE=
 github.com/nxadm/tail v1.4.8/go.mod h1:+ncqLTQzXmGhMZNUePPaPqPvBxHAIsmXswZKocGu+AU=
 github.com/nyaruka/phonenumbers v1.0.55/go.mod h1:sDaTZ/KPX5f8qyV9qN+hIm+4ZBARJrupC6LuhshJq1U=
-github.com/oekit/concurrency v0.23.1 h1:aW+U6kYBY3hSyrFvjNNecGqUg4RBKSCPc6c5XJ/Kk/0=
-github.com/oekit/concurrency v0.23.1/go.mod h1:ht9EmByozS4A4fpEO6O2OSCfMe9/LiBXxL4t9hUb8kM=
+github.com/oekit/concurrency v0.23.2 h1:1iMfoBe7ti6//IRJoyBlokhUKW0tSEvrQIvb3lEXyvI=
+github.com/oekit/concurrency v0.23.2/go.mod h1:eLMEfucIyKs1cLGK4+lKRQCf3Fgb6EE/mkpPXFMRuMA=
 github.com/oekit/core v0.12.1 h1:RPSr6AdWl3SpFzZ+w2a4C+nhvZr1NSNt8WNjtGotnM0=
 github.com/oekit/core v0.12.1/go.mod h1:HhBTwYHU5MUp9tfNvHjfZv6P4yglQmn4jKmz98dUIsM=
 github.com/oekit/logx v0.8.0 h1:S0KQOiI6h4GGktsv0fl1KtHBcOGZZgj6M6cUCLRk41E=
