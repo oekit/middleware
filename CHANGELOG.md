@@ -1,3 +1,7 @@
+## [v0.13.4] — 2026-10-29
+
+- build: 依赖地板对齐——concurrency 抬到 v0.23.2
+
 ## [v0.13.3] — 2026-10-28
 
 - fix(prometheus): 同名 collector 必须**复用已注册的实例**——此前只吞掉 `AlreadyRegisteredError`，把新建的（未注册的）collector 留在字段里 ⇒ 同一 Registry + namespace 下构造第二个 `PrometheusMetrics` 时它的全部指标都不会出现在采集端，而构造函数却「成功」返回 ⇒ 故障完全静默。代码注释写着「复用已注册的 collector」，实现并没有复用
