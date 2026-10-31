@@ -15,7 +15,11 @@ import (
 )
 
 // resetJWTState 重新设置全局 jwtState,每个测试隔离。
-// 因为 JWTAuth 用 sync.Once 懒构造,需要在每个测试前重置。
+// 因为 JWTAuth 用懒构造(全局单例),需要在每个测试前重置。
+//
+// ⚠️ 必须**整体重置**:runtime 是 atomic.Pointer,只清 opts 会留下上一次的
+//
+//	runtime ⇒ 测试之间互相污染(且 materialKey 指纹也会命中"无需重建")。
 func resetJWTState() {
 	globalJWTState = jwtState{}
 }
@@ -274,5 +278,202 @@ func TestJWTAuth_SkipPaths(t *testing.T) {
 	w2 := ut.PerformRequest(h.Engine, "GET", "/private", nil)
 	if w2.Code != 401 {
 		t.Errorf("protected path without token: got %d (want 401)", w2.Code)
+	}
+}
+
+// TestJWTAuth_SecretRotationKeepsSignAndVerifyConsistent 钉住 **签发/验签分裂**。
+//
+// 缺陷形态（2026-10-31 实测）：上游 HertzJWTMiddleware 把 Key/SigningAlgorithm
+// **拷进自己的字段**（构造后冻结），而全局 opts 是**可变**的。
+// ⇒ 二次调用 JWTAuth(换 secret)后：
+//   - 签发（JWTGenerateToken 读 opts）用**新** Key
+//   - 验签（中间件读 instance）用**旧** Key
+//     ⇒ 自家签的 token 被自家中间件 401 "signature is invalid"。
+//
+// 本测试是**行为级**断言：签发出来的 token 必须能被自家中间件接受。
+// 断言「签发与验签同源」，而不是断言某个内部字段的值。
+func TestJWTAuth_SecretRotationKeepsSignAndVerifyConsistent(t *testing.T) {
+	resetJWTState()
+
+	const secretA = "secret-A-at-least-32-bytes-long-for-hs256-alg-x"
+	const secretB = "secret-B-at-least-32-bytes-long-for-hs256-alg-y"
+
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.POST("/login", func(_ context.Context, c *app.RequestContext) {
+		tok, err := JWTGenerateToken(jwt.MapClaims{"user_id": "alice"})
+		if err != nil {
+			c.JSON(500, map[string]string{"err": err.Error()})
+			return
+		}
+		c.JSON(200, map[string]string{"token": tok})
+	})
+	protected := JWTAuth(WithJWTSecret([]byte(secretA)))
+	h.GET("/protected", protected, func(_ context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"ok": "true"})
+	})
+
+	// 轮换密钥：再次调用 JWTAuth 换 secret（运维常规动作）。
+	_ = JWTAuth(WithJWTSecret([]byte(secretB)))
+
+	// ⚠️ 轮换必须**真的生效**：当前 instance 必须用**新**密钥。
+	//    否则就是「轮换静默失效」——旧密钥仍被接受、新密钥签的 token 被拒,
+	//    而表面一切正常(没有报错)。
+	//    这条判据是「不重建 instance」那个变异的唯一区分点。
+	rt := globalJWTState.runtime.Load()
+	if rt == nil || rt.instance == nil {
+		t.Fatal("轮换后 runtime 未构造")
+	}
+	if got := string(rt.instance.Key); got != secretB {
+		t.Errorf("★ 轮换 secret 未生效：instance.Key = %q，期望新密钥 %q", got, secretB)
+	}
+
+	w := ut.PerformRequest(h.Engine, "POST", "/login", nil)
+	if w.Code != 200 {
+		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	}
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &loginResp); err != nil || loginResp.Token == "" {
+		t.Fatalf("bad login response: %v %s", err, w.Body.String())
+	}
+
+	// 轮换后签发的 token 必须仍被自家中间件接受。
+	w2 := ut.PerformRequest(h.Engine, "GET", "/protected", nil, ut.Header{
+		Key: "Authorization", Value: "Bearer " + loginResp.Token,
+	})
+	if w2.Code != 200 {
+		t.Errorf("轮换 secret 后自签 token 被自家中间件拒绝: got %d (want 200) body=%s",
+			w2.Code, w2.Body.String())
+	}
+}
+
+// TestJWTAuth_AlgorithmChangeKeepsSignAndVerifyConsistent 同型缺陷：
+// 换签名算法（HS256 → HS512）后，签发用新算法、验签用旧算法 ⇒
+// 解析直接失败（"invalid signing algorithm"）。
+func TestJWTAuth_AlgorithmChangeKeepsSignAndVerifyConsistent(t *testing.T) {
+	resetJWTState()
+
+	const secret = "secret-at-least-32-bytes-long-for-hs256-alg-xyz"
+
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.POST("/login", func(_ context.Context, c *app.RequestContext) {
+		tok, err := JWTGenerateToken(jwt.MapClaims{"user_id": "bob"})
+		if err != nil {
+			c.JSON(500, map[string]string{"err": err.Error()})
+			return
+		}
+		c.JSON(200, map[string]string{"token": tok})
+	})
+	protected := JWTAuth(WithJWTSecret([]byte(secret)))
+	h.GET("/protected", protected, func(_ context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"ok": "true"})
+	})
+
+	// 换签名算法。
+	_ = JWTAuth(WithJWTSecret([]byte(secret)), WithJWTAlgorithm("HS512"))
+
+	w := ut.PerformRequest(h.Engine, "POST", "/login", nil)
+	if w.Code != 200 {
+		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	}
+	var loginResp struct {
+		Token string `json:"token"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &loginResp); err != nil || loginResp.Token == "" {
+		t.Fatalf("bad login response: %v %s", err, w.Body.String())
+	}
+
+	w2 := ut.PerformRequest(h.Engine, "GET", "/protected", nil, ut.Header{
+		Key: "Authorization", Value: "Bearer " + loginResp.Token,
+	})
+	if w2.Code != 200 {
+		t.Errorf("换算法后自签 token 被自家中间件拒绝: got %d (want 200) body=%s",
+			w2.Code, w2.Body.String())
+	}
+
+	// JWTParse 也必须能用新算法解析（同一 runtime）。
+	if _, err := JWTParse(loginResp.Token); err != nil {
+		t.Errorf("JWTParse 换算法后失败: %v", err)
+	}
+}
+
+// TestJWTAuth_SignAndVerifyShareSameSource 钉住「同源」这个不变量本身：
+// 签发用的 Key/Algorithm 必须与验签 instance 里的**完全一致**。
+//
+// 为什么单独一条：上面两条是**行为级**（某个配置组合下会炸），
+// 这条是**结构级**（签发与验签读同一个对象）⇒ 任何配置组合下都不会分裂。
+func TestJWTAuth_SignAndVerifyShareSameSource(t *testing.T) {
+	resetJWTState()
+
+	const secret = "secret-at-least-32-bytes-long-for-hs256-alg-abc"
+	_ = JWTAuth(WithJWTSecret([]byte(secret)), WithJWTAlgorithm("HS512"))
+
+	rt := globalJWTState.runtime.Load()
+	if rt == nil || rt.instance == nil {
+		t.Fatal("runtime 未构造")
+	}
+	// 签发侧读到的 algorithm 必须来自 instance（而不是另有一份 opts）。
+	if got := rt.instance.SigningAlgorithm; got != "HS512" {
+		t.Errorf("instance.SigningAlgorithm = %q, want HS512", got)
+	}
+	if got := rt.instance.Key; string(got) != secret {
+		t.Errorf("instance.Key = %q, want %q", got, secret)
+	}
+}
+
+// TestJWTAuth_SigningMaterialComesFromRuntime 钉住「签发材料取自 runtime」
+// 这条**结构性**判据。
+//
+// 为什么必须单独一条（2026-10-31 变异验证实测）：
+// 修复之后，「重建 instance」会让 opts 与 instance 的值**恰好相同**
+// ⇒ 单看行为（签发的 token 能否被验签通过）**测不出**「签发侧读的是
+// opts 还是 instance」——两者结果一样！
+// ⇒ 唯一有区分力的判据是：**签发用的材料必须取自 runtime 里的 instance**。
+//
+//	变异「签发退回读 opts」⇒ 本判据立刻转红。
+//
+// 做法：先构造好 runtime，再**绕过 JWTAuth**直接把 opts 改成别的值
+// （模拟「有人改了 opts 但 instance 没重建」这个中间态），
+// 然后签发 ⇒ 签出来的 token 必须仍能被**当前 runtime 的 instance** 验签通过。
+// ⇒ 若签发读的是 opts，签出来的就是另一个密钥 ⇒ 验签失败 ⇒ 转红。
+func TestJWTAuth_SigningMaterialComesFromRuntime(t *testing.T) {
+	resetJWTState()
+
+	const secret = "secret-at-least-32-bytes-long-for-hs256-alg-qrs"
+	const other = "OTHER-secret-at-least-32-bytes-long-for-hs256-alg-z"
+
+	_ = JWTAuth(WithJWTSecret([]byte(secret)))
+	rt := globalJWTState.runtime.Load()
+	if rt == nil || rt.instance == nil {
+		t.Fatal("runtime 未构造")
+	}
+
+	// 制造中间态：opts 被改成别的密钥，但 instance 仍是旧的。
+	// 这正是「签发读 opts、验签读 instance」会分裂的那个窗口。
+	globalJWTState.mu.Lock()
+	globalJWTState.opts.secret = []byte(other)
+	globalJWTState.mu.Unlock()
+
+	// 签发 ⇒ 必须用 runtime 里 instance 的密钥（= secret），不是 opts 的 other。
+	tok, err := JWTGenerateToken(jwt.MapClaims{"user_id": "carol"})
+	if err != nil {
+		t.Fatalf("JWTGenerateToken: %v", err)
+	}
+
+	// 验签：用 runtime 的 instance 解析。
+	// 若签发读了 opts（other），这里必然失败。
+	if _, err := rt.instance.ParseTokenString(tok); err != nil {
+		t.Errorf("★ 签发材料不来自 runtime:签出的 token 无法被当前 instance 验签（%v）", err)
+	}
+	// 双保险：JWTParse（走 runtime）也必须能解。
+	if _, err := JWTParse(tok); err != nil {
+		t.Errorf("JWTParse 失败: %v", err)
 	}
 }

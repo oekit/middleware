@@ -111,6 +111,84 @@ func resetCacheState() {
 	globalCacheState = cacheState{}
 }
 
+// TestCache_FrozenInstanceKeepsOptsConsistent 钉住「opts 始终等于实际生效配置」。
+//
+// 缺陷形态（2026-10-31 实测）：cache 是全局单例，实例一旦构造就**冻结**
+// （strategy/expiration/prefix/store 全部不再重建）。但原实现仍把二次调用
+// 的 option **写进 opts** ⇒ opts.prefix 变成 "second"，而实际用的还是
+// "first" ⇒ **状态与实际行为不一致**。
+//
+// 为什么要在意：opts 是「当前配置」的唯一记录，任何读 opts 的代码
+// （新增功能、日志、诊断）都会拿到**错的**值。
+//
+// 本测试断言：冻结后二次调用 Cache(改 prefix) ⇒ opts.prefix **不变**。
+func TestCache_FrozenInstanceKeepsOptsConsistent(t *testing.T) {
+	resetCacheState()
+
+	_ = Cache(WithCachePrefix("first-prefix"))
+	if got := globalCacheState.opts.prefix; got != "first-prefix" {
+		t.Fatalf("首次构造后 opts.prefix = %q，期望 first-prefix", got)
+	}
+
+	// 二次调用改 prefix —— 实例已冻结，这些 option 永远不会生效。
+	_ = Cache(WithCachePrefix("second-prefix"))
+
+	if got := globalCacheState.opts.prefix; got != "first-prefix" {
+		t.Errorf("★ 冻结后 opts.prefix = %q，期望仍为 first-prefix —— "+
+			"opts 必须始终等于实际生效的配置（已生效的是 first-prefix）", got)
+	}
+}
+
+// TestCache_FrozenInstanceReturnsSameHandler 钉住「二次调用返回同一个 handler」。
+//
+// 冻结语义下，二次调用 Cache() 返回的 handler 必须与首次**完全一致**
+// （含 GET 守卫与凭证放行逻辑）⇒ 否则两次注册的路由行为会分叉。
+//
+// 判据用**GET 是否被缓存**（可观测）：带守卫的 handler 对 GET 缓存、
+// 裸 mw 对 GET 也缓存但**不分方法** ⇒ 差异要用「POST 是否被缓存」观测。
+// 两次 POST 各发两次 ⇒ 带守卫时 handler 被调 2 次；裸 mw 时只调 1 次
+// （第二次命中缓存）。
+func TestCache_FrozenInstanceReturnsSameHandler(t *testing.T) {
+	resetCacheState()
+
+	first := Cache()
+	second := Cache()
+	if first == nil || second == nil {
+		t.Fatal("Cache() 应返回非 nil handler")
+	}
+
+	newSrv := func(mw app.HandlerFunc) (*server.Hertz, *atomic.Int32) {
+		srv := server.New(
+			server.WithHostPorts("127.0.0.1:0"),
+			server.WithDisablePrintRoute(true),
+		)
+		var hits atomic.Int32
+		srv.POST("/p", mw, func(_ context.Context, c *app.RequestContext) {
+			hits.Add(1)
+			c.JSON(200, map[string]string{"ok": "true"})
+		})
+		return srv, &hits
+	}
+
+	// 首次注册：POST 两次 ⇒ 守卫放行 ⇒ handler 被调 2 次。
+	h1, hits1 := newSrv(first)
+	ut.PerformRequest(h1.Engine, "POST", "/p", nil)
+	ut.PerformRequest(h1.Engine, "POST", "/p", nil)
+	if got := hits1.Load(); got != 2 {
+		t.Errorf("首次注册的 handler：POST 两次应各调一次 handler，实际 %d 次", got)
+	}
+
+	// 二次注册：必须与首次**同样**带守卫 ⇒ 同样调 2 次。
+	// 若二次调用返回的是**裸 mw**（丢了守卫）⇒ POST 会被缓存 ⇒ 只调 1 次。
+	h2, hits2 := newSrv(second)
+	ut.PerformRequest(h2.Engine, "POST", "/p", nil)
+	ut.PerformRequest(h2.Engine, "POST", "/p", nil)
+	if got := hits2.Load(); got != 2 {
+		t.Errorf("★ 二次调用返回的 handler 与首次语义不一致：POST 两次只调了 %d 次 handler"+
+			"（期望 2 次；少了守卫 ⇒ POST 被缓存）", got)
+	}
+}
+
 // TestCache_GetOnlyDefault 行为级:GET 响应被缓存(第二次命中不再调 handler),
 // POST/PUT 不缓存(2026-09-05 复审修复:上游 NewCacheByRequestURI 不分方法,
 // ekit 包装层加默认 GET 守卫,对齐文档宣称的"GET 缓存"语义)。
