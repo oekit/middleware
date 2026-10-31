@@ -24,6 +24,9 @@ type cacheState struct {
 	mw      app.HandlerFunc
 	getOnly bool // 构造时冻结:是否包 GET-only 守卫
 	opts    cacheOptions
+	// handler 是首次构造出的那一个 handler(含 getOnly 守卫)。
+	// 后续 Cache() 调用直接复用它 ⇒ 返回值语义与首次完全一致。
+	handler app.HandlerFunc
 }
 
 var globalCacheState cacheState
@@ -126,6 +129,28 @@ var cacheLog = logx.Delegating("middleware-cache")
 // (上游 strategy 返回 false 时 c.Next(ctx) 直接放行 — 非 GET 走同一通道)
 func Cache(opts ...CacheOption) app.HandlerFunc {
 	globalCacheState.mu.Lock()
+	// 懒构造;失败可重试(无 once 毒化)。守卫与 mw 同帧冻结:
+	// 构造时无自定义 strategy → 本实例永久带 GET 守卫;后续再传
+	// WithCacheStrategyByRequest 不会生效(mw 不重建),守卫也不能按
+	// 调用时的 opts 翻转,否则两次调用返回语义不一致的 handler
+	// (2026-09-06 复审修正)
+	//
+	// ⚠️ **实例已冻结时,不再把新 option 写进 opts**:
+	//    这些 option 永远不会生效(strategy/expiration/prefix/store 全部冻结),
+	//    写进去只会让 `opts` 与**实际生效的配置**不一致
+	//    (2026-10-31 实测:二次调用 Cache(WithCachePrefix("second")) 后
+	//     opts.prefix 变成 "second",而实际用的还是 "first"
+	//     ⇒ 任何读 opts 的代码都会拿到错误的值)。
+	//    ⇒ 冻结后直接忽略并告警,让 opts 始终等于实际生效的配置。
+	if globalCacheState.mw != nil {
+		if len(opts) > 0 {
+			// 实例已冻结：后续 option 全部忽略（静默失效最隐蔽 ⇒ 必须告警）
+			cacheLog.Warn("cache middleware already built; later options are ignored (global singleton)", "ignoredOpts", len(opts))
+		}
+		handler := globalCacheState.handler
+		globalCacheState.mu.Unlock()
+		return handler
+	}
 	for _, opt := range opts {
 		opt(&globalCacheState.opts)
 	}
@@ -136,26 +161,16 @@ func Cache(opts ...CacheOption) app.HandlerFunc {
 	if globalCacheState.opts.prefix == "" {
 		globalCacheState.opts.prefix = defaultCachePrefix
 	}
-	// 懒构造;失败可重试(无 once 毒化)。守卫与 mw 同帧冻结:
-	// 构造时无自定义 strategy → 本实例永久带 GET 守卫;后续再传
-	// WithCacheStrategyByRequest 不会生效(mw 不重建),守卫也不能按
-	// 调用时的 opts 翻转,否则两次调用返回语义不一致的 handler
-	// (2026-09-06 复审修正)
-	if globalCacheState.mw == nil {
-		globalCacheState.mw = buildCacheLocked()
-		globalCacheState.getOnly = globalCacheState.opts.strategy == nil
-	} else if len(opts) > 0 {
-		// 实例已冻结：后续调用的 option 仍会写进 opts 但永不生效
-		// （strategy/expiration/prefix/store 全部冻结），静默失效最隐蔽
-		cacheLog.Warn("cache middleware already built; later options are ignored (global singleton)", "ignoredOpts", len(opts))
-	}
+	globalCacheState.mw = buildCacheLocked()
+	globalCacheState.getOnly = globalCacheState.opts.strategy == nil
 	mw, getOnly := globalCacheState.mw, globalCacheState.getOnly
-	globalCacheState.mu.Unlock()
 
 	if !getOnly {
+		globalCacheState.handler = mw
+		globalCacheState.mu.Unlock()
 		return mw
 	}
-	return func(ctx context.Context, c *app.RequestContext) {
+	handler := func(ctx context.Context, c *app.RequestContext) {
 		if string(c.Method()) != http.MethodGet {
 			c.Next(ctx)
 			return
@@ -172,6 +187,11 @@ func Cache(opts ...CacheOption) app.HandlerFunc {
 		}
 		mw(ctx, c)
 	}
+	// 冻结后复用同一个 handler ⇒ 二次调用 Cache() 返回的 handler
+	// 与首次**完全一致**（含 GET 守卫与凭证放行逻辑）。
+	globalCacheState.handler = handler
+	globalCacheState.mu.Unlock()
+	return handler
 }
 
 // buildCacheLocked 构造上游 cache 中间件;调用方必须持有 globalCacheState.mu。
