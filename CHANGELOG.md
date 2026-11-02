@@ -29,7 +29,7 @@
 ## [v0.13.0] — 2026-10-22
 
 ### feat(accesslog)：内建日志可关闭/改道——只采不写或注入宿主 logger（[#38](https://github.com/oekit/middleware/issues/38)）
-- `mw.AccessLogMiddleware` 此前**总是自己写一行日志**（`logx.Delegating("access")` 写死），
+- `mw.AccessLogMiddleware` 此前**总是自己写一行日志**（`logx.Delegating("access")` 写死）（#38），
   宿主想用自己的 logger 输出同一份记录就会**双写**——想用库的
   `WithAccessLogRedactPathPrefixes`（防「URL 路径即凭证」路由把 token 写进日志）
   与 `WithAccessLogSkipPaths`，又不能接受库那行输出，只能整段手搓、库的 redaction
@@ -61,7 +61,7 @@
 ## [v0.12.0] — 2026-10-18
 
 ### fix(accesslog)：panic 请求同样产出访问记录（[#20](https://github.com/oekit/middleware/issues/20)）
-- 此前栈序 Recovery → AccessLog 下 handler panic 直接穿过 AccessLog 到达外层
+- 此前栈序 Recovery → AccessLog 下 handler panic 直接穿过 AccessLog 到达外层（#20）
   Recovery——**状态码、耗时、路径全部无记录**，最需要观测的请求反而零记录，
   故障时段 access log 完全失明
 - `chainmw.AccessLog` 内核在 **panic 恢复点**产出
@@ -78,7 +78,7 @@
 ## [v0.11.0] — 2026-10-18
 
 ### feat(accesslog)：落库 sink + 响应自管一键形态 + 适用边界文档（[#18](https://github.com/oekit/middleware/issues/18)）
-- **`WithAccessLogSink(AccessSink)`**：访问记录旁路消费者——同一份记录
+- **`WithAccessLogSink(AccessSink)`**：访问记录旁路消费者——同一份记录（#18）
   `AccessRecord{Method, Path, Status, Latency, ClientIP, UserAgent, TraceID}`
   （与日志字段同源，Path 已脱敏）交给调用方自己的 access_log 表 / 审计上报；
   `c *app.RequestContext` 同传，可读鉴权中间件注入的 userId 等业务键（仅本次调用内
