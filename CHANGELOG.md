@@ -211,13 +211,13 @@ github.com/oekit/middleware              # package mw — 自研标准中间件�
 - **核心包 `mw` 提升到模块根**：import 从 `github.com/oekit/middleware/middleware`
   改为 `github.com/oekit/middleware`（包名仍为 `mw`）
 - **删除重复层** `middleware/contrib/`（与根 `contrib/` 字节级重复的副本）
-- **删除废弃转发层** `middleware/traceid/hmw/`（原 Deprecated 兼容层）
+- **删除废弃转发层** `middleware/traceid/hmw/`（原 Deprecated 兼容层）（#11）
 
 ### 能力面（自 ekit 拆分保留）
 
 - `DefaultMiddleware` — 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制）
 - `MinimalMiddleware` — 最小安全栈：TraceID → Recovery
-- `ResponseMiddleware` — 统一 JSON 响应 `{code, data, message, trace_id}`，
+- `ResponseMiddleware` — 统一 JSON 响应 `{code, data, message, trace_id}`（#9），
   支持 `WithSkipPaths` / `WithSkipPrefixes` 声明式跳过 + `SkipResponseWrap` 逃生舱
 - `RecoveryMiddleware` — panic recovery（可选 SentryReporter 钩子）
 - `AccessLogMiddleware` — 请求访问日志
