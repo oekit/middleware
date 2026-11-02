@@ -78,7 +78,7 @@
 ## [v0.11.0] — 2026-10-18
 
 ### feat(accesslog)：落库 sink + 响应自管一键形态 + 适用边界文档（[#18](https://github.com/oekit/middleware/issues/18)）
-- **`WithAccessLogSink(AccessSink)`**：访问记录旁路消费者——同一份记录（#18）
+- **`WithAccessLogSink(AccessSink)`**：访问记录旁路消费者（#18）——同一份记录
   `AccessRecord{Method, Path, Status, Latency, ClientIP, UserAgent, TraceID}`
   （与日志字段同源，Path 已脱敏）交给调用方自己的 access_log 表 / 审计上报；
   `c *app.RequestContext` 同传，可读鉴权中间件注入的 userId 等业务键（仅本次调用内
