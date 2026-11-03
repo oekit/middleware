@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"strconv"
+	"strings"
 	"testing"
 	"time"
 
@@ -225,4 +226,214 @@ func TestRateLimitMiddlewareWithLimiter_NilPanics(t *testing.T) {
 		}
 	}()
 	_ = RateLimitMiddlewareWithLimiter(nil)
+}
+
+// --- #78: SkipPaths / 限流响应头 / TokenBucket 剩余配额出口 ---
+
+// rlRequest 构造请求并直接调用中间件（不经过 handler 链）。
+func rlRequest(h app.HandlerFunc, path string) *app.RequestContext {
+	c := app.NewContext(8)
+	c.Request.SetRequestURI(path)
+	c.Request.Header.SetMethod("GET")
+	h(context.Background(), c)
+	return c
+}
+
+// TestRateLimitMiddleware_SkipPaths 验证白名单路径豁免限流（正例）：
+// 不占配额（桶耗尽后白名单仍放行），精确与 glob 形态都命中。
+func TestRateLimitMiddleware_SkipPaths(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitSkipPaths("/ping", "/health*"),
+	)
+
+	// 白名单路径连续请求全部放行（不占配额：桶容量只有 1）
+	for _, p := range []string{"/ping", "/ping", "/healthz", "/healthz"} {
+		c := rlRequest(h, p)
+		assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
+	}
+
+	// 业务路径照常限流：容量 1，第一个放行、第二个 429
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/api").Response.StatusCode())
+	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/api").Response.StatusCode())
+
+	// 业务流量耗尽后白名单依旧放行（豁免不依赖桶状态）
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/ping").Response.StatusCode())
+}
+
+// TestRateLimitMiddleware_SkipPaths_Negative 验证负例：未配置即无隐式豁免、
+// 不在清单的路径不受豁免。
+func TestRateLimitMiddleware_SkipPaths_Negative(t *testing.T) {
+	key := WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" })
+
+	// 未配置 SkipPaths：探活路径同样受限
+	h := RateLimitMiddleware(WithRateLimit(rate.Limit(1), 1), key)
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/ping").Response.StatusCode())
+	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/ping").Response.StatusCode())
+
+	// 配置了但路径不在清单：不受豁免
+	h2 := RateLimitMiddleware(WithRateLimit(rate.Limit(1), 1), key, WithRateLimitSkipPaths("/metrics"))
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h2, "/ping").Response.StatusCode())
+	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h2, "/ping").Response.StatusCode())
+}
+
+// TestRateLimitMiddleware_Headers_Allowed 验证放行响应头 X-RateLimit-Remaining
+// 接的是 TokenBucket.Tokens() 剩余配额出口：随消费递减（1 → 0），放行时不写
+// 拒绝头。极小速率保证桶内不回填，剩余数确定。
+func TestRateLimitMiddleware_Headers_Allowed(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(0.000001), 2),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitHeaders(true),
+	)
+
+	c1 := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusOK, c1.Response.StatusCode())
+	assert.DeepEqual(t, "1", string(c1.Response.Header.Peek(headerRateLimitRemaining)))
+	assert.DeepEqual(t, "", string(c1.Response.Header.Peek(headerRetryAfter)))
+	assert.DeepEqual(t, "", string(c1.Response.Header.Peek(headerRateLimitReset)))
+
+	c2 := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusOK, c2.Response.StatusCode())
+	assert.DeepEqual(t, "0", string(c2.Response.Header.Peek(headerRateLimitRemaining)))
+}
+
+// TestRateLimitMiddleware_Headers_Rejected 验证拒绝响应头：Retry-After（秒，
+// 来自 TokenBucket.RetryAfter() 出口）与 X-RateLimit-Reset（配额恢复时刻）。
+// rate=1/burst=1 下被拒意味着下一个令牌恰在 (0,1] 秒内 ⇒ Retry-After 恒为 1。
+func TestRateLimitMiddleware_Headers_Rejected(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitHeaders(true),
+	)
+
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/api").Response.StatusCode())
+
+	before := time.Now().Unix()
+	c := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusTooManyRequests, c.Response.StatusCode())
+	assert.DeepEqual(t, "1", string(c.Response.Header.Peek(headerRetryAfter)))
+
+	reset, err := strconv.ParseInt(string(c.Response.Header.Peek(headerRateLimitReset)), 10, 64)
+	if err != nil {
+		t.Fatalf("X-RateLimit-Reset not a unix timestamp: %v", err)
+	}
+	if reset < before || reset > time.Now().Unix()+2 {
+		t.Errorf("X-RateLimit-Reset = %d, want ≈ now+1s", reset)
+	}
+}
+
+// TestRateLimitMiddleware_Headers_DefaultOff 验证负例：不显式打开时默认
+// 无任何限流响应头（默认行为保持不变）。
+func TestRateLimitMiddleware_Headers_DefaultOff(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+	)
+
+	for _, want := range []int{consts.StatusOK, consts.StatusTooManyRequests} {
+		c := rlRequest(h, "/api")
+		assert.DeepEqual(t, want, c.Response.StatusCode())
+		for _, hdr := range []string{headerRateLimitRemaining, headerRetryAfter, headerRateLimitReset} {
+			if got := string(c.Response.Header.Peek(hdr)); got != "" {
+				t.Errorf("%s = %q, want empty (headers default off)", hdr, got)
+			}
+		}
+	}
+}
+
+// TestRateLimitMiddlewareOnReject 验证拒绝钩子拿到 TokenBucket 出口的建议
+// 等待时长并接管响应（正例；Headers 未开也照传 retryAfter）。
+func TestRateLimitMiddlewareOnReject(t *testing.T) {
+	var called int
+	var got time.Duration
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitOnReject(func(c *app.RequestContext, retryAfter time.Duration) {
+			called++
+			got = retryAfter
+			c.Response.SetStatusCode(503)
+			c.Response.SetBody([]byte("slow down"))
+		}),
+	)
+
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/api").Response.StatusCode())
+
+	c := rlRequest(h, "/api")
+	assert.DeepEqual(t, 1, called)
+	if got <= 0 || got > time.Second {
+		t.Errorf("retryAfter = %v, want (0, 1s]", got)
+	}
+	assert.DeepEqual(t, 503, c.Response.StatusCode())
+	assert.DeepEqual(t, "slow down", string(c.Response.Body()))
+}
+
+// TestRateLimitMiddlewareOnReject_NilUsesDefault 验证负例：未注入钩子时走
+// 默认 ErrorResp 429 统一错误体。
+func TestRateLimitMiddlewareOnReject_NilUsesDefault(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+	)
+
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/api").Response.StatusCode())
+
+	c := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusTooManyRequests, c.Response.StatusCode())
+	if !strings.Contains(string(c.Response.Body()), "too many requests") {
+		t.Errorf("body = %q, want default ErrorResp body", c.Response.Body())
+	}
+}
+
+// TestRateLimitMiddlewareWithLimiter_Headers_QuotaExit 验证调用方自建
+// KeyedLimiter 形态下剩余配额出口同样接通（正例）。
+func TestRateLimitMiddlewareWithLimiter_Headers_QuotaExit(t *testing.T) {
+	keyed := ratelimit.NewKeyedLimiter(func() ratelimit.Limiter {
+		return ratelimit.NewTokenBucket(rate.Limit(0.000001), 1)
+	}, time.Minute)
+	defer keyed.Close()
+
+	h := RateLimitMiddlewareWithLimiter(keyed,
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitHeaders(true),
+	)
+
+	c1 := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusOK, c1.Response.StatusCode())
+	assert.DeepEqual(t, "0", string(c1.Response.Header.Peek(headerRateLimitRemaining)))
+
+	c2 := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusTooManyRequests, c2.Response.StatusCode())
+	if ra := string(c2.Response.Header.Peek(headerRetryAfter)); ra == "" {
+		t.Error("Retry-After should be set on reject")
+	}
+}
+
+// plainLimiter 是不实现 Tokens() 出口的自定义 Limiter，用于验证响应头
+// 优雅降级（负例）。
+type plainLimiter struct{}
+
+func (plainLimiter) Allow() bool                    { return true }
+func (plainLimiter) AllowN(n int) bool              { return true }
+func (plainLimiter) Reserve() time.Duration         { return 0 }
+func (plainLimiter) Wait(ctx context.Context) error { return nil }
+
+// TestRateLimitMiddlewareWithLimiter_Headers_NoQuotaExit 验证负例：自定义
+// Limiter 无剩余配额出口时不硬算、不输出 X-RateLimit-Remaining，请求照常放行。
+func TestRateLimitMiddlewareWithLimiter_Headers_NoQuotaExit(t *testing.T) {
+	keyed := ratelimit.NewKeyedLimiter(func() ratelimit.Limiter {
+		return plainLimiter{}
+	}, time.Minute)
+	defer keyed.Close()
+
+	h := RateLimitMiddlewareWithLimiter(keyed, WithRateLimitHeaders(true))
+
+	c := rlRequest(h, "/api")
+	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
+	if got := string(c.Response.Header.Peek(headerRateLimitRemaining)); got != "" {
+		t.Errorf("X-RateLimit-Remaining = %q, want empty (no Tokens() exit)", got)
+	}
 }
