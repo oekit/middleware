@@ -23,7 +23,7 @@ require (
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
 	github.com/oekit/concurrency v0.25.1
 	github.com/oekit/logx v0.8.3
-	github.com/oekit/metrics v0.1.11
+	github.com/oekit/metrics v0.1.12
 	github.com/oekit/registry v0.5.4
 	github.com/oekit/tracing v0.3.2
 	github.com/prometheus/client_golang v1.25.0
