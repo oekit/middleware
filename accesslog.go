@@ -41,6 +41,20 @@ type AccessLogOptions struct {
 	// （#38）。宿主用 zap 等非 logx 后端时可自行实现 logx.Logger 适配，
 	// 或改用 logx.SetDefault 整体替换后端。
 	Logger logx.Logger
+
+	// ClientIPFunc 是客户端 IP 解析缝（#83）：签名与 pkg/convert.ResolveClientIP
+	// 一致（对端地址、XFF 头、可信代理 CIDR 列表 → 客户端 IP），nil 走默认口径。
+	//
+	// ⚠️ 默认口径自 v0.13.9 起**不再采信任意来源的 XFF**（fail-closed）：
+	// 此前走 `c.ClientIP()`——hertz 默认信任任意网段的 X-Forwarded-For，直连方
+	// 可随意伪造，落库消费方（审计/安全分析按 IP 归因）的来源 IP 全被毒化，
+	// 且与同仓 ratelimit 的防伪造口径（defaultIPKey 用直连地址）自相矛盾。
+	// 默认=「对端地址，可信网段为空」；代理拓扑（RemoteAddr=上游网关）下按真实
+	// 客户端 IP 记录：注入本缝，如 `mw.WithAccessLogClientIP(func(remote, xff string, _ []string) string {
+	//     return convert.ResolveClientIP(remote, xff, myTrustedCIDRs)
+	// })`（或直接用 oekit/hertz 的 clientip.GetClientIP 包一层）。字段含义与
+	// 日志 ip 字段、sink 的 AccessRecord.ClientIP 同源同值。
+	ClientIPFunc func(remoteAddr, xff string, trustedProxies []string) string
 }
 
 // AccessRecord 是 AccessLogMiddleware 单次请求的 HTTP 采集结果，与日志字段
@@ -55,7 +69,8 @@ type AccessRecord struct {
 	Status int
 	// Latency handler 链耗时。
 	Latency time.Duration
-	// ClientIP 客户端 IP（c.ClientIP()，尊重 X-Forwarded-For 等代理头配置）。
+	// ClientIP 客户端 IP。默认口径为对端地址（fail-closed，不采信任意来源的
+	// XFF，#83）；代理拓扑下经 WithAccessLogClientIP 注入可信网段解析。
 	ClientIP string
 	// UserAgent 请求 User-Agent。
 	UserAgent string
@@ -155,6 +170,35 @@ func WithAccessLogLogger(l logx.Logger) AccessLogOption {
 	}
 }
 
+// WithAccessLogClientIP 注入客户端 IP 解析函数（#83）：代理拓扑下按可信代理
+// 网段解析真实客户端 IP，推荐直接包一层 pkg/convert.ResolveClientIP（或
+// oekit/hertz clientip.GetClientIP，同源实现）：
+//
+//	mw.AccessLogMiddleware(mw.WithAccessLogClientIP(func(remote, xff string, _ []string) string {
+//	    return convert.ResolveClientIP(remote, xff, []string{"10.0.0.0/8"})
+//	}))
+//
+// nil 不覆盖既有配置。函数在每请求路径上调用，保持轻量。
+func WithAccessLogClientIP(fn func(remoteAddr, xff string, trustedProxies []string) string) AccessLogOption {
+	return func(o *AccessLogOptions) {
+		if fn != nil {
+			o.ClientIPFunc = fn
+		}
+	}
+}
+
+// resolveClientIP 统一出口（#83）：默认 fail-closed——只取对端地址（去端口），
+// 不采信任何代理头（hertz c.ClientIP() 默认信任任意网段 XFF，直连方可伪造，
+// 与同仓 ratelimit defaultIPKey 的防伪造口径必须一致——审计链的 IP 比限流
+// key 更不能被毒化）。可信网段解析属部署形态知识，经 WithAccessLogClientIP
+// 显式注入。
+func resolveClientIP(c *app.RequestContext, fn func(remoteAddr, xff string, trustedProxies []string) string) string {
+	if fn != nil {
+		return fn(c.RemoteAddr().String(), string(c.Request.Header.Peek("X-Forwarded-For")), nil)
+	}
+	return hostOnly(c.RemoteAddr().String())
+}
+
 func newAccessLogOptions(opts ...AccessLogOption) *AccessLogOptions {
 	cfg := &AccessLogOptions{}
 	for _, opt := range opts {
@@ -166,7 +210,8 @@ func newAccessLogOptions(opts ...AccessLogOption) *AccessLogOptions {
 var accessLog = logx.Delegating("access")
 
 // accessRecordOf 由 Hertz 请求上下文与内核采集结果拼出 HTTP 语义的访问记录。
-func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecord {
+// clientIPFunc 是 AccessLogOptions.ClientIPFunc 的透传（#83 口径缝）。
+func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFunc func(remoteAddr, xff string, trustedProxies []string) string) AccessRecord {
 	status := c.Response.StatusCode()
 	if rec.Panic {
 		status = 500 // panic 恢复点状态码尚未写出，按 Recovery 缺省 500 记（#20）
@@ -176,7 +221,7 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecor
 		Path:      rec.Operation,
 		Status:    status,
 		Latency:   rec.Latency,
-		ClientIP:  c.ClientIP(),
+		ClientIP:  resolveClientIP(c, clientIPFunc),
 		UserAgent: string(c.UserAgent()),
 		TraceID:   hmw.FromRequestContext(c),
 		Panic:     rec.Panic,
@@ -198,6 +243,9 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord) AccessRecor
 //   - 可通过 WithAccessLogSilent 关闭内建日志输出（只采不写，采集行为不变）
 //     或通过 WithAccessLogLogger 注入宿主 logger（避免宿主再写一份造成双写）
 //     （#38）
+//   - ClientIP 默认 fail-closed（#83）：取对端地址，不采信任意来源的 XFF
+//     （与同仓 ratelimit 防伪造口径一致）；代理拓扑经 WithAccessLogClientIP
+//     注入可信网段解析（推荐包一层 pkg/convert.ResolveClientIP）
 //   - 无参调用即启用默认配置（不跳过任何路径、不脱敏、不落库）
 //
 // # 实现说明（#14）
@@ -268,7 +316,7 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 				"path", rec.Operation,
 				"status", status,
 				"latency_ms", rec.Latency.Milliseconds(),
-				"ip", c.ClientIP(),
+				"ip", resolveClientIP(c, cfg.ClientIPFunc),
 			}
 		}),
 	)
@@ -283,7 +331,7 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 			if !ok {
 				return nil
 			}
-			return sink(ctx, c, accessRecordOf(c, rec))
+			return sink(ctx, c, accessRecordOf(c, rec, cfg.ClientIPFunc))
 		}))
 	}
 	kernel := chainmw.AccessLog(kernelOpts...)
