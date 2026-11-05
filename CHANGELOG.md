@@ -1,3 +1,7 @@
+## [v0.13.10] — 2026-11-06
+
+- build: 矩阵依赖地板对齐（维护轮 #233）
+
 ## [v0.13.9] — 2026-11-06
 
 - **BREAKING** fix(accesslog): ClientIP 默认口径 fail-closed——不再采信任意来源的 X-Forwarded-For（[#83](https://github.com/oekit/middleware/issues/83)）——此前走 `c.ClientIP()`，hertz 默认信任任意网段的 XFF：直连方每请求换一个伪造 XFF 即可任意改写访问日志与 sink 记录里的来源 IP，落库消费方（审计/安全分析按 IP 归因）全被毒化；而同仓 ratelimit 的 `defaultIPKey` 早已为同款风险改用直连地址——同一仓库两个模块对同一问题口径相反，accesslog 是更该防的那面（IP 进审计链）却用更弱口径。修法与 ratelimit 口径合一：默认取**对端地址**（去端口，复用 ratelimit 的 hostOnly），可信网段为空；代理拓扑（RemoteAddr=上游网关）经新增 `WithAccessLogClientIP` 注入解析缝（签名对齐 `pkg/convert.ResolveClientIP`，推荐直接包一层；oekit/hertz clientip.GetClientIP 同源）。**升级可见（0.x minor 允许 breaking）**：直连部署行为不变（对端地址）；经不可信代理头的部署从「伪造值」变为「网关地址」——受影响方应注入可信网段而非回退旧行为
