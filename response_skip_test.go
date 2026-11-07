@@ -202,3 +202,43 @@ func TestResponseMiddleware_Skip_KeepsHandlerBody(t *testing.T) {
 		t.Errorf("skipped request body mutated:\n got %s\nwant %s", r.Body(), raw)
 	}
 }
+
+// TestResponseMiddleware_SkipPrefixesSegmentBoundary 回归测试（#100）：
+// 前缀命中必须是**段边界**的——裸 strings.HasPrefix 会把 "/mcp" 连带到
+// "/mcp-v2/data" 等同字符开头的无关路由，命中路由静默失去统一包壳，
+// 按信封 {code,data,message,trace_id} 解码的消费方直接解析失败且无信号。
+//
+// 矩阵边界："/mcp" 命中 "/mcp"（等于）与 "/mcp/tools"（新段），不命中
+// "/mcp-v2/data"；尾斜杠前缀 "/.well-known/" 的子路径照常命中。
+func TestResponseMiddleware_SkipPrefixesSegmentBoundary(t *testing.T) {
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(ResponseMiddleware(WithSkipPrefixes("/.well-known/", "/mcp")))
+	handler := func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"biz": "payload"})
+	}
+	h.GET("/mcp", handler)
+	h.GET("/mcp/tools", handler)
+	h.GET("/mcp-v2/data", handler)
+	h.GET("/.well-known/openid-configuration", handler)
+
+	cases := []struct {
+		path         string
+		wantSkipped  bool
+		wantContains string
+	}{
+		{"/mcp", true, `"biz"`},                              // 前缀等于完整路径
+		{"/mcp/tools", true, `"biz"`},                        // 前缀后紧跟新段
+		{"/mcp-v2/data", false, `"code"`},                    // 同字符开头、无段边界 → 不豁免（#100 缺陷方向）
+		{"/.well-known/openid-configuration", true, `"biz"`}, // 尾斜杠前缀子路径照常命中
+	}
+	for _, tc := range cases {
+		r := ut.PerformRequest(h, http.MethodGet, tc.path, nil).Result()
+		body := r.Body()
+		if bytes.Contains(body, []byte(`"code"`)) == tc.wantSkipped {
+			t.Errorf("GET %s: wrapped=%v, want skipped=%v (body=%s)", tc.path, !tc.wantSkipped, tc.wantSkipped, body)
+		}
+		if !bytes.Contains(body, []byte(tc.wantContains)) {
+			t.Errorf("GET %s: body should contain %q, got %s", tc.path, tc.wantContains, body)
+		}
+	}
+}
