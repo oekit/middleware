@@ -239,3 +239,71 @@ func TestFailWithData_NonBizErrorDropsData(t *testing.T) {
 		t.Errorf("body: got %q, want contains 'internal server error'", body)
 	}
 }
+
+// TestFail_TypedNilBizError 回归测试（#95）：`func f() *errors.BizError { return nil }`
+// 的返回值装进 error 接口时接口非 nil——裸 errors.As 匹配成功拿到 nil 指针，
+// writeBizError 解引用 bizErr.HTTPCode 直接让错误出口自身 panic（被 Recovery
+// 兜住后变 500/断连，原始错误信息全丢）。改用 AsBizError（带 nil 判定）后
+// typed-nil 落 500 fallback，不 panic。
+func TestFail_TypedNilBizError(t *testing.T) {
+	var typedNil *ekiterrors.BizError
+	var err error = typedNil // 接口非 nil，指向 nil 指针
+
+	c := &app.RequestContext{}
+	Fail(context.Background(), c, err)
+	if c.Response.StatusCode() != 500 {
+		t.Errorf("status: got %d, want 500 (typed-nil must fall through to 500, not panic)", c.Response.StatusCode())
+	}
+	if body := string(c.Response.Body()); !strings.Contains(body, "internal server error") {
+		t.Errorf("body: got %q, want contains 'internal server error'", body)
+	}
+}
+
+// TestFail_WrappedTypedNilBizError 包装链上的 typed-nil（fmt.Errorf %w）同样
+// 不得命中 BizError 分支 panic。
+func TestFail_WrappedTypedNilBizError(t *testing.T) {
+	var typedNil *ekiterrors.BizError
+	err := fmt.Errorf("load project: %w", typedNil)
+
+	c := &app.RequestContext{}
+	Fail(context.Background(), c, err)
+	if c.Response.StatusCode() != 500 {
+		t.Errorf("status: got %d, want 500", c.Response.StatusCode())
+	}
+	if body := string(c.Response.Body()); !strings.Contains(body, "internal server error") {
+		t.Errorf("body: got %q, want contains 'internal server error'", body)
+	}
+}
+
+// TestFailWithData_TypedNilBizError FailWithData 与 Fail 同修：typed-nil 不 panic，
+// 非 BizError 路径不透传 data。
+func TestFailWithData_TypedNilBizError(t *testing.T) {
+	var typedNil *ekiterrors.BizError
+	var err error = typedNil
+
+	c := &app.RequestContext{}
+	FailWithData(context.Background(), c, err, map[string]string{"secret": "s-1"})
+	if c.Response.StatusCode() != 500 {
+		t.Errorf("status: got %d, want 500", c.Response.StatusCode())
+	}
+	body := string(c.Response.Body())
+	if strings.Contains(body, "s-1") {
+		t.Errorf("typed-nil 不得透传 data，实际 body: %q", body)
+	}
+	if !strings.Contains(body, "internal server error") {
+		t.Errorf("body: got %q, want contains 'internal server error'", body)
+	}
+}
+
+// TestWriteBizError_NilGuard writeBizError 头部 nil 守卫单测：nil BizError
+// 按 500 处理而非解引用 panic（防御深度——即便上游再有裸 As 混入）。
+func TestWriteBizError_NilGuard(t *testing.T) {
+	c := &app.RequestContext{}
+	writeBizError(c, nil, nil)
+	if c.Response.StatusCode() != 500 {
+		t.Errorf("status: got %d, want 500", c.Response.StatusCode())
+	}
+	if body := string(c.Response.Body()); !strings.Contains(body, "internal server error") {
+		t.Errorf("body: got %q, want contains 'internal server error'", body)
+	}
+}

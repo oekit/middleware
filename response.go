@@ -220,7 +220,14 @@ func ErrorResp(c *app.RequestContext, code int, message string) {
 //   - body code 字段使用 BizCode（业务语义）
 //   - HTTP 状态码优先用 HTTPCode；为 0 时经 StatusMapper 从 BizCode 推导（向后兼容）
 //   - data 为随错误返回的业务载荷（202 业务态场景；Fail 传 nil）
+//
+// bizErr 为 nil（typed-nil 防御，#95）时按 500 处理——直接解引用
+// bizErr.HTTPCode 会让错误出口自身 panic，被 Recovery 兜住后原始错误信息全丢。
 func writeBizError(c *app.RequestContext, bizErr *errors.BizError, data any) {
+	if bizErr == nil {
+		ErrorResp(c, 500, "internal server error")
+		return
+	}
 	httpCode := bizErr.HTTPCode
 	if httpCode == 0 {
 		httpCode = getStatusMapper()(bizErr.BizCode)

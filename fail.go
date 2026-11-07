@@ -66,8 +66,10 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 	if err == nil {
 		return
 	}
-	var bizErr *ekiterrors.BizError
-	if stderrors.As(err, &bizErr) {
+	// AsBizError 对 typed-nil *BizError（`func f() *BizError { return nil }`
+	// 装进 error 接口）返回 false——裸 errors.As 会匹配成功拿到 nil 指针，
+	// writeBizError 解引用 bizErr.HTTPCode 直接 panic，错误出口自身崩溃（#95）。
+	if bizErr, ok := ekiterrors.AsBizError(err); ok {
 		// WrapBizError 的 cause 不回显到响应（防内部细节泄漏）但必须落日志：
 		// 否则 "create branch failed" / "encrypt token" 这类壳文案成为排障盲区，
 		// 下游曾为定位一个合并失败翻了三轮日志（实测）。
@@ -119,13 +121,11 @@ func FailWithData(ctx context.Context, c *app.RequestContext, err error, data an
 	if err == nil {
 		return
 	}
-	// 同 Fail：cause 只落日志不回显
-	var be *ekiterrors.BizError
-	if stderrors.As(err, &be) && be.Unwrap() != nil {
-		failLog.CtxError(ctx, "biz error cause", "biz_code", be.BizCode, "msg", be.Message, "cause", be.Unwrap())
-	}
-	var bizErr *ekiterrors.BizError
-	if stderrors.As(err, &bizErr) {
+	// 同 Fail：AsBizError 拒绝 typed-nil（#95）；cause 只落日志不回显。
+	if bizErr, ok := ekiterrors.AsBizError(err); ok {
+		if cause := bizErr.Unwrap(); cause != nil {
+			failLog.CtxError(ctx, "biz error cause", "biz_code", bizErr.BizCode, "msg", bizErr.Message, "cause", cause)
+		}
 		writeBizError(c, bizErr, data)
 		return
 	}
