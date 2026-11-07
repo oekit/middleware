@@ -1,3 +1,13 @@
+
+
+## [v0.13.14] — 2026-11-08
+
+- fix(contrib/cache): 默认 CacheKey 并入 Authorization 身份哈希——认证响应不再跨用户共享（#106）：此前默认 CacheKey=RequestURI 不含身份维度，A 认证后的响应（含 Set-Cookie）在 TTL 内可被任何请求同 URI 的 B 命中⇒会话泄露（越权/会话固定）
+- build: 终局地板/版本行对齐（全矩阵收口，纯基线声明不发版）
+- docs: 版本引用对齐最新 tag（refresh_versions）
+
+关联问题单：middleware#106。
+
 ## [v0.13.13] — 2026-11-07
 
 - fix(fail): Fail/FailWithData 改用 errors.AsBizError——typed-nil *BizError 在错误出口自身 panic 关闭（#95）
