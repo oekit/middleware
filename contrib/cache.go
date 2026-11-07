@@ -2,10 +2,16 @@ package contrib
 
 import (
 	"context"
-	logx "github.com/oekit/logx"
+	"crypto/sha256"
+	"encoding/hex"
 	"net/http"
+	"net/url"
+	"sort"
+	"strings"
 	"sync"
 	"time"
+
+	logx "github.com/oekit/logx"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/hertz-contrib/cache"
@@ -108,6 +114,23 @@ var cacheLog = logx.Delegating("middleware-cache")
 // 放行不缓存,对齐本注释一贯宣称的"GET 缓存"语义;业务通过
 // WithCacheStrategyByRequest 显式接管缓存判定时,方法过滤由业务负责。
 //
+// ⚠️ 身份维度与默认 key(middleware#106):默认 CacheKey=RequestURI 不含
+// 身份维度——认证后的响应(含 Set-Cookie)若跨用户共享即是会话泄露。
+// 默认行为是两道防线的组合:
+//
+//  1. 带 Authorization 头的请求照常缓存,但默认 key 并入该头的 SHA-256
+//     前 16 hex:`RequestURI|auth:<hash>`——同 URI 不同凭证得到不同缓存
+//     条目,私有响应不再跨用户共享;无 Authorization 的请求保持纯
+//     RequestURI(匿名用法 key 与旧默认一致)。
+//  2. 仅带 Cookie(无 Authorization)的请求直接放行不缓存——cookie 会话
+//     没有稳定可哈希的身份头,缓存重放 Set-Cookie 的风险仍在。
+//
+// 认证接口仍**强烈建议**经 WithCacheStrategyByRequest 自定义含业务身份
+// (用户 ID 等)的 CacheKey:对 Authorization 头做哈希只保证「不跨凭证
+// 共享」,不保证粒度最优——token 轮换、同用户多 token 都会拆成独立缓存
+// 条目。自定义 strategy 时上述默认防线(方法守卫/凭证放行)不再生效,
+// 由业务全权负责。
+//
 // 业务使用:
 //
 //	// 简单 GET 缓存 1 分钟
@@ -175,12 +198,15 @@ func Cache(opts ...CacheOption) app.HandlerFunc {
 			c.Next(ctx)
 			return
 		}
-		// 认证后的响应禁止跨用户共享：默认 CacheKey=RequestURI 不含身份
-		// 维度，上游会把 Set-Cookie 连同 body 一起重放——A 的会话在 TTL
-		// 内泄给任何请求同 URI 的 B（越权/会话固定）。带凭证的请求一律
-		// 放行；确实要缓存私有响应必须业务显式接管 strategy 并把身份
-		// 纳入 CacheKey。
-		if len(c.Request.Header.Peek("Authorization")) > 0 ||
+		// 会话泄露防护（middleware#106，两道防线组合）：
+		// 1) 带 Authorization 头的请求照常缓存，但默认 key 已并入该头的
+		//    SHA-256 短哈希（defaultCacheStrategy）——同 URI 不同凭证
+		//    ⇒ 不同缓存条目，私有响应（含 Set-Cookie）不跨用户共享；
+		// 2) 仅带 Cookie（无 Authorization）的请求直接放行不缓存——
+		//    cookie 会话没有稳定可哈希的身份头，缓存重放 Set-Cookie
+		//    的风险仍在（认证接口建议自定义含身份的 CacheKey，见 Cache
+		//    godoc 的身份维度说明）。
+		if len(c.Request.Header.Peek("Authorization")) == 0 &&
 			len(c.Request.Header.Peek("Cookie")) > 0 {
 			c.Next(ctx)
 			return
@@ -205,9 +231,15 @@ func buildCacheLocked() app.HandlerFunc {
 	cOpts := []cache.Option{
 		cache.WithPrefixKey(globalCacheState.opts.prefix),
 	}
-	if globalCacheState.opts.strategy != nil {
-		cOpts = append(cOpts, cache.WithCacheStrategyByRequest(globalCacheState.opts.strategy))
+	// strategy:业务自定义优先;缺省走本包默认(含 Authorization 身份
+	// 维度的 key 生成,middleware#106)。不再直接用上游
+	// NewCacheByRequestURI/...WithIgnoreQueryOrder——它们的 key 不含
+	// 身份维度且归一化函数未导出,无法在 URI 基础上追加 auth 后缀。
+	strategy := globalCacheState.opts.strategy
+	if strategy == nil {
+		strategy = defaultCacheStrategy(globalCacheState.opts.ignoreOrder)
 	}
+	cOpts = append(cOpts, cache.WithCacheStrategyByRequest(strategy))
 	if globalCacheState.opts.onHit != nil {
 		cOpts = append(cOpts, cache.WithOnHitCache(globalCacheState.opts.onHit))
 	}
@@ -220,11 +252,58 @@ func buildCacheLocked() app.HandlerFunc {
 	if globalCacheState.opts.beforeReply != nil {
 		cOpts = append(cOpts, cache.WithBeforeReplyWithCache(globalCacheState.opts.beforeReply))
 	}
-	// 选 middleware 工厂
-	if globalCacheState.opts.ignoreOrder {
-		return cache.NewCacheByRequestURIWithIgnoreQueryOrder(
-			store, globalCacheState.opts.expiration, cOpts...)
+	return cache.NewCache(store, globalCacheState.opts.expiration, cOpts...)
+}
+
+// defaultCacheStrategy 默认缓存判定(middleware#106):key 取 RequestURI
+// (ignoreOrder 时先做 query 顺序归一化,口径等价上游
+// NewCacheByRequestURIWithIgnoreQueryOrder);请求带 Authorization 头时把
+// 该头的 SHA-256 前 16 hex 并入 key(RequestURI|auth:<hash>)——同 URI
+// 不同凭证 ⇒ 不同缓存条目,认证后的私有响应不再跨用户共享;无
+// Authorization 保持纯 RequestURI(匿名用法 key 与旧默认一致)。
+// 哈希而非原样拼接:凭证不得明文进 key(Redis 等共享 store 的 key 空间
+// 可被运维侧观察)。Cookie 会话不在此处理——由外层守卫直接放行。
+func defaultCacheStrategy(ignoreOrder bool) cache.GetCacheStrategyByRequest {
+	return func(_ context.Context, c *app.RequestContext) (bool, cache.Strategy) {
+		key := string(c.Request.RequestURI())
+		if ignoreOrder {
+			if normalized, err := normalizeQueryOrder(key); err == nil {
+				key = normalized
+			}
+		}
+		if auth := c.Request.Header.Peek("Authorization"); len(auth) > 0 {
+			sum := sha256.Sum256(auth)
+			key += "|auth:" + hex.EncodeToString(sum[:8])
+		}
+		return true, cache.Strategy{CacheKey: key}
 	}
-	return cache.NewCacheByRequestURI(
-		store, globalCacheState.opts.expiration, cOpts...)
+}
+
+// normalizeQueryOrder query 顺序归一化:k2=v2&k1=v1 与 k1=v1&k2=v2 归一为
+// 同一 key。上游 getRequestUriIgnoreQueryOrder 未导出,此为本仓同口径
+// 复刻(按 query key 升序、同 key 的 value 升序重拼);解析失败由调用方
+// 回退原始 URI(与上游错误处理一致——上游失败时也回退原 URI)。
+func normalizeQueryOrder(requestURI string) (string, error) {
+	parsed, err := url.ParseRequestURI(requestURI)
+	if err != nil {
+		return "", err
+	}
+	values := parsed.Query()
+	if len(values) == 0 {
+		return requestURI, nil
+	}
+	queryKeys := make([]string, 0, len(values))
+	for queryKey := range values {
+		queryKeys = append(queryKeys, queryKey)
+	}
+	sort.Strings(queryKeys)
+
+	queryVals := make([]string, 0, len(queryKeys))
+	for _, queryKey := range queryKeys {
+		sort.Strings(values[queryKey])
+		for _, val := range values[queryKey] {
+			queryVals = append(queryVals, queryKey+"="+val)
+		}
+	}
+	return parsed.Path + "?" + strings.Join(queryVals, "&"), nil
 }

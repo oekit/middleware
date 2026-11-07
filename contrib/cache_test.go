@@ -2,7 +2,12 @@ package contrib
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"fmt"
 	"net/http"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -248,33 +253,39 @@ func TestCache_CustomStrategyOptsOut(t *testing.T) {
 	}
 }
 
-// TestCache_SkipsAuthenticatedRequests 回归：默认 CacheKey=RequestURI 不含
-// 身份维度，上游会把 Set-Cookie 连同 body 一起重放——A 的会话在 TTL 内泄给
-// 任何请求同 URI 的 B。钉住：带 Authorization/Cookie 的请求一律放行不缓存。
+// TestCache_SkipsAuthenticatedRequests 回归（middleware#106 后语义更新）：
+// 仅带 Cookie（无 Authorization）的请求直接放行不缓存——cookie 会话没有
+// 稳定可哈希的身份头，缓存重放 Set-Cookie 的风险仍在。带 Authorization
+// 的请求不再放行，改按身份哈希 key 缓存（见 TestCache_AuthHashScopesKey）。
 func TestCache_SkipsAuthenticatedRequests(t *testing.T) {
 	resetCacheState()
+	store := newRecordingStore(time.Minute)
 	h := server.New(
 		server.WithHostPorts("127.0.0.1:0"),
 		server.WithDisablePrintRoute(true),
 	)
 	count := 0
-	h.GET("/private", Cache(WithCacheExpiration(time.Minute)),
+	h.GET("/private", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
 		func(ctx context.Context, c *app.RequestContext) {
 			count++
 			c.Header("Set-Cookie", "session=user-A")
 			c.JSON(200, map[string]int{"n": count})
 		})
 
-	// 带凭证请求两次：都必须真正执行 handler（不缓存）
+	// 仅带 Cookie 的请求两次：都必须真正执行 handler（不缓存），
+	// 且 store 不出现任何新 key（中间件根本没进缓存分支）。
 	for i := 0; i < 2; i++ {
 		w := ut.PerformRequest(h.Engine, "GET", "/private", nil,
-			ut.Header{Key: "Authorization", Value: "Bearer tok"})
+			ut.Header{Key: "Cookie", Value: "sid=1"})
 		if w.Code != 200 {
-			t.Fatalf("authed request %d: status %d", i, w.Code)
+			t.Fatalf("cookie request %d: status %d", i, w.Code)
 		}
 	}
 	if count != 2 {
-		t.Fatalf("authed requests must not be cached: handler ran %d times, want 2", count)
+		t.Fatalf("cookie-only requests must not be cached: handler ran %d times, want 2", count)
+	}
+	if n := len(store.Keys()); n != 0 {
+		t.Fatalf("cookie-only requests must not touch store, got keys %v", store.Keys())
 	}
 
 	// 无凭证请求两次：第二次命中缓存（count 不再增长）
@@ -283,5 +294,191 @@ func TestCache_SkipsAuthenticatedRequests(t *testing.T) {
 	}
 	if count != 3 {
 		t.Fatalf("anonymous requests should use cache: handler ran %d times, want 3", count)
+	}
+}
+
+// recordingStore 记录经过 store 的全部 key（Get/Set 合计）——middleware#106
+// 默认 key 口径的断言依据。委托内层 MemoryStore 保证真实读写语义。
+type recordingStore struct {
+	mu    sync.Mutex
+	keys  []string
+	inner persist.CacheStore
+}
+
+func newRecordingStore(expire time.Duration) *recordingStore {
+	return &recordingStore{inner: persist.NewMemoryStore(expire)}
+}
+
+func (r *recordingStore) record(key string) {
+	r.mu.Lock()
+	r.keys = append(r.keys, key)
+	r.mu.Unlock()
+}
+
+// Keys 返回已记录 key 的拷贝。
+func (r *recordingStore) Keys() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]string(nil), r.keys...)
+}
+
+func (r *recordingStore) Get(ctx context.Context, key string, value any) error {
+	r.record(key)
+	return r.inner.Get(ctx, key, value)
+}
+
+func (r *recordingStore) Set(ctx context.Context, key string, value any, expire time.Duration) error {
+	r.record(key)
+	return r.inner.Set(ctx, key, value, expire)
+}
+
+func (r *recordingStore) Delete(ctx context.Context, key string) error {
+	return r.inner.Delete(ctx, key)
+}
+
+// authKeySuffix 计算默认 key 的身份后缀（与 defaultCacheStrategy 同口径）：
+// SHA-256 前 8 字节的 hex（16 字符）。
+func authKeySuffix(authValue string) string {
+	sum := sha256.Sum256([]byte(authValue))
+	return "|auth:" + hex.EncodeToString(sum[:8])
+}
+
+// containsKey 判断 key 是否被记录过。
+func containsKey(keys []string, key string) bool {
+	for _, k := range keys {
+		if k == key {
+			return true
+		}
+	}
+	return false
+}
+
+// TestCache_AuthHashScopesDefaultKey middleware#106 核心：同 URI、不同
+// Authorization 头 ⇒ 不同缓存条目（key 并入该头哈希）；同凭证重复请求
+// 命中各自的条目。修复前默认 key=RequestURI 不含身份维度，A 的认证响应
+// （含 Set-Cookie）会被 B 命中——会话泄露。
+func TestCache_AuthHashScopesDefaultKey(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/private", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
+		func(ctx context.Context, c *app.RequestContext) {
+			n := count.Add(1)
+			c.Header("Set-Cookie", "session=user-"+fmt.Sprint(n))
+			c.JSON(200, map[string]int{"n": int(n)})
+		})
+
+	keyA := "ekit/private" + authKeySuffix("Bearer token-a")
+	keyB := "ekit/private" + authKeySuffix("Bearer token-b")
+
+	// A 首次：miss → handler 执行 → 写入身份隔离条目
+	w := ut.PerformRequest(h.Engine, "GET", "/private", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer token-a"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"n":1`) {
+		t.Fatalf("A first: code=%d body=%s", w.Code, w.Body.String())
+	}
+	if !containsKey(store.Keys(), keyA) {
+		t.Fatalf("★ A 的请求必须写入身份隔离 key %q, got %v", keyA, store.Keys())
+	}
+
+	// A 二次：命中自己的条目（handler 不再执行，Set-Cookie 原样重放）
+	w = ut.PerformRequest(h.Engine, "GET", "/private", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer token-a"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"n":1`) {
+		t.Fatalf("A second (cache hit): code=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := count.Load(); got != 1 {
+		t.Fatalf("A 二次请求应命中缓存: handler ran %d times, want 1", got)
+	}
+
+	// B 首次：同 URI 不同凭证 ⇒ 不同条目（不得命中 A 的缓存）
+	w = ut.PerformRequest(h.Engine, "GET", "/private", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer token-b"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"n":2`) {
+		t.Fatalf("B first: code=%d body=%s（不得重放 A 的响应）", w.Code, w.Body.String())
+	}
+	if !containsKey(store.Keys(), keyB) {
+		t.Fatalf("★ B 的请求必须写入独立 key %q, got %v", keyB, store.Keys())
+	}
+	if got := count.Load(); got != 2 {
+		t.Fatalf("B 首次请求不得命中 A 的缓存: handler ran %d times, want 2", got)
+	}
+
+	// 无身份维度的裸 URI key 不得出现（那是跨用户共享的老默认）
+	if containsKey(store.Keys(), "ekit/private") {
+		t.Fatalf("★ 带凭证请求不得落在无身份 key 上: %v", store.Keys())
+	}
+}
+
+// TestCache_DefaultKeyAnonymousMatchesOldDefault 回归：无 Authorization 的
+// 请求默认 key 仍为 prefix+RequestURI（不含身份后缀）——不破坏现有匿名用法。
+func TestCache_DefaultKeyAnonymousMatchesOldDefault(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/data", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
+		func(ctx context.Context, c *app.RequestContext) {
+			count.Add(1)
+			c.JSON(200, map[string]string{"v": "1"})
+		})
+
+	ut.PerformRequest(h.Engine, "GET", "/data?a=1", nil)
+	ut.PerformRequest(h.Engine, "GET", "/data?a=1", nil)
+
+	if got := count.Load(); got != 1 {
+		t.Fatalf("匿名 GET 两次应命中缓存: handler ran %d times, want 1", got)
+	}
+	// 老默认 key = prefix + RequestURI，一条不多（Get+Set 各一次恰好两个记录）
+	want := "ekit/data?a=1"
+	for _, k := range store.Keys() {
+		if k != want {
+			t.Fatalf("★ 匿名请求 key = %q, want %q（与旧默认一致）, all=%v", k, want, store.Keys())
+		}
+	}
+	if len(store.Keys()) == 0 {
+		t.Fatal("store 未记录任何 key——缓存未生效")
+	}
+}
+
+// TestCache_IgnoreQueryOrderWithAuthSuffix WithIgnoreQueryOrder 与身份后缀
+// 组合：query 顺序归一化后追加 auth 哈希——两种顺序、同一凭证命中同一
+// 条目（normalizeQueryOrder 是上游未导出函数的本仓复刻，需钉住口径）。
+func TestCache_IgnoreQueryOrderWithAuthSuffix(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/q", Cache(
+		WithCacheStore(store),
+		WithCacheExpiration(time.Minute),
+		WithIgnoreQueryOrder(),
+	), func(ctx context.Context, c *app.RequestContext) {
+		count.Add(1)
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+
+	suffix := authKeySuffix("Bearer token-a")
+	ut.PerformRequest(h.Engine, "GET", "/q?x=1&y=2", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer token-a"})
+	ut.PerformRequest(h.Engine, "GET", "/q?y=2&x=1", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer token-a"})
+
+	if got := count.Load(); got != 1 {
+		t.Fatalf("query 顺序不同应归一为同一 key: handler ran %d times, want 1", got)
+	}
+	want := "ekit/q?x=1&y=2" + suffix
+	if !containsKey(store.Keys(), want) {
+		t.Fatalf("★ 归一化 key = %q 不在记录中, got %v", want, store.Keys())
 	}
 }
