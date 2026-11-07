@@ -32,7 +32,7 @@ type Response struct {
 //
 // 声明式跳过（与 SkipResponseWrap 并存）:
 //   - WithSkipPaths — 路径精确匹配，命中则整请求不包装
-//   - WithSkipPrefixes — 路径前缀匹配（如 "/.well-known/"、"/mcp"），命中则整请求不包装
+//   - WithSkipPrefixes — 路径前缀匹配（段边界："/mcp" 命中 "/mcp" 与 "/mcp/tools"，不命中 "/mcp-v2"），命中则整请求不包装
 //   - SkipResponseWrap — handler 级逃生舱（写响应前调用），单响应跳过包装
 //
 // 注意: 本中间件不负责生成 trace_id。请确保已在其之前注册 hmw.Middleware()。
@@ -115,12 +115,21 @@ type responseSkipConfig struct {
 }
 
 // skip 判断给定路径是否命中声明式跳过规则。
+//
+// 前缀命中后做段边界校验（#100）：裸 strings.HasPrefix 会把 "/mcp" 连带到
+// "/mcp-v2/..." 等同字符开头的无关路由——包壳豁免是「静默失败」型错误，
+// 命中路由返回裸 JSON、按统一信封解码的消费方直接解析失败且无任何信号。
+// 边界规则：前缀等于完整路径，或前缀以 "/" 结尾（尾斜杠前缀天然按段开头），
+// 或路径在前缀后紧跟 "/"（新段开始）。空前缀维持历史行为（匹配一切）。
 func (c *responseSkipConfig) skip(path string) bool {
 	if _, ok := c.skipPaths[path]; ok {
 		return true
 	}
 	for _, p := range c.skipPrefixes {
-		if strings.HasPrefix(path, p) {
+		if p == "" || !strings.HasPrefix(path, p) {
+			continue
+		}
+		if len(path) == len(p) || p[len(p)-1] == '/' || path[len(p)] == '/' {
 			return true
 		}
 	}
@@ -155,6 +164,12 @@ func WithSkipPaths(paths ...string) ResponseOption {
 
 // WithSkipPrefixes 声明前缀匹配的跳过路径：命中即整请求不做统一包壳。
 // 适合 /.well-known/、/mcp 这类按前缀成组的标准端点。
+//
+// 匹配是**段边界**的（#100）：前缀要么等于完整路径（"/mcp" 命中 "/mcp"），
+// 要么路径在其后紧跟新段（"/mcp" 命中 "/mcp/tools"，但不命中 "/mcp-v2/data"
+// ——裸字节前缀会把同字符开头的无关路由连带豁免，命中路由静默失去统一
+// 包壳，消费方按信封解码直接失败且无信号）。尾斜杠前缀（"/.well-known/"）
+// 天然按段开头，子路径照常命中。
 //
 // 用法:
 //
