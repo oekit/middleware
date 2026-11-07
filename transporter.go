@@ -86,7 +86,11 @@ func (a *hertzReplyHeader) Values(key string) []string {
 
 func (a *hertzReplyHeader) Set(key, value string) { a.h.Set(key, value) }
 
-func (a *hertzReplyHeader) Add(key, value string) { a.h.Set(key, value) }
+// Add 追加（同 key 多值）——与 hertzRequestHeader.Add 及 core/transport 的
+// Header.Add 语义一致；此前误用 Set（覆盖），后写的值会顶掉先写的值，
+// Vary/Set-Cookie 类多值响应头被静默丢值（#99，与 hertz 仓 transportx
+// replyHeader.Add 的修复同构）。
+func (a *hertzReplyHeader) Add(key, value string) { a.h.Add(key, value) }
 
 func (a *hertzReplyHeader) Del(key string) { a.h.Del(key) }
 
