@@ -1,3 +1,14 @@
+## [v0.13.13] — 2026-11-07
+
+- fix(fail): Fail/FailWithData 改用 errors.AsBizError——typed-nil *BizError 在错误出口自身 panic 关闭（#95）
+- fix(auth): cutBearerToken 切出后 TrimSpace——RFC 7235 多 SP 形态的合法 token 不再被拒（#96）
+- fix(auth): 认证缺配置从静默放行改为构造期 panic + WithAuthDisabled 显式开关——与限流 fail-fast 哲学统一（BREAKING，依赖旧行为需显式关闭）（#97）
+- feat(identity): TrustedHeadersIdentity trusted-gateway 身份中间件——「网关已验签、信任注入头」形态收编，解析容错三策略显式化（#98）
+- fix(transport): hertzReplyHeader.Add 改真追加——同名多值响应头不再被覆盖（#99）
+- fix(response): WithSkipPrefixes 段边界校验——"/mcp" 不再连带豁免 "/mcp-v2/..."（#100）
+
+关联问题单：middleware#95、middleware#96、middleware#97、middleware#98、middleware#99、middleware#100。
+
 ## [v0.13.12] — 2026-11-06
 
 - build: 矩阵依赖地板对齐（第二轮发版后置）
