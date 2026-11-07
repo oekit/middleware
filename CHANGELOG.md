@@ -1,5 +1,9 @@
 
 
+## [v0.13.15] — 2026-11-08
+
+- build: 依赖地板对齐——本版把 oekit 依赖地板抬到各依赖当前最新已发布版本（matrix-tools/scripts/align_floors.py 维护轮）
+
 ## [v0.13.14] — 2026-11-08
 
 - fix(contrib/cache): 默认 CacheKey 并入 Authorization 身份哈希——认证响应不再跨用户共享（#106）：此前默认 CacheKey=RequestURI 不含身份维度，A 认证后的响应（含 Set-Cookie）在 TTL 内可被任何请求同 URI 的 B 命中⇒会话泄露（越权/会话固定）
