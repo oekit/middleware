@@ -99,7 +99,7 @@ func TestHertzReplyHeaderAdd_ViaAccessLogTransporter(t *testing.T) {
 	})
 
 	r := ut.PerformRequest(h, http.MethodGet, "/vary", nil).Result()
-	var vary []string
+	vary := make([]string, 0, 2)
 	for _, v := range r.Header.PeekAll("Vary") {
 		vary = append(vary, string(v))
 	}
