@@ -22,7 +22,10 @@
 //   - RateLimitMiddleware — 令牌桶限流（默认按 RemoteAddr 分键）
 //   - SheddingMiddleware — CPU 自适应降载（opt-in，不加入 DefaultMiddleware 栈；
 //     Allow 拒绝 → 503/body code 50300，放行按响应状态码回填 Promise）
-//   - BearerTokenAuth   — Bearer Token 认证（Authorizer 鉴权钩子）
+//   - BearerTokenAuth   — Bearer Token 认证（Authorizer 鉴权钩子；token 未配置
+//     且未 WithAuthDisabled 时构造期 panic，fail-fast）
+//   - TrustedHeadersIdentity — 信任网关已验签、解析注入身份头 → ctx claims
+//     （zeus X-Auth-* 形态；handler 侧 ClaimsFrom 零样板读身份）
 //   - I18n              — Accept-Language 国际化（LangFromCtx / Translate）
 //   - Fail / ErrorResp / SuccessResp — handler 层统一错误处理与响应写入
 //
