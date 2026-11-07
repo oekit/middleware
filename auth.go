@@ -57,8 +57,16 @@ type SubjectExtractor func(c *app.RequestContext) Subject
 
 // BearerTokenOptions 是 Bearer Token 认证中间件的配置。
 type BearerTokenOptions struct {
-	// Token 预共享的静态 token。为空时中间件不做校验，直接放行。
+	// Token 预共享的静态 token。必填：未配置且未显式 WithAuthDisabled 时
+	// 构造期 panic（与 RateLimitMiddleware 对 Rate/Burst 的 fail-fast 同口径，
+	// #97）——此前「为空直接放行」是静默 fail-open，运维误删一行
+	// WithBearerToken 或配置中心读到空串，整个认证层就无声消失。
 	Token string
+
+	// Disabled 显式关闭认证（本地联调/明确不需要认证的服务用）。
+	// 置位后中间件等价于直通，不再要求 Token。这是一个可 grep、可审计的
+	// 显式开关——「没配 token」与「明确决定不要认证」必须可区分。
+	Disabled bool
 
 	// SkipPaths 不需要认证的路径列表，如 ["/ping", "/healthz", "/metrics"]。
 	SkipPaths []string
@@ -83,6 +91,17 @@ type BearerTokenOption func(*BearerTokenOptions)
 func WithBearerToken(token string) BearerTokenOption {
 	return func(o *BearerTokenOptions) {
 		o.Token = token
+	}
+}
+
+// WithAuthDisabled 显式关闭认证：中间件直通，不再要求 Token。
+//
+// 与「忘配 Token」的区别是本开关可 grep、可审计——代码评审能一眼看到
+// 「明确决定不要认证」的决策点。Token 未配置且未设置本开关时，
+// BearerTokenAuth 在构造期 panic（fail-fast，与 RateLimitMiddleware 同口径）。
+func WithAuthDisabled() BearerTokenOption {
+	return func(o *BearerTokenOptions) {
+		o.Disabled = true
 	}
 }
 
@@ -139,18 +158,35 @@ func newBearerTokenOptions(opts ...BearerTokenOption) *BearerTokenOptions {
 
 // cutBearerToken 从 Authorization 头切出 token（RFC 7235 scheme 大小写
 // 不敏感：bearer/Bearer/BEARER 均接受）。
+//
+// RFC 7235 的 credentials 语法是 `auth-scheme [ 1*SP ( token68 / ... ) ]`，
+// 1*SP = 一个或多个空格：scheme 与 token 间允许多个 SP，token68 本身不含
+// 空白。因此切出后 TrimSpace——"Bearer   secret"（多 SP）与 "Bearer secret "
+// （尾空白）都必须切出干净的 "secret"，否则 ConstantTimeCompare 不匹配、
+// 合法 token 被拒 401（#96）。切出后为空（"Bearer   "）视为格式非法。
 func cutBearerToken(header string) (string, bool) {
 	i := strings.IndexByte(header, ' ')
 	if i <= 0 || !strings.EqualFold(header[:i], "bearer") {
 		return "", false
 	}
-	return header[i+1:], true
+	token := strings.TrimSpace(header[i+1:])
+	if token == "" {
+		return "", false
+	}
+	return token, true
 }
 
 // BearerTokenAuth 返回一个 Bearer Token 认证中间件,可选配鉴权钩子。
 //
+// 构造期校验（fail-fast，#97）:
+//
+//	Token 未配置且未显式 WithAuthDisabled → panic。
+//	此前的「Token 为空 → 直接放行」是运行期静默 fail-open（无日志无告警），
+//	与同包 RateLimitMiddleware 对未配置 Rate/Burst 的构造期 panic 是两套
+//	安全哲学；本函数对齐后者：误配必须在启动期炸响，而不是让认证层无声消失。
+//
 // 校验流程:
-//  1. Token 为空 → 直接放行（认证关闭）
+//  1. WithAuthDisabled → 直接放行（显式关闭，等价于不注册本中间件）
 //  2. 路径在 SkipPaths 或命中 SkipFunc → 放行
 //  3. 请求头 Authorization: Bearer <token> 与配置 token 做常量时间比较
 //     - 不匹配 → 401
@@ -172,8 +208,18 @@ func cutBearerToken(header string) (string, bool) {
 //	        return mw.Subject{UserID: jwtClaims["user_id"].(string), ...}
 //	    }),
 //	))
+//
+//	// 本地联调/明确不需要认证：显式关闭（可 grep、可审计）
+//	h.Use(mw.BearerTokenAuth(mw.WithAuthDisabled()))
 func BearerTokenAuth(opts ...BearerTokenOption) app.HandlerFunc {
 	cfg := newBearerTokenOptions(opts...)
+
+	if cfg.Disabled {
+		return func(ctx context.Context, c *app.RequestContext) { c.Next(ctx) }
+	}
+	if cfg.Token == "" {
+		panic("mw.BearerTokenAuth: token not configured, call WithBearerToken(token) first (or WithAuthDisabled() to explicitly disable auth)")
+	}
 
 	skip := make(map[string]bool, len(cfg.SkipPaths))
 	for _, p := range cfg.SkipPaths {
@@ -181,11 +227,6 @@ func BearerTokenAuth(opts ...BearerTokenOption) app.HandlerFunc {
 	}
 
 	return func(ctx context.Context, c *app.RequestContext) {
-		if cfg.Token == "" {
-			c.Next(ctx)
-			return
-		}
-
 		path := string(c.Path())
 		if skip[path] || (cfg.SkipFunc != nil && cfg.SkipFunc(path)) {
 			c.Next(ctx)

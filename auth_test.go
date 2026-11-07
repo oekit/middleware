@@ -53,9 +53,33 @@ func runBearerAuth(t *testing.T, c *app.RequestContext, opts ...BearerTokenOptio
 	h(context.Background(), c)
 }
 
-// TestBearerTokenAuth_NoToken 验证 Token 为空时直接放行。
-func TestBearerTokenAuth_NoToken(t *testing.T) {
-	h := BearerTokenAuth() // 无 token → 认证关闭
+// TestBearerTokenAuth_NoTokenPanics 回归测试（#97）：Token 未配置且未显式
+// 关闭认证时构造期 panic（fail-fast，对齐 RateLimitMiddleware 的 Rate/Burst
+// 校验）——此前「为空直接放行」是静默 fail-open，认证层会无声消失。
+func TestBearerTokenAuth_NoTokenPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("BearerTokenAuth() without token should panic at construction (fail-fast)")
+		}
+	}()
+	_ = BearerTokenAuth() // 无 token、未 WithAuthDisabled → 构造期 panic
+}
+
+// TestBearerTokenAuth_EmptyTokenPanics 配置中心读到空串与忘配 option 同路：
+// WithBearerToken("") 也必须在构造期炸响，而不是静默放行。
+func TestBearerTokenAuth_EmptyTokenPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("BearerTokenAuth(WithBearerToken(\"\")) should panic at construction")
+		}
+	}()
+	_ = BearerTokenAuth(WithBearerToken(""))
+}
+
+// TestBearerTokenAuth_Disabled 显式关闭认证：WithAuthDisabled 后不要求
+// Token，请求直通（可 grep、可审计的开关，与「忘配 token」可区分）。
+func TestBearerTokenAuth_Disabled(t *testing.T) {
+	h := BearerTokenAuth(WithAuthDisabled())
 	c := app.NewContext(128)
 	c.Request.SetRequestURI("/test")
 	h(context.Background(), c)
@@ -226,6 +250,51 @@ func TestBearerTokenAuth_DefaultSubjectExtractor(t *testing.T) {
 		t.Errorf("default extractor: UserID = %q, want empty (client-supplied header must not be trusted)", auth.lastSub.UserID)
 	}
 	if auth.lastSub.Method == "" || auth.lastSub.Path == "" {
-		t.Errorf("default extractor: Method/Path should be auto-set, got %q/%q", auth.lastSub.Method, auth.lastSub.Path)
+		t.Errorf("default extractor: Method/Path should be auto-set, got %q/%q", auth.lastMethod, auth.lastPath)
 	}
+}
+
+// TestCutBearerToken 回归测试（#96）：RFC 7235 的 credentials 语法是
+// `auth-scheme [ 1*SP ( token68 / ... ) ]`——scheme 与 token 间允许一个或
+// 多个 SP。此前只切第一个空格，"Bearer   secret" 切出 "  secret"，
+// ConstantTimeCompare 不匹配 ⇒ 合法 token 被拒 401。
+func TestCutBearerToken(t *testing.T) {
+	tests := []struct {
+		name    string
+		header  string
+		wantTok string
+		wantOK  bool
+	}{
+		{"单 SP", "Bearer secret", "secret", true},
+		{"多 SP（RFC 7235 1*SP）", "Bearer   secret", "secret", true},
+		{"尾空白", "Bearer secret  ", "secret", true},
+		{"首尾空白叠加", "Bearer \tsecret\t ", "secret", true},
+		{"scheme 小写", "bearer secret", "secret", true},
+		{"scheme 大写", "BEARER secret", "secret", true},
+		{"切出后为空（多 SP 无 token）", "Bearer    ", "", false},
+		{"无 scheme", "secret", "", false},
+		{"非 bearer scheme", "Basic dXNlcjpwYXNz", "", false},
+		{"空 header", "", "", false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			got, ok := cutBearerToken(tt.header)
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if got != tt.wantTok {
+				t.Fatalf("token = %q, want %q", got, tt.wantTok)
+			}
+		})
+	}
+}
+
+// TestBearerTokenAuth_MultipleSpacesToken 端到端：多 SP 的 Authorization 头
+// 携带合法 token 必须放行（此前切出带前导空格的 token 被 401）。
+func TestBearerTokenAuth_MultipleSpacesToken(t *testing.T) {
+	c := app.NewContext(128)
+	c.Request.SetRequestURI("/test")
+	c.Request.Header.Set("Authorization", "Bearer   "+testBearerToken) // 3 个 SP
+	runBearerAuth(t, c, WithBearerToken(testBearerToken))
+	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
 }
