@@ -96,3 +96,77 @@ func TestRegisterPprof_EmptyPrefixFallsBackToDefault(t *testing.T) {
 		t.Fatalf("expected default prefix on empty override, got %q", info.Prefix)
 	}
 }
+
+// hasRoute 判断路由表里是否有指定 method+path。
+func hasRoute(routes []string, want string) bool {
+	for _, r := range routes {
+		if r == want {
+			return true
+		}
+	}
+	return false
+}
+
+// TestFgprofPrefixFor 钉住兄弟目录推导规则:把 pprof 前缀末段替换成 fgprof。
+// 缺省(/debug/pprof)推导值恰好等于上游 DefaultFgprofPrefix(/debug/fgprof),
+// 既有部署零行为变化;自定义前缀按同构关系推导(/internal/pprof →
+// /internal/fgprof)。
+func TestFgprofPrefixFor(t *testing.T) {
+	cases := []struct{ pprof, want string }{
+		{"/debug/pprof", "/debug/fgprof"},
+		{"/internal/pprof", "/internal/fgprof"},
+		{"/a/b/pprof", "/a/b/fgprof"},
+		{"/pprof", "/fgprof"},
+	}
+	for _, c := range cases {
+		if got := fgprofPrefixFor(c.pprof); got != c.want {
+			t.Errorf("fgprofPrefixFor(%q) = %q, want %q", c.pprof, got, c.want)
+		}
+	}
+}
+
+// TestRegisterDebug_FgprofFollowsPrefix 回归 #124:WithDebugPrefix 必须同时
+// 作用于 fgprof(推导兄弟目录)。此前 cfg.Prefix 只喂 pprof,自定义前缀时
+// fgprof 仍暴露在默认 /debug/fgprof——按文档隐藏 debug 面的部署藏了一半。
+func TestRegisterDebug_FgprofFollowsPrefix(t *testing.T) {
+	h := newTestHertzForPprof()
+	RegisterDebug(h, WithDebugPrefix("/internal/pprof"), WithDebugFgprof())
+	routes := getRouteList(h)
+	if !hasRoute(routes, "GET /internal/fgprof/") {
+		t.Errorf("expected fgprof at derived sibling path, got routes %v", routes)
+	}
+	for _, r := range routes {
+		if strings.HasPrefix(r, "GET /debug/fgprof") {
+			t.Errorf("legacy default fgprof path should be gone after custom prefix: %q", r)
+		}
+	}
+}
+
+// TestRegisterDebug_FgprofDefaultBackwardCompat 缺省配置下 fgprof 仍挂上游
+// 默认 /debug/fgprof(推导值 == DefaultFgprofPrefix),修复不留迁移成本。
+func TestRegisterDebug_FgprofDefaultBackwardCompat(t *testing.T) {
+	h := newTestHertzForPprof()
+	RegisterDebug(h, WithDebugFgprof())
+	routes := getRouteList(h)
+	if !hasRoute(routes, "GET /debug/fgprof/") {
+		t.Errorf("expected fgprof at upstream default path with default prefix, got routes %v", routes)
+	}
+}
+
+// TestRegisterDebug_FgprofPrefixExplicitOverride 显式 WithDebugFgprofPrefix
+// 优先于兄弟目录推导值;空串沿用推导(与 WithDebugPrefix 空值语义一致)。
+func TestRegisterDebug_FgprofPrefixExplicitOverride(t *testing.T) {
+	h := newTestHertzForPprof()
+	RegisterDebug(h,
+		WithDebugPrefix("/internal/pprof"),
+		WithDebugFgprofPrefix("/x/fg"),
+		WithDebugFgprof(),
+	)
+	routes := getRouteList(h)
+	if !hasRoute(routes, "GET /x/fg/") {
+		t.Errorf("expected explicit fgprof prefix /x/fg, got routes %v", routes)
+	}
+	if hasRoute(routes, "GET /internal/fgprof/") {
+		t.Errorf("derived sibling path should not be registered when explicit override set, got routes %v", routes)
+	}
+}
