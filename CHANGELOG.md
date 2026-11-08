@@ -1,5 +1,13 @@
 
 
+## [v0.14.0] — 2026-11-09
+
+- fix(contrib): CSRF Secret 空串构造期 fail-fast（#122）
+- fix(chainmw): Recovery 补 *PanicError 返回路径上报——与 core/chain 语义一致（#123）
+- fix(contrib): WithDebugPrefix 作用于 fgprof + WithDebugFgprofPrefix 显式覆盖（#124）
+
+关联问题单：middleware#122、middleware#123、middleware#124。
+
 ## [v0.13.15] — 2026-11-08
 
 - build: 依赖地板对齐——本版把 oekit 依赖地板抬到各依赖当前最新已发布版本（matrix-tools/scripts/align_floors.py 维护轮）
