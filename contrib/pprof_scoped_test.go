@@ -96,14 +96,20 @@ func TestRegisterDebug_AuthScopedToDebugRoutes(t *testing.T) {
 		t.Errorf("debug endpoint with token: got %d, want 200", code)
 	}
 
-	// fgprof 端点同样受 guard 保护
-	code, _ = debugGet(t, base+"/debug/fgprof")
+	// fgprof 端点同样受 guard 保护,路径随 WithDebugPrefix 推导兄弟目录
+	// (#124 修复:此前 fgprof 不吃前缀、仍暴露在默认 /debug/fgprof)
+	code, _ = debugGet(t, base+"/internal/fgprof")
 	if code != 401 {
 		t.Errorf("fgprof without token: got %d, want 401", code)
 	}
-	code, _ = debugGet(t, base+"/debug/fgprof?token=tok-123&seconds=1")
+	code, _ = debugGet(t, base+"/internal/fgprof?token=tok-123&seconds=1")
 	if code != 200 {
 		t.Errorf("fgprof with token: got %d, want 200", code)
+	}
+	// 反证:默认路径必须不再暴露(只有「新路径能用」证明不了「旧路径下线」)
+	code, _ = debugGet(t, base+"/debug/fgprof")
+	if code != 404 {
+		t.Errorf("legacy default fgprof path should be gone: got %d, want 404", code)
 	}
 }
 
@@ -116,5 +122,19 @@ func TestRegisterDebug_NoAuth_PublicReachable(t *testing.T) {
 	code, _ := debugGet(t, base+"/debug/pprof/")
 	if code != 200 {
 		t.Errorf("unauthenticated debug endpoint: got %d, want 200", code)
+	}
+}
+
+// TestRegisterDebug_FgprofDefaultPathReachable 缺省配置(不传 WithDebugPrefix)
+// 下 fgprof 仍在上游默认 /debug/fgprof 可达:#124 修复的推导值恰好等于
+// DefaultFgprofPrefix,既有部署零行为变化。
+func TestRegisterDebug_FgprofDefaultPathReachable(t *testing.T) {
+	base := spinDebugRealServer(t, func(h *server.Hertz) {
+		RegisterDebug(h, WithDebugFgprof())
+	})
+	// seconds=1:fgprof 无参默认采 30 秒样,测试只验证路由可达,不验证采样时长
+	code, _ := debugGet(t, base+"/debug/fgprof?seconds=1")
+	if code != 200 {
+		t.Errorf("default fgprof endpoint: got %d, want 200", code)
 	}
 }

@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/subtle"
 	"net/http"
+	"path"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/app/server"
@@ -72,6 +73,7 @@ type debugConfig struct {
 	EnableAuth   bool
 	Token        string
 	EnableFgprof bool
+	FgprofPrefix string
 }
 
 // newDebugOptions 构造默认 debugConfig,Prefix 由调用方决定。
@@ -84,6 +86,11 @@ func newDebugOptions(opts ...DebugOption) *debugConfig {
 }
 
 // WithDebugPrefix 自定义 pprof URL 前缀,默认 /debug/pprof。
+//
+// 同时决定 fgprof 的挂载点:启用 WithDebugFgprof 时,fgprof 缺省挂到本前缀
+// 的**兄弟目录**(/debug/pprof → /debug/fgprof,/internal/pprof →
+// /internal/fgprof,与上游默认的同构关系一致),保证「隐藏 debug 面」是
+// 整体隐藏而非藏一半;如需另行指定用 WithDebugFgprofPrefix。
 func WithDebugPrefix(prefix string) DebugOption {
 	return func(c *debugConfig) {
 		if prefix != "" {
@@ -113,12 +120,43 @@ func WithDebugAuth(token string) DebugOption {
 // WithDebugFgprof 额外注册 fgprof 端点(非阻塞 profiling,避免长采样把
 // STW 拖到秒级)。
 //
+// fgprof 路径:缺省由 WithDebugPrefix 推导兄弟目录(/debug/pprof →
+// /debug/fgprof;/internal/pprof → /internal/fgprof),显式覆盖用
+// WithDebugFgprofPrefix。
+//
 // 官方依据:https://github.com/hertz-contrib/pprof/tree/main(README 提到
 // fgprof 是独立 API,需要单独调用 FgprofRegister)。
 func WithDebugFgprof() DebugOption {
 	return func(c *debugConfig) {
 		c.EnableFgprof = true
 	}
+}
+
+// WithDebugFgprofPrefix 自定义 fgprof URL 前缀,显式覆盖 WithDebugPrefix
+// 推导出的兄弟目录值。空串 = 沿用推导值(与 WithDebugPrefix/WithDebugAuth
+// 的空值语义一致)。
+//
+// 注意不能与 pprof 前缀相同:上游 Register/RouteRegister 与
+// FgprofRegister/FgprofRouteRegister 都在各自前缀下注册 GET "/",
+// 同前缀必然路由冲突,启动即失败——上游默认就是兄弟目录(/debug/pprof 与
+// /debug/fgprof),保持兄弟关系即可。
+func WithDebugFgprofPrefix(prefix string) DebugOption {
+	return func(c *debugConfig) {
+		if prefix != "" {
+			c.FgprofPrefix = prefix
+		}
+	}
+}
+
+// fgprofPrefixFor 把 pprof 前缀的末段替换成 fgprof,保持与上游默认的兄弟
+// 关系:/debug/pprof → /debug/fgprof,/internal/pprof → /internal/fgprof。
+// 缺省情况下推导值恰好等于上游 DefaultFgprofPrefix,对既有部署零行为变化。
+func fgprofPrefixFor(pprofPrefix string) string {
+	dir := path.Dir(pprofPrefix)
+	if dir == "." || dir == "/" {
+		return "/fgprof"
+	}
+	return path.Join(dir, "fgprof")
 }
 
 // debugAuthGuard 简单 query/header token 鉴权中间件。
@@ -141,6 +179,8 @@ func debugAuthGuard(token string) app.HandlerFunc {
 //
 // 与 RegisterPprof 区别:支持鉴权(防止公网被扫到)和 fgprof(非阻塞 CPU
 // profiling)。默认无鉴权、无 fgprof,业务按需 WithDebugAuth/WithDebugFgprof。
+// WithDebugPrefix 同时作用于 pprof 与 fgprof(fgprof 挂兄弟目录,见
+// WithDebugFgprofPrefix)。
 //
 // 用法:
 //
@@ -150,6 +190,7 @@ func debugAuthGuard(token string) app.HandlerFunc {
 //	    WithDebugAuth(os.Getenv("PPROF_TOKEN")),
 //	    WithDebugFgprof(),
 //	)
+//	// pprof → /internal/pprof,fgprof → /internal/fgprof
 //
 // 官方依据:https://github.com/hertz-contrib/pprof + hertz 官方扩展列表
 // https://github.com/cloudwego/hertz#extensions。
@@ -157,6 +198,13 @@ func RegisterDebug(h *server.Hertz, opts ...DebugOption) {
 	cfg := newDebugOptions(opts...)
 	if cfg.Prefix == "" {
 		cfg.Prefix = PprofDefaultPrefix
+	}
+	// fgprof 前缀:显式优先,缺省由 pprof 前缀推导兄弟目录(缺省配置下推导值
+	// == 上游 DefaultFgprofPrefix,既有部署零行为变化;此前 cfg.Prefix 只喂
+	// pprof,自定义前缀时 fgprof 仍暴露在默认 /debug/fgprof——藏了一半,#124)。
+	fgprofPrefix := cfg.FgprofPrefix
+	if fgprofPrefix == "" {
+		fgprofPrefix = fgprofPrefixFor(cfg.Prefix)
 	}
 	// 鉴权 scope(2026-09-05 复审修复:原实现 h.Use(guard) 挂到 root group,
 	// hertz 在路由注册时快照 group handlers,guard 会泄漏到之后注册的
@@ -169,13 +217,13 @@ func RegisterDebug(h *server.Hertz, opts ...DebugOption) {
 		g.Use(debugAuthGuard(cfg.Token))
 		hertzcontribpprof.RouteRegister(g, cfg.Prefix)
 		if cfg.EnableFgprof {
-			hertzcontribpprof.FgprofRouteRegister(g)
+			hertzcontribpprof.FgprofRouteRegister(g, fgprofPrefix)
 		}
 		return
 	}
 	hertzcontribpprof.Register(h, cfg.Prefix)
 	if cfg.EnableFgprof {
-		hertzcontribpprof.FgprofRegister(h)
+		hertzcontribpprof.FgprofRegister(h, fgprofPrefix)
 	}
 }
 
