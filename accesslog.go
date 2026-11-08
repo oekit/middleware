@@ -93,7 +93,19 @@ type AccessSink func(ctx context.Context, c *app.RequestContext, rec AccessRecor
 // AccessLogOption 配置 AccessLogMiddleware。
 type AccessLogOption func(*AccessLogOptions)
 
-// WithAccessLogSkipPaths 设置不需要记录日志的路径列表。
+// WithAccessLogSkipPaths 设置不需要记录日志的路径列表（glob 模式）。
+//
+// 匹配走 pathx.MatchesPath（filepath.Match 语义 + "/**" 目录前缀分支）：
+// `*` 是**单段**通配符，不跨 "/"——"/internal/*" 只命中 "/internal/inspect"
+// 这类直接子路径，不命中 "/internal/db/query"、"/internal/webhook/<token>"
+// 等嵌套路径；要豁免整棵子树用 "/internal/**"（"/**" 目录前缀跨层）。
+// 常用形态："/metrics"（精确）、"/health*"（同段前缀）、"/internal/**"
+// （子树全部）。
+//
+// ⚠️ 嵌套路径漏跳是静默的：不报错也无日志线索——按 "/internal/*" 以为内部
+// 端点已豁免，嵌套路径照常整条进日志，正是「URL 路径即凭证」（#12）要防的
+// 泄露面在「我以为已经关掉」的错觉下继续泄露（#127）。语义钉子测试见
+// TestAccessLogMiddleware_SkipPathsGlobSegmentSemantics。
 func WithAccessLogSkipPaths(paths ...string) AccessLogOption {
 	return func(o *AccessLogOptions) {
 		o.SkipPaths = append(o.SkipPaths, paths...)
@@ -232,7 +244,8 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 //
 // 特性:
 //   - 使用 scoped logger 输出结构化日志，自动携带 trace_id
-//   - 可通过 WithAccessLogSkipPaths 跳过健康检查等高频路径（支持 glob 模式）
+//   - 可通过 WithAccessLogSkipPaths 跳过健康检查等高频路径（支持 glob 模式；
+//     注意 `*` 单段不跨 "/"，子树豁免用 "/**"，见该函数文档）
 //   - 可通过 WithAccessLogRedactPathPrefixes 对「URL 路径即凭证」的路由
 //     （webhook/{token} 类）做路径脱敏，token 不落日志
 //   - 可通过 WithAccessLogSink 把同一份记录（AccessRecord）旁路交给落库/上报
@@ -261,8 +274,8 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 //	// 默认配置（不跳过任何路径）
 //	h.Use(mw.AccessLogMiddleware())
 //
-//	// 跳过健康检查和指标端点（支持 glob 模式）
-//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipPaths("/metrics", "/ping", "/health", "/internal/*")))
+//	// 跳过健康检查和指标端点（支持 glob 模式；"/internal/**" 豁免整棵子树）
+//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipPaths("/metrics", "/ping", "/health", "/internal/**")))
 //
 //	// webhook 凭证路径脱敏
 //	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogRedactPathPrefixes("/api/v2/webhook/alert", "/api/v2/task/trigger")))

@@ -100,8 +100,12 @@ func WithLogFields(fn func(ctx context.Context, req any, rec AccessRecord) []any
 }
 
 // WithSkipPaths 设置跳过记录的 Operation 模式列表（支持 glob，按原始值
-// 匹配、不受脱敏影响；http 侧即请求 PATH，如 "/metrics"、"/internal/*"）。
-// 命中时下游照常执行、仅不记访问日志。无 transport 上下文时不判定。
+// 匹配、不受脱敏影响；http 侧即请求 PATH，如 "/metrics"、"/internal/**"）。
+// 匹配走 pathx.MatchesPath（filepath.Match 语义 + "/**" 目录前缀分支）：
+// `*` 是**单段**通配符，不跨 "/"——"/internal/*" 只命中一层直接子路径，
+// 不命中 "/internal/db/query" 等嵌套路径；整棵子树用 "/internal/**"（#127，
+// 漏跳静默无日志线索）。命中时下游照常执行、仅不记访问日志。
+// 无 transport 上下文时不判定。
 func WithSkipPaths(patterns ...string) AccessLogOption {
 	return func(c *accessLogConfig) { c.skip = append(c.skip, patterns...) }
 }

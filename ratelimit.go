@@ -33,6 +33,11 @@ type RateLimitOptions struct {
 	// 同口径）。命中的请求整请求绕过限流：不占配额、不写限流响应头。
 	// 用于 /ping /healthz /ready /metrics 等探活/监控路径——没有豁免口时
 	// 健康检查会被业务流量的 429 误伤。
+	//
+	// ⚠️ glob 语义是 filepath.Match（pathx.MatchesPath）：`*` 单段不跨
+	// "/"——"/health*" 只命中 /healthz 等同段路径，不命中 /health/deep
+	// 等嵌套探活路径；子树豁免用 "/health/**"（"/**" 目录前缀跨层）。
+	// 漏跳静默无日志线索（#127）。
 	SkipPaths []string
 
 	// Headers 是否输出限流响应头（默认关闭，保持既有消费方响应不变）。
@@ -76,6 +81,12 @@ func WithLimiterTTL(ttl time.Duration) RateLimitOption {
 // WithAccessLogSkipPaths 同口径，精确路径即字面匹配）。命中的请求整请求
 // 绕过限流：不占配额、不写限流响应头，探活/监控路径不会被业务流量的
 // 429 误伤。
+//
+// ⚠️ glob 语义是 filepath.Match（pathx.MatchesPath）：`*` 单段不跨 "/"，
+// "/ready*" 只命中 /readyz 等同段路径，不命中 /ready/deep-check 等嵌套
+// 探活路径；子树豁免用 "/ready/**"（"/**" 目录前缀跨层，#127——漏跳静默
+// 无日志线索，探活路径会被 429 误伤）。语义钉子测试见
+// TestRateLimitMiddleware_SkipPathsGlobSegmentSemantics。
 //
 // 用法:
 //
