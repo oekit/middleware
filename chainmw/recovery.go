@@ -55,13 +55,17 @@ func WithRecoveryLogFields(fn func(ctx context.Context, req any, pv *chain.Panic
 // Recovery 返回 panic 恢复中间件（transport 无关内核）。
 //
 // 行为：下游 panic 被捕获为 *chain.PanicError → 记 Error 日志 → 经 panic
-// 隔离的监控钩子上报 → 以错误返回（链不中断）。响应转换由调用方的错误
+// 隔离的监控钩子上报 → 以错误返回（链不中断）。下游**以 *PanicError 形式
+// 返回**（例如链上内层的 core/chain.Timeout 已把 panic 收编成错误再上抛）
+// 走同一日志+上报口径，与「直接 panic」的路径一致。响应转换由调用方的错误
 // 出口负责（hertz/chainmw.Wrap 的 WithOnError/默认 mw.Fail、kitex 侧透传
 // 给 kitex 错误处理）。
 //
-// 与 core/chain.Recovery 的关系：捕获/转换语义一致；本实现叠加 logx 日志
-// 与上报 panic 隔离，为「一份逻辑两端跑」的内核（根包 mw 的 Hertz 栈与
-// kitex 经 ToKitex 桥接均复用本实现）。
+// 与 core/chain.Recovery 的关系：捕获/转换语义一致（含「以 *PanicError
+// 返回」这条上报路径）；本实现叠加 logx 日志与上报 panic 隔离，为「一份
+// 逻辑两端跑」的内核（根包 mw 的 Hertz 栈与 kitex 经 ToKitex 桥接均复用
+// 本实现）。注：内外两层都是本中间件嵌套时，*PanicError 返回路径会双记
+// 日志/双上报——core/chain.Recovery 同样如此，保持与 core 语义一致优先。
 //
 // 用法：
 //
@@ -86,7 +90,17 @@ func Recovery(opts ...RecoveryOption) chain.Middleware {
 					resp, err = nil, pv
 				}
 			}()
-			return next(ctx, req)
+			resp, err = next(ctx, req)
+			// 下游以 *PanicError **形式返回**（例如下游中间的 Timeout 已把
+			// panic 收编成错误再往上抛）⇒ 同样走日志与上报钩子，与「直接
+			// panic」的路径口径一致（对齐 core/chain.Recovery 的第二条上报
+			// 路径；否则这类 panic 不进 Sentry 等上报、连 [panic] recovered
+			// 日志都没有——带日志的实现反而在该路径零观测，#123）。
+			if pe, ok := err.(*chain.PanicError); ok {
+				cfg.logPanic(ctx, req, pe)
+				cfg.reportIsolated(ctx, req, pe)
+			}
+			return resp, err
 		}
 	}
 }

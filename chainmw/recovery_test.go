@@ -143,6 +143,75 @@ func TestRecoveryLogFieldsHook(t *testing.T) {
 	}
 }
 
+// TestRecoveryReportsPanicErrorReturnPath 回归 #123：下游**以 *PanicError
+// 形式返回**（例如链上内层的 core/chain.Timeout 已把 panic 收编成错误再
+// 上抛）必须与「直接 panic」同口径——记 [panic] recovered 日志 + 调上报
+// 钩子。core/chain.Recovery 有这条路径（panic_isolation_test.go 的第二个
+// reporter 调用点），chainmw 此前漏掉，Timeout 收编的 panic 零日志零上报。
+func TestRecoveryReportsPanicErrorReturnPath(t *testing.T) {
+	rec := &captureLogger{}
+	called := false
+	var got *chain.PanicError
+	sentinel := &chain.PanicError{Value: "as-error", Stack: "fake-stack"}
+	h := chain.Finalize(func(_ context.Context, _ any) (any, error) {
+		return nil, sentinel
+	}, Recovery(
+		WithRecoveryLogger(rec),
+		WithRecoveryReporter(func(_ context.Context, _ any, pv *chain.PanicError) {
+			called = true
+			got = pv
+		}),
+	))
+
+	resp, err := h(context.Background(), "req")
+	if !called {
+		t.Fatal("expected reporter to be called for *PanicError return path")
+	}
+	if got != sentinel {
+		t.Errorf("reported pv = %v, want the returned *chain.PanicError", got)
+	}
+	if err != sentinel {
+		t.Errorf("err = %v, want unchanged *chain.PanicError passthrough", err)
+	}
+	if resp != nil {
+		t.Errorf("resp = %v, want nil", resp)
+	}
+
+	out := rec.text()
+	if !strings.Contains(out, "[panic] recovered") || !strings.Contains(out, "ERROR") {
+		t.Fatalf("missing panic error log on *PanicError return path: %s", out)
+	}
+	if !strings.Contains(out, "panic=as-error") {
+		t.Errorf("log missing panic value: %s", out)
+	}
+}
+
+// TestRecoveryPlainErrorReturnNotReported 反向钉：普通错误返回不触发 panic
+// 日志/上报——*PanicError 判定必须收窄，不能把所有 error 都当 panic 记。
+func TestRecoveryPlainErrorReturnNotReported(t *testing.T) {
+	rec := &captureLogger{}
+	reporterCalled := false
+	h := chain.Finalize(func(_ context.Context, _ any) (any, error) {
+		return nil, errors.New("plain biz error")
+	}, Recovery(
+		WithRecoveryLogger(rec),
+		WithRecoveryReporter(func(_ context.Context, _ any, _ *chain.PanicError) {
+			reporterCalled = true
+		}),
+	))
+
+	_, err := h(context.Background(), "req")
+	if err == nil {
+		t.Fatal("expected plain error passthrough")
+	}
+	if reporterCalled {
+		t.Error("reporter must not be called for plain error return")
+	}
+	if len(rec.entries) != 0 {
+		t.Errorf("unexpected logs for plain error return: %v", rec.entries)
+	}
+}
+
 // TestRecoveryNoTransportDefaults 验证无 transport 上下文时 kind/op 记 "-"。
 func TestRecoveryNoTransportDefaults(t *testing.T) {
 	rec := &captureLogger{}
