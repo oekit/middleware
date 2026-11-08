@@ -8,6 +8,7 @@ import (
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
+	"github.com/oekit/logx"
 	"github.com/oekit/middleware/hmw"
 	"github.com/oekit/pkg/errors"
 )
@@ -120,13 +121,26 @@ type responseSkipConfig struct {
 // "/mcp-v2/..." 等同字符开头的无关路由——包壳豁免是「静默失败」型错误，
 // 命中路由返回裸 JSON、按统一信封解码的消费方直接解析失败且无任何信号。
 // 边界规则：前缀等于完整路径，或前缀以 "/" 结尾（尾斜杠前缀天然按段开头），
-// 或路径在前缀后紧跟 "/"（新段开始）。空前缀维持历史行为（匹配一切）。
+// 或路径在前缀后紧跟 "/"（新段开始）。
+//
+// 空前缀匹配**一切**路径（strings.HasPrefix(path, "") 恒真）——#100 之前
+// 一直的历史行为。#100 的段边界改动曾把空前缀静默翻转成「匹配零」：以
+// 变量传参（WithSkipPrefixes(cfg.PathPrefix)）且配置缺失时，全部豁免无声
+// 消失、所有响应突然被包壳，且注释仍宣称「维持历史行为」自相矛盾（#126）。
+// #126 定版回历史语义；空前缀是「全站豁免」级的高影响配置，误配必须
+// 可观测——WithSkipPrefixes 收到空串时打 WARN（见该函数文档）。
 func (c *responseSkipConfig) skip(path string) bool {
 	if _, ok := c.skipPaths[path]; ok {
 		return true
 	}
 	for _, p := range c.skipPrefixes {
-		if p == "" || !strings.HasPrefix(path, p) {
+		// 空前缀匹配一切（历史行为，#126 定版回历史语义；#100 曾翻转成
+		// 「匹配零」）。显式分支：空串进入下方段边界分支会因 p[len(p)-1]
+		// 越界 panic。
+		if p == "" {
+			return true
+		}
+		if !strings.HasPrefix(path, p) {
 			continue
 		}
 		if len(path) == len(p) || p[len(p)-1] == '/' || path[len(p)] == '/' {
@@ -171,14 +185,30 @@ func WithSkipPaths(paths ...string) ResponseOption {
 // 包壳，消费方按信封解码直接失败且无信号）。尾斜杠前缀（"/.well-known/"）
 // 天然按段开头，子路径照常命中。
 //
+// ⚠️ 空前缀匹配**一切**路径（= 全站豁免；历史行为，#126 定版）：以变量传参
+// （WithSkipPrefixes(cfg.PathPrefix)）时配置缺失会退化成空串，全站响应
+// 不再包壳。构造期对空串打 WARN——「全站豁免」级的高影响配置必须可观测，
+// 不允许无信号；确需全站豁免请显式声明并接受该告警。
+//
 // 用法:
 //
 //	mw.ResponseMiddleware(mw.WithSkipPrefixes("/.well-known/", "/mcp"))
 func WithSkipPrefixes(prefixes ...string) ResponseOption {
 	return func(c *responseSkipConfig) {
+		for _, p := range prefixes {
+			if p == "" {
+				responseLog.Warn(
+					"WithSkipPrefixes 收到空前缀：空前缀匹配一切路径（全站豁免，历史行为 #126）——若为配置缺失请显式修正",
+					"option", "WithSkipPrefixes")
+			}
+		}
 		c.skipPrefixes = append(c.skipPrefixes, prefixes...)
 	}
 }
+
+// responseLog response 包日志（构造期误配告警，与 accesslog 的 accessLog
+// 同款包级模式）。
+var responseLog = logx.Delegating("response")
 
 // StatusMapper 将业务码映射为 HTTP 状态码。
 // 默认实现 DefaultStatusMapper 将 HTTP 对齐的业务码（100-599）直接用作 HTTP 状态码，

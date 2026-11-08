@@ -93,6 +93,54 @@ func TestAccessLogMiddleware_SinkSkipPaths(t *testing.T) {
 	}
 }
 
+// TestAccessLogMiddleware_SkipPathsGlobSegmentSemantics 钉住 #127：skip-path
+// glob 的 `*` 是**单段**通配符（pathx.MatchesPath = filepath.Match 语义，
+// 不跨 "/"）——"/internal/*" 只豁免一层直接子路径，嵌套路径照常记录（漏跳
+// 静默无日志线索，#12 的「URL 路径即凭证」泄露面会以「我以为已豁免」的
+// 错觉继续泄露）；子树豁免必须用 "/internal/**"。文档示例与实现语义一致
+// 由本测试钉死，防止未来更换匹配原语时反向放大。
+func TestAccessLogMiddleware_SkipPathsGlobSegmentSemantics(t *testing.T) {
+	newHits := func(skipPaths ...string) func(path string) int {
+		calls := 0
+		h := route.NewEngine(config.NewOptions([]config.Option{}))
+		h.Use(AccessLogMiddleware(
+			WithAccessLogSkipPaths(skipPaths...),
+			WithAccessLogSink(func(context.Context, *app.RequestContext, AccessRecord) error { calls++; return nil }),
+		))
+		handler := func(ctx context.Context, c *app.RequestContext) { c.String(200, "ok") }
+		h.GET("/internal/inspect", handler)
+		h.GET("/internal/db/query", handler)
+		h.GET("/internal/webhook/tk-123", handler)
+		return func(path string) int {
+			before := calls
+			ut.PerformRequest(h, http.MethodGet, path, nil)
+			return calls - before
+		}
+	}
+
+	// 负例（#127 缺陷方向）："/internal/*" 不豁免嵌套路径——嵌套请求必须
+	// 照常产生访问记录（sink 调 1 次）。
+	hit := newHits("/internal/*")
+	if got := hit("/internal/db/query"); got != 1 {
+		t.Fatalf("/internal/* 不得豁免嵌套路径（`*` 单段不跨 /，#127）: sink 调用 %d 次, want 1", got)
+	}
+	if got := hit("/internal/webhook/tk-123"); got != 1 {
+		t.Fatalf("/internal/* 不得豁免嵌套的凭证路径: sink 调用 %d 次, want 1", got)
+	}
+	// 同段正例保持成立：一层直接子路径确实被豁免。
+	if got := hit("/internal/inspect"); got != 0 {
+		t.Fatalf("/internal/* 应豁免一层直接子路径: sink 调用 %d 次, want 0", got)
+	}
+
+	// 正例："/internal/**" 豁免整棵子树（含嵌套），与文档示例口径一致。
+	hitAll := newHits("/internal/**")
+	for _, p := range []string{"/internal/inspect", "/internal/db/query", "/internal/webhook/tk-123"} {
+		if got := hitAll(p); got != 0 {
+			t.Fatalf("/internal/** 应豁免子树全部路径（#127 文档口径）: %s sink 调用 %d 次, want 0", p, got)
+		}
+	}
+}
+
 // TestAccessLogMiddleware_SinkFailureIsolated：sink 出错 / panic 均不影响已写出的响应，
 // 后续 sink 照常执行。
 func TestAccessLogMiddleware_SinkFailureIsolated(t *testing.T) {

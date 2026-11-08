@@ -278,6 +278,42 @@ func TestRateLimitMiddleware_SkipPaths_Negative(t *testing.T) {
 	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h2, "/ping").Response.StatusCode())
 }
 
+// TestRateLimitMiddleware_SkipPathsGlobSegmentSemantics 钉住 #127：glob 的
+// `*` 单段不跨 "/"——"/ready*" 只豁免 /readyz 等同段路径，不豁免
+// /ready/deep-check 等嵌套探活路径（漏跳静默无日志线索，探活会被业务流量的
+// 429 误伤）；子树豁免用 "/ready/**"。与 SkipPaths 的文档口径互钉，防止
+// 未来更换匹配原语时反向放大。
+func TestRateLimitMiddleware_SkipPathsGlobSegmentSemantics(t *testing.T) {
+	// 负例（#127 缺陷方向）："/ready*" 不豁免嵌套探活路径——照常限流。
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitSkipPaths("/ready*"),
+	)
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/ready/deep-check").Response.StatusCode())
+	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/ready/deep-check").Response.StatusCode())
+
+	// 同段正例保持成立：/readyz 仍被 "/ready*" 豁免（不占配额，恒放行）。
+	h2 := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitSkipPaths("/ready*"),
+	)
+	for i := 0; i < 3; i++ {
+		assert.DeepEqual(t, consts.StatusOK, rlRequest(h2, "/readyz").Response.StatusCode())
+	}
+
+	// 正例："/ready/**" 豁免整棵子树（含嵌套探活路径）。
+	h3 := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitSkipPaths("/ready/**"),
+	)
+	for i := 0; i < 3; i++ {
+		assert.DeepEqual(t, consts.StatusOK, rlRequest(h3, "/ready/deep-check").Response.StatusCode())
+	}
+}
+
 // TestRateLimitMiddleware_Headers_Allowed 验证放行响应头 X-RateLimit-Remaining
 // 接的是 TokenBucket.Tokens() 剩余配额出口：随消费递减（1 → 0），放行时不写
 // 拒绝头。极小速率保证桶内不回填，剩余数确定。

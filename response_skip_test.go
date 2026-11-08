@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -200,6 +201,77 @@ func TestResponseMiddleware_Skip_KeepsHandlerBody(t *testing.T) {
 	r := ut.PerformRequest(h, http.MethodGet, "/raw/echo", nil).Result()
 	if string(r.Body()) != raw {
 		t.Errorf("skipped request body mutated:\n got %s\nwant %s", r.Body(), raw)
+	}
+}
+
+// TestResponseSkipConfig_EmptyPrefixMatchesAll 回归测试（#126）：空前缀匹配
+// **一切**路径——#100 之前的历史行为（strings.HasPrefix(path, "") 恒真），
+// #100 曾在同一提交里静默翻转成「匹配零」且注释仍宣称「维持历史行为」。
+// 单元级表驱动钉住：任意路径（含根、深层嵌套、畸形串）全部命中，且空串
+// 不进入段边界分支（那里 p[len(p)-1] 对空串会越界 panic）。
+func TestResponseSkipConfig_EmptyPrefixMatchesAll(t *testing.T) {
+	cfg := newResponseOptions(WithSkipPrefixes(""))
+	for _, path := range []string{"/", "/a", "/a/b/c", "/mcp-v2/data", "relative", ""} {
+		if !cfg.skip(path) {
+			t.Fatalf("空前缀必须匹配一切路径（历史行为，#126 定版）: path=%q 未命中", path)
+		}
+	}
+
+	// 与普通前缀混排：空前缀依旧匹配一切。
+	mixed := newResponseOptions(WithSkipPrefixes("/mcp", ""))
+	for _, path := range []string{"/api/x", "/mcp/tools"} {
+		if !mixed.skip(path) {
+			t.Fatalf("空前缀混排时仍必须匹配一切路径: path=%q 未命中", path)
+		}
+	}
+
+	// 非空前缀的 #100 段边界语义保持不变（回归互钉，防 restore 时连带破坏）。
+	boundary := newResponseOptions(WithSkipPrefixes("/mcp"))
+	if !boundary.skip("/mcp") || !boundary.skip("/mcp/tools") {
+		t.Fatal("/mcp 段边界命中语义被破坏（#100）")
+	}
+	if boundary.skip("/mcp-v2/data") || boundary.skip("/api/mcp") {
+		t.Fatal("/mcp 段边界不命中语义被破坏（#100）")
+	}
+}
+
+// TestResponseMiddleware_SkipPrefixesEmptyMatchesAll 端到端回归（#126）：
+// WithSkipPrefixes("") ⇒ 所有响应免包壳（历史行为）。以变量传参且配置缺失
+// 时豁免显形（全站裸 JSON），而不是被静默收回——豁免方向翻转属契约变更，
+// #100 无权在同一次段边界修复里顺手翻转。
+func TestResponseMiddleware_SkipPrefixesEmptyMatchesAll(t *testing.T) {
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(ResponseMiddleware(WithSkipPrefixes("")))
+	handler := func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"biz": "payload"})
+	}
+	h.GET("/anything", handler)
+	h.GET("/nested/deep/path", handler)
+
+	for _, path := range []string{"/anything", "/nested/deep/path"} {
+		r := ut.PerformRequest(h, http.MethodGet, path, nil).Result()
+		assertNoWrap(t, r.Body(), `"biz"`)
+	}
+}
+
+// TestResponseMiddleware_SkipPrefixesEmptyWarns 构造期空前缀 WARN 可观测
+// （#126）：「全站豁免」级高影响配置不允许无信号——对齐 #100 修复批评的
+// 「无日志、无告警」缺口；非空前缀不产生告警（避免热路径/正常路径噪音）。
+func TestResponseMiddleware_SkipPrefixesEmptyWarns(t *testing.T) {
+	cap := &accessLogCapture{}
+	old := responseLog
+	responseLog = cap
+	t.Cleanup(func() { responseLog = old })
+
+	_ = newResponseOptions(WithSkipPrefixes("", "/mcp"))
+	if out := cap.text(); !strings.Contains(out, "WARN") || !strings.Contains(out, "空前缀") {
+		t.Fatalf("空前缀必须打 WARN（全站豁免高影响配置），got: %q", out)
+	}
+
+	cap.entries = nil
+	_ = newResponseOptions(WithSkipPrefixes("/mcp", "/.well-known/"))
+	if out := cap.text(); out != "" {
+		t.Fatalf("非空前缀不得产生 WARN，got: %q", out)
 	}
 }
 
