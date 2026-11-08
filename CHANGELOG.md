@@ -1,5 +1,13 @@
 
 
+## [v0.14.1] — 2026-11-09
+
+- fix(contrib/cache): 归一化按原始编码字节级双射——编码字符不再塌缩（#125）
+- fix(response): 空前缀恢复匹配一切语义 + 空串 WARN（#126）
+- docs(accesslog/ratelimit): skip-path glob 单段不跨 / 的语义写明（#127）
+
+关联问题单：middleware#125、middleware#126、middleware#127。
+
 ## [v0.14.0] — 2026-11-09
 
 - fix(contrib): CSRF Secret 空串构造期 fail-fast（#122）
