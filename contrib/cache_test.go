@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
@@ -445,6 +446,166 @@ func TestCache_DefaultKeyAnonymousMatchesOldDefault(t *testing.T) {
 	}
 	if len(store.Keys()) == 0 {
 		t.Fatal("store 未记录任何 key——缓存未生效")
+	}
+}
+
+// TestNormalizeQueryOrder_ByteLevelBijection #125 回归：归一化必须字节级
+// 双射——url.Query() 返回已解码值，解码后直接重拼（原实现）会让字面量
+// 含 %26/%2F 的 value 与语义完全不同的请求塌缩成同一缓存键（投毒/串响应）。
+// 钉住三类不变量：编码字节原样保留、不同语义请求归一后必不同、顺序无关
+// 归一仍成立。
+func TestNormalizeQueryOrder_ByteLevelBijection(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want string
+	}{
+		// 编码 value 原样保留——不得解码重拼成 "filter=a&sort=desc"
+		{"encoded ampersand kept", "/r?filter=a%26sort=desc", "/r?filter=a%26sort=desc"},
+		{"plain multi key", "/r?filter=a&sort=desc", "/r?filter=a&sort=desc"},
+		// Path 转义原样保留——%2F 与 "/" 不得塌缩
+		{"encoded slash in path kept", "/files/a%2Fb?x=1", "/files/a%2Fb?x=1"},
+		{"literal slash in path", "/files/a/b?x=1", "/files/a/b?x=1"},
+		// 顺序无关：按原始字节升序重排
+		{"reorder", "/q?y=2&x=1", "/q?x=1&y=2"},
+		{"already sorted", "/q?x=1&y=2", "/q?x=1&y=2"},
+		{"same key multiple values", "/q?k=2&k=1", "/q?k=1&k=2"},
+		// 空段对解码语义零贡献，丢弃（对齐上游解码口径）
+		{"empty segment dropped", "/q?b=2&&a=1", "/q?a=1&b=2"},
+		// 无 query 原样返回
+		{"no query", "/plain", "/plain"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := normalizeQueryOrder(c.in)
+			if err != nil {
+				t.Fatalf("normalizeQueryOrder(%q) unexpected err: %v", c.in, err)
+			}
+			if got != c.want {
+				t.Fatalf("normalizeQueryOrder(%q) = %q, want %q", c.in, got, c.want)
+			}
+		})
+	}
+
+	// 不同语义请求归一后必须不同（原缺陷：两者同键）。
+	collide := [][2]string{
+		{"/r?filter=a%26sort=desc", "/r?filter=a&sort=desc"},
+		{"/files/a%2Fb?x=1", "/files/a/b?x=1"},
+	}
+	for _, p := range collide {
+		a, errA := normalizeQueryOrder(p[0])
+		b, errB := normalizeQueryOrder(p[1])
+		if errA != nil || errB != nil {
+			t.Fatalf("normalize(%q/%q) err: %v/%v", p[0], p[1], errA, errB)
+		}
+		if a == b {
+			t.Fatalf("★ 不同语义请求塌缩成同一缓存键: %q 与 %q 归一后同为 %q", p[0], p[1], a)
+		}
+	}
+
+	// 解析失败回退错误（调用方回退原始 URI）。
+	if _, err := normalizeQueryOrder("not a uri"); err == nil {
+		t.Fatal("非法 URI 应返回 error 供调用方回退")
+	}
+}
+
+// TestCache_IgnoreQueryOrderNoEncodedCollision #125 端到端回归（issue 原复
+// 现场景）：WithIgnoreQueryOrder 下，GET /report?filter=a%26sort=desc（filter
+// 的值字面量是 "a&sort=desc"）与 GET /report?filter=a&sort=desc（filter=a
+// 且 sort=desc，语义完全不同）必须各自执行 handler、各自持有缓存条目——
+// 修复前 B 命中 A 的缓存体，缓存投毒/串响应。
+func TestCache_IgnoreQueryOrderNoEncodedCollision(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/report", Cache(
+		WithCacheStore(store),
+		WithCacheExpiration(time.Minute),
+		WithIgnoreQueryOrder(),
+	), func(ctx context.Context, c *app.RequestContext) {
+		n := count.Add(1)
+		c.JSON(200, map[string]string{
+			"resp_of": c.Query("filter"),
+			"sort":    c.Query("sort"),
+			"run":     fmt.Sprint(n),
+		})
+	})
+
+	// 请求 A：filter 的值字面量是 "a&sort=desc"（& 为被编码的）。
+	// JSON 断言走解码后比较（body 里 & 会被转义成 \u0026，字面 Contains 不可靠）。
+	var bodyA map[string]string
+	wA := ut.PerformRequest(h.Engine, "GET", "/report?filter=a%26sort=desc", nil)
+	if wA.Code != 200 || json.Unmarshal(wA.Body.Bytes(), &bodyA) != nil ||
+		bodyA["resp_of"] != "a&sort=desc" || bodyA["sort"] != "" {
+		t.Fatalf("A first: code=%d body=%s", wA.Code, wA.Body.String())
+	}
+
+	// 请求 B：filter=a 且 sort=desc，语义完全不同——不得命中 A 的缓存。
+	var bodyB map[string]string
+	wB := ut.PerformRequest(h.Engine, "GET", "/report?filter=a&sort=desc", nil)
+	if wB.Code != 200 || json.Unmarshal(wB.Body.Bytes(), &bodyB) != nil ||
+		bodyB["resp_of"] != "a" || bodyB["sort"] != "desc" {
+		t.Fatalf("★ B 被投喂 A 的缓存体（缓存投毒/串响应，#125）: code=%d body=%s",
+			wB.Code, wB.Body.String())
+	}
+	if got := count.Load(); got != 2 {
+		t.Fatalf("不同语义请求必须各自执行 handler: ran %d times, want 2", got)
+	}
+
+	// 两条目各自持有独立 key。
+	keyA := "ekit/report?filter=a%26sort=desc"
+	keyB := "ekit/report?filter=a&sort=desc"
+	if !containsKey(store.Keys(), keyA) || !containsKey(store.Keys(), keyB) {
+		t.Fatalf("★ 两个语义独立的请求必须持有独立缓存条目: want %q 与 %q, got %v",
+			keyA, keyB, store.Keys())
+	}
+
+	// 各自二次请求命中自己的条目。
+	ut.PerformRequest(h.Engine, "GET", "/report?filter=a%26sort=desc", nil)
+	ut.PerformRequest(h.Engine, "GET", "/report?filter=a&sort=desc", nil)
+	if got := count.Load(); got != 2 {
+		t.Fatalf("各语义域内二次请求应命中缓存: ran %d times, want 2", got)
+	}
+}
+
+// TestCache_IgnoreQueryOrderEncodedPathNotCollapsed #125 同因回归（Path）：
+// /files/a%2Fb?x=1 与 /files/a/b?x=1 归一后不得同键（parsed.Path 是解码值，
+// 原实现把两者塌缩成一个缓存条目）。
+func TestCache_IgnoreQueryOrderEncodedPathNotCollapsed(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.NoRoute(Cache(
+		WithCacheStore(store),
+		WithCacheExpiration(time.Minute),
+		WithIgnoreQueryOrder(),
+	), func(ctx context.Context, c *app.RequestContext) {
+		n := count.Add(1)
+		c.JSON(200, map[string]string{"path": string(c.Request.Path()), "run": fmt.Sprint(n)})
+	})
+
+	wA := ut.PerformRequest(h.Engine, "GET", "/files/a%2Fb?x=1", nil)
+	wB := ut.PerformRequest(h.Engine, "GET", "/files/a/b?x=1", nil)
+	t.Logf("A: code=%d body=%s", wA.Code, wA.Body.String())
+	t.Logf("B: code=%d body=%s", wB.Code, wB.Body.String())
+
+	// 归一化层面的硬断言（路由层对 %2F 的处理不在本中间件职责内）：
+	// 两个 URI 的归一化 key 必须不同。
+	keyA, errA := normalizeQueryOrder("/files/a%2Fb?x=1")
+	keyB, errB := normalizeQueryOrder("/files/a/b?x=1")
+	if errA != nil || errB != nil {
+		t.Fatalf("normalize err: %v/%v", errA, errB)
+	}
+	if keyA == keyB {
+		t.Fatalf("★ 编码 Path 与字面量 Path 塌缩成同一缓存键（#125 同因）: %q", keyA)
 	}
 }
 

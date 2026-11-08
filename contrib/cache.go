@@ -280,30 +280,35 @@ func defaultCacheStrategy(ignoreOrder bool) cache.GetCacheStrategyByRequest {
 }
 
 // normalizeQueryOrder query 顺序归一化:k2=v2&k1=v1 与 k1=v1&k2=v2 归一为
-// 同一 key。上游 getRequestUriIgnoreQueryOrder 未导出,此为本仓同口径
-// 复刻(按 query key 升序、同 key 的 value 升序重拼);解析失败由调用方
-// 回退原始 URI(与上游错误处理一致——上游失败时也回退原 URI)。
+// 同一 key。解析失败由调用方回退原始 URI(与上游错误处理一致——上游失败
+// 时也回退原 URI)。
+//
+// 归一化必须字节级双射(#125):url.ParseRequestURI().Query() 返回**已解码**
+// 的值,解码后直接重拼(原实现)会让字面量含 "&"/"=" 的 value 与语义完全
+// 不同的多 key 请求塌缩成同一缓存键——GET /r?filter=a%26sort=desc(filter
+// 的值是 "a&sort=desc")与 /r?filter=a&sort=desc(两个独立 key)归一后同键,
+// 后者命中前者的缓存响应,攻击者可用可控 query 构造与真实请求的键碰撞,
+// 投毒/串取他人响应;Path 同理(%2F 与 "/" 塌缩,/files/a%2Fb 与 /files/a/b
+// 同键)。故对 parsed.RawQuery 按 "&" 切出**原始编码**的 k/v 对、按字节
+// 升序重排后原样重拼(无损),路径用 parsed.EscapedPath()(保留转义):
+// 归一后同键 ⟺ 原始编码字节串的有序重排相同,不同语义请求绝不塌缩;
+// 语义相同而书写不同的请求(如空段 "a=1&&b=2"、%2F 与 %2f)最多少命中一次
+// (方向安全,不会错命中)。纯 ASCII 无特殊字符的 query 重排结果与上游
+// 解码口径一致。
 func normalizeQueryOrder(requestURI string) (string, error) {
 	parsed, err := url.ParseRequestURI(requestURI)
 	if err != nil {
 		return "", err
 	}
-	values := parsed.Query()
-	if len(values) == 0 {
+	if parsed.RawQuery == "" {
 		return requestURI, nil
 	}
-	queryKeys := make([]string, 0, len(values))
-	for queryKey := range values {
-		queryKeys = append(queryKeys, queryKey)
-	}
-	sort.Strings(queryKeys)
-
-	queryVals := make([]string, 0, len(queryKeys))
-	for _, queryKey := range queryKeys {
-		sort.Strings(values[queryKey])
-		for _, val := range values[queryKey] {
-			queryVals = append(queryVals, queryKey+"="+val)
+	pairs := make([]string, 0, strings.Count(parsed.RawQuery, "&")+1)
+	for _, pair := range strings.Split(parsed.RawQuery, "&") {
+		if pair != "" { // 空段("a=1&&b=2")对解码语义零贡献,丢弃对齐上游口径
+			pairs = append(pairs, pair)
 		}
 	}
-	return parsed.Path + "?" + strings.Join(queryVals, "&"), nil
+	sort.Strings(pairs)
+	return parsed.EscapedPath() + "?" + strings.Join(pairs, "&"), nil
 }
