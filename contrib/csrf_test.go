@@ -3,6 +3,7 @@ package contrib
 import (
 	"context"
 	"net/http"
+	"strings"
 	"testing"
 
 	"github.com/cloudwego/hertz/pkg/app"
@@ -46,5 +47,31 @@ func TestCSRFMiddleware_MissingToken_403(t *testing.T) {
 	wg := ut.PerformRequest(h.Engine, "GET", "/submit", nil)
 	if wg.Code == http.StatusForbidden {
 		t.Errorf("GET (ignored method) should not be rejected, got %d", wg.Code)
+	}
+}
+
+// TestCSRFMiddleware_EmptySecret_FailFast 回归 #122：Secret 为空（未设置或
+// 显式传空串）必须在构造期 panic（fail-fast，同 ratelimit 缺配置的姿势），
+// 而不是让上游 csrf.New 静默接受——空密钥时 token=sha256("salt-") 一切照常
+// 工作、测试全绿，防护强度静默降档。
+func TestCSRFMiddleware_EmptySecret_FailFast(t *testing.T) {
+	cases := map[string][]CSRFOption{
+		"not-set":        nil,
+		"explicit-empty": {WithCSRFSecret("")},
+	}
+	for name, opts := range cases {
+		t.Run(name, func(t *testing.T) {
+			defer func() {
+				r := recover()
+				if r == nil {
+					t.Fatal("empty Secret should panic at construction time")
+				}
+				msg, ok := r.(string)
+				if !ok || !strings.Contains(msg, "Secret") {
+					t.Errorf("panic value = %v, want message mentioning Secret", r)
+				}
+			}()
+			_ = CSRFMiddleware(opts...)
+		})
 	}
 }

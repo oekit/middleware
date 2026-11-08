@@ -57,7 +57,9 @@ func WithCSRFKeyLookUp(lookup string) CSRFOption {
 //
 // 前置条件: 必须先注册 sessions 中间件（hertz-contrib/sessions），
 // 否则每个请求都会 panic（底层 csrf 依赖 sessions.Default(c)）。
-// Secret 不能为空。
+// Secret 必填：空 Secret 构造期即 panic（fail-fast，同 ratelimit 缺配置
+// 的姿势）。上游 csrf.New 不校验 Secret，空密钥时 token=sha256("salt-")
+// 一切照常工作、测试全绿——防护强度静默降档，所以必须在装配时暴露。
 //
 // 用法:
 //
@@ -70,6 +72,13 @@ func CSRFMiddleware(opts ...CSRFOption) app.HandlerFunc {
 	cfg := &CSRFOptions{}
 	for _, opt := range opts {
 		opt(cfg)
+	}
+
+	// 空 Secret 构造期 fail-fast：上游 csrf.New 只校验 KeyLookup 形态、不校验
+	// Secret，空密钥会静默产出可预测的弱 token（防护降档且测试全绿），宁可
+	// 启动即暴露（同 ratelimit 缺配置 panic 的姿势，#122）。
+	if cfg.Secret == "" {
+		panic("contrib.CSRFMiddleware: Secret 不能为空，请用 WithCSRFSecret(secret) 设置")
 	}
 
 	csrfOpts := []csrf.Option{csrf.WithSecret(cfg.Secret)}
