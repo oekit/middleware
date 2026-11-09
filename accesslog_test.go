@@ -188,3 +188,55 @@ func TestAccessLogMiddleware_PanicRecord(t *testing.T) {
 		t.Error("panic 请求记录也应携带 trace_id")
 	}
 }
+
+// TestAccessLogMiddleware_InfraPathsDefaultSkip 钉住 #137：未显式传 SkipPaths
+// 时按 mw.InfraPaths 兜底——标准探活/监控端点零日志零 sink（K8s 探针与
+// Prometheus 抓取流量不再进审计日志），业务路径照常记录。
+func TestAccessLogMiddleware_InfraPathsDefaultSkip(t *testing.T) {
+	calls := 0
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(AccessLogMiddleware(
+		WithAccessLogSink(func(context.Context, *app.RequestContext, AccessRecord) error { calls++; return nil }),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) { c.String(200, "ok") }
+	for _, p := range InfraPaths {
+		h.GET(p, handler)
+	}
+	h.GET("/api/data", handler)
+
+	for _, p := range InfraPaths {
+		before := calls
+		ut.PerformRequest(h, http.MethodGet, p, nil)
+		if calls != before {
+			t.Errorf("标准探活路径 %s 应被缺省豁免（零 sink 调用，#137）", p)
+		}
+	}
+	ut.PerformRequest(h, http.MethodGet, "/api/data", nil)
+	if calls != 1 {
+		t.Fatalf("业务路径应照常记录，期望 1 次，got %d", calls)
+	}
+}
+
+// TestAccessLogMiddleware_ExplicitSkipPathsOverride 钉住 #137 覆盖语义：
+// 显式传 SkipPaths 完全覆盖 InfraPaths 缺省——/metrics 不在显式清单内，
+// 照常记录（不是「InfraPaths + 显式清单」的并集）。
+func TestAccessLogMiddleware_ExplicitSkipPathsOverride(t *testing.T) {
+	calls := 0
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(AccessLogMiddleware(
+		WithAccessLogSkipPaths("/internal/**"),
+		WithAccessLogSink(func(context.Context, *app.RequestContext, AccessRecord) error { calls++; return nil }),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) { c.String(200, "ok") }
+	h.GET("/metrics", handler)
+	h.GET("/internal/inspect", handler)
+
+	ut.PerformRequest(h, http.MethodGet, "/metrics", nil)
+	if calls != 1 {
+		t.Fatalf("显式清单外的 /metrics 应照常记录（完全覆盖语义，#137），期望 1 次，got %d", calls)
+	}
+	ut.PerformRequest(h, http.MethodGet, "/internal/inspect", nil)
+	if calls != 1 {
+		t.Fatalf("显式清单内的 /internal/inspect 应被跳过，期望仍 1 次，got %d", calls)
+	}
+}

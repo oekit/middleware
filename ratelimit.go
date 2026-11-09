@@ -34,6 +34,11 @@ type RateLimitOptions struct {
 	// 用于 /ping /healthz /ready /metrics 等探活/监控路径——没有豁免口时
 	// 健康检查会被业务流量的 429 误伤。
 	//
+	// 缺省语义（#137）：未显式传时用 mw.InfraPaths 兜底（标准探活/监控
+	// 端点不占配额，探针风暴不进限流计数）；显式传则**完全覆盖**缺省——
+	// 不在显式清单内的路径（含 InfraPaths 里的）照常限流，不是
+	// 「InfraPaths + 显式清单」的并集。
+	//
 	// ⚠️ glob 语义是 filepath.Match（pathx.MatchesPath）：`*` 单段不跨
 	// "/"——"/health*" 只命中 /healthz 等同段路径，不命中 /health/deep
 	// 等嵌套探活路径；子树豁免用 "/health/**"（"/**" 目录前缀跨层）。
@@ -81,6 +86,10 @@ func WithLimiterTTL(ttl time.Duration) RateLimitOption {
 // WithAccessLogSkipPaths 同口径，精确路径即字面匹配）。命中的请求整请求
 // 绕过限流：不占配额、不写限流响应头，探活/监控路径不会被业务流量的
 // 429 误伤。
+//
+// ⚠️ 显式传即**完全覆盖** InfraPaths 缺省（#137）：不在显式清单内的路径
+// 照常限流——需要额外豁免业务路径又想保留探活豁免时，把 mw.InfraPaths
+// 一并写进清单（`append(mw.InfraPaths, "/api/**")`）。
 //
 // ⚠️ glob 语义是 filepath.Match（pathx.MatchesPath）：`*` 单段不跨 "/"，
 // "/ready*" 只命中 /readyz 等同段路径，不命中 /ready/deep-check 等嵌套
@@ -147,6 +156,7 @@ func newRateLimitOptions(opts ...RateLimitOption) *RateLimitOptions {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	cfg.SkipPaths = withInfraPathsDefault(cfg.SkipPaths) // #137 缺省兜底
 	if cfg.KeyFunc == nil {
 		cfg.KeyFunc = defaultIPKey
 	}
@@ -167,7 +177,8 @@ func newRateLimitOptions(opts ...RateLimitOption) *RateLimitOptions {
 // RateLimitMiddlewareWithLimiter 自建并持有 KeyedLimiter。
 //
 // 可选能力（默认全关，保持既有消费方行为不变）：
-//   - WithRateLimitSkipPaths — 探活/监控路径豁免限流（如 /ping /healthz）
+//   - SkipPaths — 探活/监控路径豁免限流；缺省按 mw.InfraPaths 兜底（#137，
+//     标准探活/监控端点不占配额），显式传则完全覆盖缺省（不是追加）
 //   - WithRateLimitHeaders — 限流响应头（X-RateLimit-Remaining / Retry-After /
 //     X-RateLimit-Reset，数字读自 TokenBucket 的剩余配额出口）
 //   - WithRateLimitOnReject — 拒绝时的自定义响应钩子（统一错误体）
