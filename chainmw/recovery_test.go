@@ -225,3 +225,135 @@ func TestRecoveryNoTransportDefaults(t *testing.T) {
 		t.Fatalf("expected kind=-/op=- without transport: %s", out)
 	}
 }
+
+// evilError 是 Error() 自身会 panic 的 evil error（#138 的缺陷触发形态：
+// panic 值是 error 且其 Error() 炸 ⇒ 日志后端格式化 kv 时二次 panic）。
+type evilError struct{}
+
+func (evilError) Error() string { panic("Error() explodes") }
+
+// evilValueLogger 模拟 logx slog 后端的 logValue 行为：对 error 值**直接调
+// Error()**（不经 fmt 的 panic 保护）——#138 的真实二次 panic 触发面
+// （logx/slog.go logValue 直接 err.Error()，evil error 在此炸出）。
+type evilValueLogger struct {
+	captureLogger
+}
+
+func (l *evilValueLogger) CtxError(ctx context.Context, msg string, kvs ...any) {
+	for i := 0; i+1 < len(kvs); i += 2 {
+		if e, ok := kvs[i+1].(error); ok {
+			_ = e.Error() // 直接调用：Error() panic 则 panic（真实后端形态）
+		}
+	}
+	l.captureLogger.CtxError(ctx, msg, kvs...)
+}
+
+// TestRecoveryEvilErrorPanicValueIsolated 钉住 #138：panic 值是 Error() 会炸
+// 的 error 时，日志路径必须被 panic 隔离——recovery 不得整体失效：
+//   - panic 不逃出中间件（此前整个 h(...) 调用 panic 逃逸）；
+//   - 仍以 *chain.PanicError 返回（外层 errors.As 分支可走、ErrorHandler 可调）；
+//   - 上报钩子被调用（此前一次都不被调，Sentry 静默丢失）；
+//   - 日志降级为隔离兜底（logger_panic 字段），不再携带会炸的原始值。
+func TestRecoveryEvilErrorPanicValueIsolated(t *testing.T) {
+	rec := &evilValueLogger{}
+	reporterCalled := false
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) {
+		panic(evilError{})
+	}, Recovery(
+		WithRecoveryLogger(rec),
+		WithRecoveryReporter(func(_ context.Context, _ any, _ *chain.PanicError) {
+			reporterCalled = true
+		}),
+	))
+
+	// 此处不再 panic 逃逸即为本测试的一部分：逃逸则测试框架直接判红。
+	resp, err := h(context.Background(), "req")
+	if resp != nil {
+		t.Errorf("resp = %v, want nil", resp)
+	}
+	var pv *chain.PanicError
+	if !errors.As(err, &pv) {
+		t.Fatalf("err = %v, want *chain.PanicError (ErrorHandler 分支可走)", err)
+	}
+	if _, ok := pv.Value.(evilError); !ok {
+		t.Errorf("pv.Value = %v, want evilError", pv.Value)
+	}
+	if !reporterCalled {
+		t.Error("reporter must be called before the log path explodes (#138)")
+	}
+
+	out := rec.text()
+	if !strings.Contains(out, "[panic] recovered") || !strings.Contains(out, "logger_panic") {
+		t.Fatalf("missing isolated log-failure fallback: %s", out)
+	}
+	if !strings.Contains(out, "original_panic=") {
+		t.Errorf("isolated fallback missing original panic (sanitized): %s", out)
+	}
+}
+
+// TestPanicSafeText panicSafeText 自身契约：对 Error() 会炸的值不 panic，
+// 降级为类型名描述；普通值原样格式化。
+func TestPanicSafeText(t *testing.T) {
+	got := panicSafeText(evilError{}) // 此处不 panic 即为通过
+	if got == "" {
+		t.Error("panicSafeText should never return an empty string")
+	}
+	if s := panicSafeText("plain"); s != "plain" {
+		t.Errorf("panicSafeText(plain) = %q, want plain", s)
+	}
+}
+
+// panickyLogger CtxError 自身 panic 的 logger（日志后端故障形态）。
+type panickyLogger struct {
+	captureLogger
+}
+
+func (p *panickyLogger) CtxError(_ context.Context, _ string, _ ...any) {
+	panic("logger backend exploded")
+}
+
+// TestRecoveryLoggerPanicIsolated 钉住 #138 的另一触发面：logger 后端自身
+// panic 时 recovery 同样不得失效——上报钩子照常、*PanicError 照常返回
+// （兜底日志再炸只能静默吞掉，无处可记）。
+func TestRecoveryLoggerPanicIsolated(t *testing.T) {
+	reporterCalled := false
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) {
+		panic("biz panic")
+	}, Recovery(
+		WithRecoveryLogger(&panickyLogger{}),
+		WithRecoveryReporter(func(_ context.Context, _ any, _ *chain.PanicError) {
+			reporterCalled = true
+		}),
+	))
+
+	_, err := h(context.Background(), "req")
+	var pv *chain.PanicError
+	if !errors.As(err, &pv) || pv.Value != "biz panic" {
+		t.Fatalf("err = %v, want *chain.PanicError(biz panic)", err)
+	}
+	if !reporterCalled {
+		t.Error("reporter must be called even when the logger panics (#138)")
+	}
+}
+
+// TestRecoveryReportBeforeLog 钉住 #138 的顺序契约：上报先于日志——日志
+// 路径出问题时上报钩子已经执行（监控不静默丢失）。
+func TestRecoveryReportBeforeLog(t *testing.T) {
+	var order []string
+	h := chain.Finalize(func(ctx context.Context, req any) (any, error) {
+		panic("boom")
+	}, Recovery(
+		WithRecoveryReporter(func(_ context.Context, _ any, _ *chain.PanicError) {
+			order = append(order, "report")
+		}),
+		WithRecoveryLogFields(func(_ context.Context, _ any, _ *chain.PanicError) []any {
+			order = append(order, "log") // 字段构建器在 logPanic 内部调用
+			return nil
+		}),
+	))
+
+	h(context.Background(), "req")
+	if len(order) != 2 || order[0] != "report" || order[1] != "log" {
+		t.Fatalf("execution order = %v, want [report log] (#138)", order)
+	}
+}
