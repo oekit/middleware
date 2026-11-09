@@ -3,6 +3,7 @@ package mw
 import (
 	"context"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -302,5 +303,198 @@ func TestClaimsFromRequestContext(t *testing.T) {
 func TestClaimsFrom_UnregisteredContext(t *testing.T) {
 	if _, ok := ClaimsFrom(context.Background()); ok {
 		t.Error("ClaimsFrom on plain context should return ok=false")
+	}
+}
+
+// overrideAPIKeyAuth 模拟 octopus APIKeyAuth 的路由级 strip-then-inject：
+// 校验 API key、把归属人身份经 OverrideTrustedClaims 可信覆写进 claims。
+func overrideAPIKeyAuth(t *testing.T, okFunc func(ok bool)) app.HandlerFunc {
+	t.Helper()
+	return func(ctx context.Context, c *app.RequestContext) {
+		ctx, ok := OverrideTrustedClaims(ctx, c, TrustedClaims{
+			UserID:   "key-owner-1",
+			Username: "api-key-client",
+			Roles:    []string{"api-key"},
+		})
+		if okFunc != nil {
+			okFunc(ok)
+		}
+		if !ok {
+			ErrorResp(c, 401, "unauthorized")
+			return
+		}
+		c.Next(ctx)
+	}
+}
+
+// TestOverrideTrustedClaims_RouteLevelRewrite 钉住 #136 主场景（octopus
+// APIKeyAuth 形态）：伪造头在入口已被解析进 claims，路由级中间件在身份链
+// 之后可信覆写——下游 handler 读到的是覆写后身份，Rewritten 审计标记置位，
+// 伪造身份头被剥离（清场）。
+func TestOverrideTrustedClaims_RouteLevelRewrite(t *testing.T) {
+	probe := &identityProbe{}
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(TrustedHeadersIdentity(TrustedIdentityConfig{
+		AdminRoles: []string{"1"},
+		Missing:    AnonymousClaims,
+	}))
+	h.GET("/api/v2/ext/data", overrideAPIKeyAuth(t, nil), func(ctx context.Context, c *app.RequestContext) {
+		claims, ok := ClaimsFrom(ctx)
+		probe.store(claims, ok)
+		// 清场断言：伪造身份头对下游读头代码不可见
+		if got := string(c.GetHeader("X-Auth-User-ID")); got != "" {
+			t.Errorf("X-Auth-User-ID 应被覆写口剥离（清场），got %q", got)
+		}
+		c.JSON(http.StatusOK, map[string]any{"uid": claims.UserID})
+	})
+
+	// 客户端伪造 X-Auth-User-ID: attacker + admin 角色 —— 入口解析进 claims，
+	// 路由级覆写后下游只见 key 归属人。
+	r := ut.PerformRequest(h, http.MethodGet, "/api/v2/ext/data", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "attacker"},
+		ut.Header{Key: "X-Auth-Role-IDs", Value: "1"},
+	).Result()
+
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", r.StatusCode(), r.Body())
+	}
+	claims, ok := probe.load()
+	if !ok {
+		t.Fatal("ClaimsFrom should find rewritten claims")
+	}
+	if claims.UserID != "key-owner-1" || claims.Username != "api-key-client" {
+		t.Errorf("claims = %+v, want rewritten identity key-owner-1 (not forged attacker)", claims)
+	}
+	if !claims.Rewritten {
+		t.Error("Rewritten should be true after trusted override (#136 audit marker)")
+	}
+	if claims.IsAdmin {
+		t.Errorf(`IsAdmin = true, want false ("api-key" role must not match admin "1" after recompute)`)
+	}
+}
+
+// TestOverrideTrustedClaims_ContextAndRequestContextAgree ctx 与 RequestContext
+// 双写出口读到同一份覆写结果（同 key 写回契约）。
+func TestOverrideTrustedClaims_ContextAndRequestContextAgree(t *testing.T) {
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(TrustedHeadersIdentity(TrustedIdentityConfig{Missing: AnonymousClaims}))
+	h.GET("/ext", overrideAPIKeyAuth(t, nil), func(ctx context.Context, c *app.RequestContext) {
+		fromCtx, okCtx := ClaimsFrom(ctx)
+		fromRC, okRC := ClaimsFromRequestContext(c)
+		if !okCtx || !okRC {
+			t.Errorf("both exits should find claims: ctx ok=%v rc ok=%v", okCtx, okRC)
+		}
+		if !reflect.DeepEqual(fromCtx, fromRC) {
+			t.Errorf("ctx claims %+v != RequestContext claims %+v", fromCtx, fromRC)
+		}
+		if !fromCtx.Rewritten || fromCtx.UserID != "key-owner-1" {
+			t.Errorf("claims = %+v, want rewritten key-owner-1", fromCtx)
+		}
+		c.JSON(http.StatusOK, map[string]any{"ok": true})
+	})
+
+	r := ut.PerformRequest(h, http.MethodGet, "/ext", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "attacker"}).Result()
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode())
+	}
+}
+
+// TestOverrideTrustedClaims_SecondOverrideRejected 单向闸：仅允许覆写一次，
+// 第二次覆写被拒绝（ok=false）且保留第一次覆写结果——防链内多方互相覆盖。
+func TestOverrideTrustedClaims_SecondOverrideRejected(t *testing.T) {
+	probe := &identityProbe{}
+	secondOK := false
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(TrustedHeadersIdentity(TrustedIdentityConfig{Missing: AnonymousClaims}))
+	h.GET("/ext",
+		overrideAPIKeyAuth(t, nil),
+		func(ctx context.Context, c *app.RequestContext) {
+			var ok bool
+			ctx, ok = OverrideTrustedClaims(ctx, c, TrustedClaims{UserID: "second-override"})
+			secondOK = ok
+			c.Next(ctx)
+		},
+		func(ctx context.Context, c *app.RequestContext) {
+			claims, _ := ClaimsFrom(ctx)
+			probe.store(claims, true)
+			c.JSON(http.StatusOK, map[string]any{"ok": true})
+		},
+	)
+
+	r := ut.PerformRequest(h, http.MethodGet, "/ext", nil).Result()
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode())
+	}
+	if secondOK {
+		t.Error("second override must be rejected (one-way gate, #136)")
+	}
+	claims, _ := probe.load()
+	if claims.UserID != "key-owner-1" {
+		t.Errorf("claims = %+v, want first override kept (key-owner-1)", claims)
+	}
+}
+
+// TestOverrideTrustedClaims_NoIdentityMiddleware 未注册身份链时覆写被拒绝
+// （覆写口不凭空造身份，fail-closed），下游 ClaimsFrom 仍 ok=false。
+func TestOverrideTrustedClaims_NoIdentityMiddleware(t *testing.T) {
+	probe := &identityProbe{}
+	overrideOK := true
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.GET("/ext", func(ctx context.Context, c *app.RequestContext) {
+		var ok bool
+		ctx, ok = OverrideTrustedClaims(ctx, c, TrustedClaims{UserID: "injected"})
+		overrideOK = ok
+		c.Next(ctx)
+	}, func(ctx context.Context, c *app.RequestContext) {
+		claims, ok := ClaimsFrom(ctx)
+		probe.store(claims, ok)
+		c.JSON(http.StatusOK, map[string]any{"ok": true})
+	})
+
+	r := ut.PerformRequest(h, http.MethodGet, "/ext", nil).Result()
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode())
+	}
+	if overrideOK {
+		t.Error("override without identity middleware must be rejected (fail-closed, #136)")
+	}
+	if _, ok := probe.load(); ok {
+		t.Error("ClaimsFrom must stay ok=false when override was rejected")
+	}
+}
+
+// TestOverrideTrustedClaims_AdminRecompute 覆写口的 IsAdmin 按启动期口径
+// 重算：调用方传入的 IsAdmin 不被采信——覆写口不提供绕过 admin 口径的
+// 通道（Roles 命中 admin 配置则重算为 true，反之不可凭 IsAdmin=true 提权）。
+func TestOverrideTrustedClaims_AdminRecompute(t *testing.T) {
+	probe := &identityProbe{}
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(TrustedHeadersIdentity(TrustedIdentityConfig{AdminRoles: []string{"1"}}))
+	h.GET("/ext", func(ctx context.Context, c *app.RequestContext) {
+		// 调用方声称 IsAdmin=true 但 Roles 不含 admin 角色 → 重算降权。
+		ctx, _ = OverrideTrustedClaims(ctx, c, TrustedClaims{
+			UserID:  "key-owner-1",
+			Roles:   []string{"api-key"},
+			IsAdmin: true, // 不被采信
+		})
+		claims, _ := ClaimsFrom(ctx)
+		probe.store(claims, true)
+		c.Next(ctx)
+	}, func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(http.StatusOK, map[string]any{"ok": true})
+	})
+
+	r := ut.PerformRequest(h, http.MethodGet, "/ext", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "u-42"}).Result()
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200", r.StatusCode())
+	}
+	claims, _ := probe.load()
+	if claims.IsAdmin {
+		t.Errorf("IsAdmin = true, want false (caller-set IsAdmin must be recomputed, #136)")
+	}
+	if claims.UserID != "key-owner-1" {
+		t.Errorf("UserID = %q, want key-owner-1", claims.UserID)
 	}
 }

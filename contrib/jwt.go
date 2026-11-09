@@ -22,15 +22,21 @@ const (
 // jwtLog 是 JWT 组件专用 logger(构造失败等一次性告警)。
 var jwtLog = logx.Delegating("middleware-jwt")
 
-// jwtState 持有懒构造的 HertzJWTMiddleware,延迟到第一次调用 JWTAuth 时构造。
-// 全部字段经 mu 保护:JWTAuth(写 opts/构造)、JWTGenerateToken(读 runtime)、
-// JWTParse(读 runtime)可并发调用(2026-09-05 复审修复:原实现无锁)。
+// jwtState 持有**显式签发/解析入口**（JWTGenerateToken/JWTParse）的默认配置
+// 与运行态。全部字段经 mu 保护:JWTAuth(写 opts/构造)、JWTGenerateToken
+// (读 runtime)、JWTParse(读 runtime)可并发调用(2026-09-05 复审修复:原实现无锁)。
+//
+// ⚠️ 验签侧**不用**本状态（#139）：JWTAuth 每次调用构造实例私有的
+// opts/runtime 快照——验签密钥落全局会让第二次 JWTAuth 覆写先前实例的密钥，
+// 跨服务认证边界被静默跨越（同进程多服务网关/BFF/灰度双密钥并存是常见形态）。
 type jwtState struct {
 	mu sync.Mutex
-	// opts 是**配置真相源**:JWTAuth 的每次调用把 option 累积到这里。
+	// opts 是**签发缺省配置**:JWTAuth 的每次调用把 option 累积到这里，
+	// JWTGenerateToken/JWTParse 读最后一次注册的缺省。
 	opts jwtOptions
-	// runtime 是**当前生效的运行态**快照(原子读,无锁)。
-	// 签发与验签**都以它为准** ⇒ 不可能分裂(见 jwtRuntime 注释)。
+	// runtime 是**当前生效的签发缺省运行态**快照(原子读,无锁)。
+	// JWTGenerateToken 的签发材料以它为准 ⇒ 签发与 JWTParse 不可能分裂
+	// (见 jwtRuntime 注释)。
 	runtime atomic.Pointer[jwtRuntime]
 	// builtKey 是当前成功构造的 runtime 的 materialKey 指纹。
 	// 用于判定「影响签发/验签的配置是否变了」⇒ 变了要重建。
@@ -90,6 +96,9 @@ func (o *jwtOptions) materialKey() string {
 		o.timeout.String()
 }
 
+// globalJWTState 是**显式签发/解析入口**（JWTGenerateToken/JWTParse）的全局
+// 默认状态。验签侧一律用 JWTAuth 实例私有快照（#139）——验签密钥落全局会让
+// 第二次 JWTAuth 覆写先前实例的密钥，跨服务认证边界被静默跨越。
 var globalJWTState jwtState
 
 // JWTOption 是 JWTAuth 的配置选项函数类型。
@@ -140,9 +149,18 @@ func WithJWTSkipFunc(fn func(path string) bool) JWTOption {
 //	    mw.WithJWTSkipPaths("/healthz", "/login"),
 //	))
 //
+// ⚠️ 实例私有验签（#139）:每次 JWTAuth 调用用**本次传入的 options** 构造
+// 自己的验签快照,密钥等配置不落全局——同进程内多个 JWTAuth 实例(单进程
+// 多服务网关、BFF、灰度双密钥并存)各验各的密钥,后注册的实例不会覆写先前
+// 实例的密钥,跨服务认证边界不会被静默跨越。相应地,**验签密钥的轮换**不再
+// 由「再次调用 JWTAuth」触发(已注册实例的快照在构造期冻结);轮换 = 用新
+// 密钥构造新实例并重新注册路由。全局状态只保留显式签发/解析入口
+// (JWTGenerateToken/JWTParse)的默认配置:最后一次 JWTAuth 注册的密钥成为
+// 签发缺省(与既有行为一致;单实例应用签发与验签天然同源)。
+//
 // ⚠️ fail-closed:构造失败(典型:漏传 WithJWTSecret)时返回的中间件会把
-// 所有请求 500,而不是静默放行 — 认证中间件缺省方向必须是拒绝。补传
-// secret 后再次调用 JWTAuth 即恢复正常(构造可重试,无 once 毒化)。
+// 所有请求 500,而不是静默放行 — 认证中间件缺省方向必须是拒绝。每个实例的
+// 配置在构造期定版,补传 secret 后再次调用 JWTAuth 即得到可用的新实例。
 //
 // ⚠️ 与 BearerTokenAuth(静态 token)互补:JWT 用于签名 token 验证,
 // BearerToken 用于简单预共享。两者可同时存在但通常只用一个。
@@ -150,11 +168,25 @@ func WithJWTSkipFunc(fn func(path string) bool) JWTOption {
 // 官方依据:https://www.cloudwego.io/zh/docs/hertz/tutorials/third-party/middleware/jwt/
 // (Timeout "用于设置 token 过期时间,默认为一小时")
 func JWTAuth(opts ...JWTOption) app.HandlerFunc {
+	// 实例私有配置与验签快照(#139):构造期一次性定版,闭包直接捕获。
+	// 不读 globalJWTState.opts——读全局就回到了「第二次注册覆写先前实例
+	// 密钥」的跨服务放行形态。全局 options 累积/「缺参继承上次配置」的
+	// 写法一并废除:每个实例必须自带完整配置,缺 secret 即 fail-closed。
+	local := newJWTOptions(opts...)
+	rt := buildJWTRuntime(local)
+
+	// 全局状态只维护**显式签发/解析入口**的默认配置(JWTGenerateToken/
+	// JWTParse 读这里):本次注册的 options 累积进全局 opts,影响签发的材料
+	// 变了就重建全局 runtime。验签侧不走这条路径。
+	//
+	// ⚠️ **关键配置变了必须重建 instance**:上游 HertzJWTMiddleware 把
+	//    Key/SigningAlgorithm **拷进自己的字段**(冻结),而 opts 是可变的。
+	//    ⇒ 用 materialKey 指纹判定「影响签发的配置是否变了」,
+	//      变了就重建。skipPaths/skipFunc 不进指纹(与 instance 无关)。
 	globalJWTState.mu.Lock()
 	for _, opt := range opts {
 		opt(&globalJWTState.opts)
 	}
-	// 应用默认值到 opts(JWTGenerateToken 等后续调用读 opts)
 	if globalJWTState.opts.realm == "" {
 		globalJWTState.opts.realm = defaultJWTRealm
 	}
@@ -164,44 +196,25 @@ func JWTAuth(opts ...JWTOption) app.HandlerFunc {
 	if globalJWTState.opts.timeout == 0 {
 		globalJWTState.opts.timeout = defaultJWTTimeout
 	}
-	// 懒构造;失败可重试(后续调用补齐 secret 后重新构造,无 once 毒化)
-	//
-	// ⚠️ **关键配置变了必须重建 instance**:上游 HertzJWTMiddleware 把
-	//    Key/SigningAlgorithm **拷进自己的字段**(冻结),而 opts 是可变的。
-	//    不重建 ⇒ 验签用旧 Key、签发用新 Key ⇒ 签发与验签分裂
-	//    (轮换 secret ⇒ 自家签的 token 被自家 401)。
-	//    ⇒ 用 materialKey 指纹判定「影响签发/验签的配置是否变了」,
-	//      变了就重建。skipPaths/skipFunc 不进指纹(与 instance 无关)。
-	needRebuild := globalJWTState.runtime.Load() == nil ||
-		globalJWTState.builtKey != globalJWTState.opts.materialKey()
-	if needRebuild {
-		// 重建前先清掉旧 runtime:构造失败时不能留着一个用旧 Key 的
-		// instance 让后续请求继续验签(那会继续 401 且难以定位)。
-		rt := buildJWTRuntimeLocked()
-		globalJWTState.runtime.Store(rt)
-		if rt.err == nil {
+	if globalJWTState.runtime.Load() == nil ||
+		globalJWTState.builtKey != globalJWTState.opts.materialKey() {
+		grt := buildJWTRuntimeLocked()
+		globalJWTState.runtime.Store(grt)
+		if grt.err == nil {
 			globalJWTState.builtKey = globalJWTState.opts.materialKey()
 			globalJWTState.errLogged = false
-		}
-	}
-	rt := globalJWTState.runtime.Load()
-	skipPaths, skipFunc := globalJWTState.opts.skipPaths, globalJWTState.opts.skipFunc
-	failed := rt == nil || rt.err != nil
-	var failErr error
-	if failed {
-		failErr = errJWTSecretRequired
-		if rt != nil {
-			failErr = rt.err
-		}
-		if !globalJWTState.errLogged {
+		} else if !globalJWTState.errLogged {
 			globalJWTState.errLogged = true
-			jwtLog.Error("jwt middleware init failed; failing closed (all requests 500)",
-				"err", failErr)
+			jwtLog.Error("jwt signing default init failed (JWTGenerateToken/JWTParse unavailable)",
+				"err", grt.err)
 		}
 	}
 	globalJWTState.mu.Unlock()
 
-	if failed {
+	if rt.err != nil {
+		// 本实例构造失败 ⇒ fail-closed(所有请求 500)。实例即构造事件,
+		// 每次失败的构造各告警一次。
+		jwtLog.Error("jwt middleware init failed; failing closed (all requests 500)", "err", rt.err)
 		return func(_ context.Context, c *app.RequestContext) {
 			c.AbortWithStatus(http.StatusInternalServerError)
 		}
@@ -209,51 +222,67 @@ func JWTAuth(opts ...JWTOption) app.HandlerFunc {
 
 	// skipPaths/skipFunc 在外层包装生效（上游 hertz-contrib/jwt 无跳过机制，
 	// 此前这两个选项被静默忽略——声明了跳过路径的鉴权实际仍在拦截）。
-	//
-	// ⚠️ **运行时解析当前 runtime**,不在这里捕获 instance:
-	//    捕获的话,后续 JWTAuth(轮换 secret)重建了 instance 之后,
-	//    本闭包仍用**旧** instance 验签 ⇒ 又变成签发/验签分裂。
-	//    ⇒ 每次请求 Load 当前 runtime ⇒ 验签与签发永远读同一份快照。
-	skip := make(map[string]bool, len(skipPaths))
-	for _, p := range skipPaths {
+	// 验签快照在构造期冻结:实例私有 ⇒ 不存在「后续 JWTAuth 覆写本实例
+	// 密钥」的可能,无需每请求 Load 全局 runtime。
+	skip := make(map[string]bool, len(local.skipPaths))
+	for _, p := range local.skipPaths {
 		skip[p] = true
 	}
+	skipFunc := local.skipFunc
 	return func(ctx context.Context, c *app.RequestContext) {
-		cur := globalJWTState.runtime.Load()
-		if cur == nil || cur.err != nil || cur.inner == nil {
-			// 运行期构造失败(理论上不会:构造失败时 JWTAuth 直接返回 500 闭包)
-			// ⇒ 仍然 fail-closed,不能放行。
-			c.AbortWithStatus(http.StatusInternalServerError)
-			return
-		}
 		path := string(c.Path())
 		if skip[path] || (skipFunc != nil && skipFunc(path)) {
 			c.Next(ctx)
 			return
 		}
-		cur.inner(ctx, c)
+		rt.inner(ctx, c)
 	}
 }
 
-// buildJWTRuntimeLocked 构造 HertzJWTMiddleware 及其中间件闭包。
-// 调用方必须持有 globalJWTState.mu。
+// newJWTOptions 应用 options 与默认值,返回实例私有配置(JWTAuth 每次调用
+// 独享,不与全局共享)。
+func newJWTOptions(opts ...JWTOption) *jwtOptions {
+	o := &jwtOptions{}
+	for _, opt := range opts {
+		opt(o)
+	}
+	if o.realm == "" {
+		o.realm = defaultJWTRealm
+	}
+	if o.algorithm == "" {
+		o.algorithm = defaultJWTAlgorithm
+	}
+	if o.timeout == 0 {
+		o.timeout = defaultJWTTimeout
+	}
+	return o
+}
+
+// buildJWTRuntime 构造 HertzJWTMiddleware 及其中间件闭包。
 //
-// 返回值是**不可变快照**:instance 与 inner 一一对应,
-// 签发(JWTGenerateToken)与验签(JWTAuth 返回的闭包)都读它 ⇒ 不会分裂。
-func buildJWTRuntimeLocked() *jwtRuntime {
-	if len(globalJWTState.opts.secret) == 0 {
+// 返回值是**不可变快照**:instance 与 inner 一一对应,构造后不再变化。
+// JWTAuth 实例在构造期持有自己的快照验签;签发缺省(JWTGenerateToken)读
+// 全局快照——同一实例注册时的密钥即签发缺省,单实例应用签发与验签同源。
+func buildJWTRuntime(o *jwtOptions) *jwtRuntime {
+	if len(o.secret) == 0 {
 		return &jwtRuntime{err: errJWTSecretRequired}
 	}
 	mw, err := jwthertz.New(&jwthertz.HertzJWTMiddleware{
-		Realm:            globalJWTState.opts.realm,
-		SigningAlgorithm: globalJWTState.opts.algorithm,
-		Key:              globalJWTState.opts.secret,
-		Timeout:          globalJWTState.opts.timeout,
+		Realm:            o.realm,
+		SigningAlgorithm: o.algorithm,
+		Key:              o.secret,
+		Timeout:          o.timeout,
 	})
 	if err != nil {
 		return &jwtRuntime{err: err}
 	}
 	return &jwtRuntime{instance: mw, inner: mw.MiddlewareFunc()}
+}
+
+// buildJWTRuntimeLocked 构造全局签发缺省配置的 runtime。
+// 调用方必须持有 globalJWTState.mu。
+func buildJWTRuntimeLocked() *jwtRuntime {
+	return buildJWTRuntime(&globalJWTState.opts)
 }
 
 // JWTGenerateToken 用当前配置签发 token(HS256/384/512 共享密钥模式)。
@@ -267,10 +296,10 @@ func buildJWTRuntimeLocked() *jwtRuntime {
 //
 // RSA 模式需自行实现(本 helper 不覆盖 — 业务可用 HertzJWTMiddleware.TokenGenerator)。
 //
-// ⚠️ **签发配置取自当前 runtime(即验签用的那个 instance)**,不是取自可变 opts。
-//
-//	两者若不同源,轮换 secret 后就会出现「自家签的 token 被自家中间件 401」。
-//	⇒ 签发与验签读同一个对象 ⇒ 结构上不可能分裂。
+// ⚠️ **签发材料取自全局签发缺省 runtime**(最后一次 JWTAuth 注册的密钥,
+// #139),不是取自可变 opts。验签侧是各 JWTAuth 实例的私有快照——单实例
+// 应用(一个服务一套密钥)签发与验签天然同源;多实例应用若要按实例签发,
+// 请用各实例注册时的密钥自行签发(或 HertzJWTMiddleware.TokenGenerator)。
 func JWTGenerateToken(claims jwt.MapClaims) (string, error) {
 	rt := globalJWTState.runtime.Load()
 	if rt == nil || rt.err != nil || rt.instance == nil {

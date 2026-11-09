@@ -2,6 +2,7 @@ package mw
 
 import (
 	"context"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -143,5 +144,52 @@ func TestRecovery_ReporterPanicIsolated(t *testing.T) {
 	}
 	if !rep.called.Load() {
 		t.Error("reporter should have been invoked")
+	}
+}
+
+// evilError 是 Error() 自身会 panic 的 evil error(#138 的缺陷触发形态)。
+type evilError struct{}
+
+func (evilError) Error() string { panic("Error() explodes") }
+
+// TestRecoveryMiddleware_EvilErrorPanicValue 钉住 #138(hertz 薄壳):panic 值
+// 是 Error() 会炸的 error 时,RecoveryMiddleware 不得整体失效——此前日志路径
+// 二次 panic 使上报钩子与 ErrorHandler 均不被调用、panic 逃出 hertz 栈
+// (无默认 PanicHandler ⇒ 客户端拿到空 body 甚至连接冲垮)。修复后:
+// 内核日志路径 panic 隔离 ⇒ *chain.PanicError 照常返回 ⇒ errors.As 命中 ⇒
+// 上报钩子与自定义 500 响应体照常执行。
+func TestRecoveryMiddleware_EvilErrorPanicValue(t *testing.T) {
+	rep := &fakeSentryReporter{}
+	errorHandlerCalled := false
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(RecoveryMiddleware(
+		WithPanicReporter(rep),
+		WithRecoveryErrorHandler(func(c *app.RequestContext, _ any, _ string) {
+			errorHandlerCalled = true
+			c.JSON(500, map[string]any{"code": 500, "message": "custom-handler"})
+		}),
+	))
+	h.GET("/boom", func(_ context.Context, c *app.RequestContext) {
+		panic(evilError{})
+	})
+
+	w := ut.PerformRequest(h.Engine, "GET", "/boom", nil)
+	if w.Code != 500 {
+		t.Errorf("status = %d, want 500(ErrorHandler 必须执行,#138)", w.Code)
+	}
+	if !strings.Contains(w.Body.String(), "custom-handler") {
+		t.Errorf("统一 500 响应体丢失: body=%s", w.Body.String())
+	}
+	if !rep.called {
+		t.Error("reporter should have been invoked (#138: 上报不得静默丢失)")
+	}
+	if rep.gotStack == "" {
+		t.Error("reporter should receive the panic stack")
+	}
+	if !errorHandlerCalled {
+		t.Error("error handler should have been invoked (#138)")
 	}
 }

@@ -2,6 +2,7 @@ package chainmw
 
 import (
 	"context"
+	"fmt"
 	"runtime/debug"
 
 	"github.com/oekit/core/chain"
@@ -54,17 +55,23 @@ func WithRecoveryLogFields(fn func(ctx context.Context, req any, pv *chain.Panic
 
 // Recovery 返回 panic 恢复中间件（transport 无关内核）。
 //
-// 行为：下游 panic 被捕获为 *chain.PanicError → 记 Error 日志 → 经 panic
-// 隔离的监控钩子上报 → 以错误返回（链不中断）。下游**以 *PanicError 形式
-// 返回**（例如链上内层的 core/chain.Timeout 已把 panic 收编成错误再上抛）
-// 走同一日志+上报口径，与「直接 panic」的路径一致。响应转换由调用方的错误
-// 出口负责（hertz/chainmw.Wrap 的 WithOnError/默认 mw.Fail、kitex 侧透传
-// 给 kitex 错误处理）。
+// 行为：下游 panic 被捕获为 *chain.PanicError → 经 panic 隔离的监控钩子
+// 上报 → 记 Error 日志 → 以错误返回（链不中断）。上报先于日志（#138）：
+// 日志路径自身出问题时上报钩子已经执行。下游**以 *PanicError 形式返回**
+// （例如链上内层的 core/chain.Timeout 已把 panic 收编成错误再上抛）走同一
+// 上报+日志口径，与「直接 panic」的路径一致。响应转换由调用方的错误出口
+// 负责（hertz/chainmw.Wrap 的 WithOnError/默认 mw.Fail、kitex 侧透传给
+// kitex 错误处理）。
+//
+// 上报与日志两条路径均在 panic 隔离下执行（#138）：panic 值自身是 Error()
+// 会炸的 error、字段构建器或 logger/上报钩子再 panic 时，recovery 自身绝
+// 不能被打挂——否则上报静默丢失、错误返回丢失，panic 逃出 transport 层
+// （hertz 无默认 PanicHandler ⇒ 连接冲垮）。
 //
 // 与 core/chain.Recovery 的关系：捕获/转换语义一致（含「以 *PanicError
-// 返回」这条上报路径）；本实现叠加 logx 日志与上报 panic 隔离，为「一份
-// 逻辑两端跑」的内核（根包 mw 的 Hertz 栈与 kitex 经 ToKitex 桥接均复用
-// 本实现）。注：内外两层都是本中间件嵌套时，*PanicError 返回路径会双记
+// 返回」这条上报路径）；本实现叠加 logx 日志与上报/日志 panic 隔离，为
+// 「一份逻辑两端跑」的内核（根包 mw 的 Hertz 栈与 kitex 经 ToKitex 桥接均
+// 复用本实现）。注：内外两层都是本中间件嵌套时，*PanicError 返回路径会双记
 // 日志/双上报——core/chain.Recovery 同样如此，保持与 core 语义一致优先。
 //
 // 用法：
@@ -85,8 +92,9 @@ func Recovery(opts ...RecoveryOption) chain.Middleware {
 			defer func() {
 				if r := recover(); r != nil {
 					pv := &chain.PanicError{Value: r, Stack: string(debug.Stack())}
-					cfg.logPanic(ctx, req, pv)
+					// 先上报、后打日志（#138）：日志路径出问题时上报钩子已执行。
 					cfg.reportIsolated(ctx, req, pv)
+					cfg.logPanic(ctx, req, pv)
 					resp, err = nil, pv
 				}
 			}()
@@ -97,17 +105,52 @@ func Recovery(opts ...RecoveryOption) chain.Middleware {
 			// 路径；否则这类 panic 不进 Sentry 等上报、连 [panic] recovered
 			// 日志都没有——带日志的实现反而在该路径零观测，#123）。
 			if pe, ok := err.(*chain.PanicError); ok {
-				cfg.logPanic(ctx, req, pe)
 				cfg.reportIsolated(ctx, req, pe)
+				cfg.logPanic(ctx, req, pe)
 			}
 			return resp, err
 		}
 	}
 }
 
-// logPanic 输出 panic 日志。字段顺序：自定义构建器优先；默认
-// panic/stack/kind/op（无 transport 上下文时 kind/op 为 "-"）。
+// panicSafeText panic 安全地把任意值转成可打印文本：值自身的 Error()/格式化
+// 再 panic（evil error 形态，#138）也不逃逸，降级为类型名描述。
+func panicSafeText(v any) (s string) {
+	defer func() {
+		if recover() != nil {
+			s = fmt.Sprintf("<unprintable %T>", v)
+		}
+	}()
+	return fmt.Sprintf("%v", v)
+}
+
+// logIsolatedPanic 输出隔离路径的兜底日志（panicKey 区分 reporter_panic /
+// logger_panic）。日志后端再 panic 时只能吞掉（已无处可记）——绝不让兜底
+// 日志把 recovery 自身打穿（#138）。字段值一律经 panicSafeText：
+// original_panic 可能是 Error() 会炸的 evil error，裸塞进 kv 会在日志后端
+// 格式化时再次 panic。
+func (c *recoveryConfig) logIsolatedPanic(ctx context.Context, msg, panicKey string, isolatedPanic any, pv *chain.PanicError) {
+	func() {
+		defer func() { _ = recover() }()
+		c.logger.CtxError(ctx, msg,
+			panicKey, panicSafeText(isolatedPanic),
+			"original_panic", panicSafeText(pv.Value),
+		)
+	}()
+}
+
+// logPanic 输出 panic 日志（panic 隔离，#138）。字段顺序：自定义构建器优先；
+// 默认 panic/stack/kind/op（无 transport 上下文时 kind/op 为 "-"）。
 func (c *recoveryConfig) logPanic(ctx context.Context, req any, pv *chain.PanicError) {
+	// 与 reportIsolated 同款隔离：panic 值是 Error() 会炸的 error 时，把
+	// pv.Value 塞进 kv 交给日志后端（slog logValue 直接调 err.Error()）就会
+	// 二次 panic；字段构建器、logger 后端同样可能炸。隔离保证日志路径永远
+	// 不会把 recovery 自身打挂（上报与错误返回已在其之前完成，#138）。
+	defer func() {
+		if rp := recover(); rp != nil {
+			c.logIsolatedPanic(ctx, panicLogMessage, "logger_panic", rp, pv)
+		}
+	}()
 	var kvs []any
 	if c.fields != nil {
 		kvs = c.fields(ctx, req, pv)
@@ -125,10 +168,7 @@ func (c *recoveryConfig) reportIsolated(ctx context.Context, req any, pv *chain.
 	}
 	defer func() {
 		if rp := recover(); rp != nil {
-			c.logger.CtxError(ctx, reporterPanicMessage,
-				"reporter_panic", rp,
-				"original_panic", pv.Value,
-			)
+			c.logIsolatedPanic(ctx, reporterPanicMessage, "reporter_panic", rp, pv)
 		}
 	}()
 	c.reporter(ctx, req, pv)

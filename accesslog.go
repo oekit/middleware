@@ -11,10 +11,46 @@ import (
 	"github.com/oekit/middleware/hmw"
 )
 
+// InfraPaths 是基础设施探活/监控端点的标准路径清单（#137）：SkipPaths 类
+// 配置的事实标准收编——/metrics（Prometheus 抓取）、/ping、/healthz、/livez、
+// /readyz（K8s 探针）、/health、/ready（常见手抄变体）、/buildVersion（版本
+// 端点）。这份清单此前由各消费方手抄，已现实漂移出 5 个变体、同仓不同
+// 中间件漏跳同一路径（探针流量落进审计日志与限流计数，故障期探测风暴时
+// 可能触发限流误伤），故由库单点维护、中间件缺省兜底。
+//
+// 只读约定：消费方不得修改本切片（中间件内部使用前会复制兜底，不共享
+// 底层数组）。匹配语义同 SkipPaths（pathx.MatchesPath glob）——以上均为
+// 字面路径。
+var InfraPaths = []string{
+	"/metrics",
+	"/ping",
+	"/healthz",
+	"/livez",
+	"/readyz",
+	"/health",
+	"/ready",
+	"/buildVersion",
+}
+
+// withInfraPathsDefault SkipPaths 缺省兜底（#137）：未显式传时用 InfraPaths；
+// 显式传则**完全覆盖**缺省（不是追加）——显式清单是调用方对豁免面的完整
+// 声明，不存在「补丁式追加」的隐式并集。
+func withInfraPathsDefault(paths []string) []string {
+	if len(paths) > 0 {
+		return paths
+	}
+	return append([]string(nil), InfraPaths...)
+}
+
 // AccessLogOptions 是访问日志中间件的配置。
 type AccessLogOptions struct {
 	// SkipPaths 是不需要记录日志的路径列表，如 ["/metrics", "/ping", "/health"]。
 	// 健康检查和监控端点通常请求频繁，跳过可减少日志噪音。
+	//
+	// 缺省语义（#137）：未显式传时用 mw.InfraPaths 兜底（标准探活/监控
+	// 端点零日志零 sink）；显式传则**完全覆盖**缺省——不在显式清单内的
+	// 路径（含 InfraPaths 里的）照常记录，不是「InfraPaths + 显式清单」
+	// 的并集。
 	SkipPaths []string
 
 	// RedactPathPrefixes 是需要脱敏的路径前缀列表。命中前缀的路径只保留
@@ -101,6 +137,10 @@ type AccessLogOption func(*AccessLogOptions)
 // 等嵌套路径；要豁免整棵子树用 "/internal/**"（"/**" 目录前缀跨层）。
 // 常用形态："/metrics"（精确）、"/health*"（同段前缀）、"/internal/**"
 // （子树全部）。
+//
+// ⚠️ 显式传即**完全覆盖** InfraPaths 缺省（#137）：不在显式清单内的路径
+// 照常记录——需要额外豁免业务路径又想保留探活豁免时，把 mw.InfraPaths
+// 一并写进清单（`append(mw.InfraPaths, "/internal/**")`）。
 //
 // ⚠️ 嵌套路径漏跳是静默的：不报错也无日志线索——按 "/internal/*" 以为内部
 // 端点已豁免，嵌套路径照常整条进日志，正是「URL 路径即凭证」（#12）要防的
@@ -216,6 +256,7 @@ func newAccessLogOptions(opts ...AccessLogOption) *AccessLogOptions {
 	for _, opt := range opts {
 		opt(cfg)
 	}
+	cfg.SkipPaths = withInfraPathsDefault(cfg.SkipPaths) // #137 缺省兜底
 	return cfg
 }
 
@@ -259,7 +300,9 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 //   - ClientIP 默认 fail-closed（#83）：取对端地址，不采信任意来源的 XFF
 //     （与同仓 ratelimit 防伪造口径一致）；代理拓扑经 WithAccessLogClientIP
 //     注入可信网段解析（推荐包一层 pkg/convert.ResolveClientIP）
-//   - 无参调用即启用默认配置（不跳过任何路径、不脱敏、不落库）
+//   - SkipPaths 缺省按 mw.InfraPaths 兜底（#137）：标准探活/监控端点零日志
+//     零 sink；显式传则完全覆盖缺省（不是追加）
+//   - 其余缺省：不脱敏、不落库
 //
 // # 实现说明（#14）
 //

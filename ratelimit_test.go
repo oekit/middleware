@@ -262,15 +262,42 @@ func TestRateLimitMiddleware_SkipPaths(t *testing.T) {
 	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/ping").Response.StatusCode())
 }
 
-// TestRateLimitMiddleware_SkipPaths_Negative 验证负例：未配置即无隐式豁免、
-// 不在清单的路径不受豁免。
-func TestRateLimitMiddleware_SkipPaths_Negative(t *testing.T) {
-	key := WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" })
+// TestRateLimitMiddleware_InfraPathsDefaultSkip 钉住 #137：未显式传 SkipPaths
+// 时按 mw.InfraPaths 兜底——标准探活/监控端点不占配额（桶被打满后仍恒放行，
+// 探针风暴不进限流计数），业务路径照常限流。
+func TestRateLimitMiddleware_InfraPathsDefaultSkip(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+	)
 
-	// 未配置 SkipPaths：探活路径同样受限
-	h := RateLimitMiddleware(WithRateLimit(rate.Limit(1), 1), key)
+	// 业务路径照常限流：容量 1，第一个放行、第二个 429
+	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/api/data").Response.StatusCode())
+	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/api/data").Response.StatusCode())
+
+	// 标准探活/监控端点缺省豁免：配额耗尽后依旧放行（不占配额）
+	for _, p := range InfraPaths {
+		assert.DeepEqual(t, consts.StatusOK, rlRequest(h, p).Response.StatusCode())
+	}
+}
+
+// TestRateLimitMiddleware_ExplicitSkipPathsOverride 钉住 #137 覆盖语义：
+// 显式传 SkipPaths 完全覆盖 InfraPaths 缺省——/ping 不在显式清单内，
+// 照常限流（不是「InfraPaths + 显式清单」的并集）。
+func TestRateLimitMiddleware_ExplicitSkipPathsOverride(t *testing.T) {
+	h := RateLimitMiddleware(
+		WithRateLimit(rate.Limit(1), 1),
+		WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" }),
+		WithRateLimitSkipPaths("/metrics"),
+	)
 	assert.DeepEqual(t, consts.StatusOK, rlRequest(h, "/ping").Response.StatusCode())
 	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/ping").Response.StatusCode())
+}
+
+// TestRateLimitMiddleware_SkipPaths_Negative 验证负例：配置了但路径不在清单
+// 的路径不受豁免。
+func TestRateLimitMiddleware_SkipPaths_Negative(t *testing.T) {
+	key := WithRateLimitKeyFunc(func(*app.RequestContext) string { return "k" })
 
 	// 配置了但路径不在清单：不受豁免
 	h2 := RateLimitMiddleware(WithRateLimit(rate.Limit(1), 1), key, WithRateLimitSkipPaths("/metrics"))
