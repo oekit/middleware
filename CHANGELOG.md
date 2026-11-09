@@ -1,5 +1,14 @@
 
 
+## [v0.15.0] — 2026-11-10
+
+- - feat(identity): OverrideTrustedClaims 可信覆写口——strip-then-inject 与全局解析共存，单向闸+Admin 重算+身份头剥离（#136）
+- - feat: mw.InfraPaths 标准探活路径常量；accesslog/ratelimit 未显式传 SkipPaths 时兜底，显式传完全覆盖（#137）
+- - fix(chainmw): Recovery 的 panic 日志路径隔离——二次 panic 不再击穿，先上报后打日志（#138）
+- - fix(contrib): JWTAuth 验签密钥改实例私有，多实例不再共享最后注册密钥；**BREAKING**：验签热轮换改为构造新实例重注册（#139）
+
+关联问题单：middleware#136、middleware#137、middleware#138、middleware#139。
+
 ## [v0.14.1] — 2026-11-09
 
 - fix(contrib/cache): 归一化按原始编码字节级双射——编码字符不再塌缩（#125）
