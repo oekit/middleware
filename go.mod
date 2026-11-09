@@ -24,7 +24,7 @@ require (
 	github.com/oekit/concurrency v0.31.1
 	github.com/oekit/logx v0.9.0
 	github.com/oekit/metrics v0.2.1
-	github.com/oekit/registry v0.5.11
+	github.com/oekit/registry v0.5.12
 	github.com/oekit/tracing v0.3.9
 	github.com/prometheus/client_golang v1.25.0
 	github.com/swaggo/http-swagger v1.3.4
