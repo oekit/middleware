@@ -191,7 +191,7 @@ func TestJWTAuth_ConcurrentAccess(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			for j := 0; j < 20; j++ {
-				_ = JWTAuth(WithJWTTimeout(time.Hour))
+				_ = JWTAuth(WithJWTSecret([]byte(testJWTSecret)), WithJWTTimeout(time.Hour))
 				tok, err := JWTGenerateToken(jwt.MapClaims{"user_id": "bob"})
 				if err == nil && tok != "" {
 					_, _ = JWTParse(tok)
@@ -281,126 +281,161 @@ func TestJWTAuth_SkipPaths(t *testing.T) {
 	}
 }
 
-// TestJWTAuth_SecretRotationKeepsSignAndVerifyConsistent 钉住 **签发/验签分裂**。
-//
-// 缺陷形态（2026-10-31 实测）：上游 HertzJWTMiddleware 把 Key/SigningAlgorithm
-// **拷进自己的字段**（构造后冻结），而全局 opts 是**可变**的。
-// ⇒ 二次调用 JWTAuth(换 secret)后：
-//   - 签发（JWTGenerateToken 读 opts）用**新** Key
-//   - 验签（中间件读 instance）用**旧** Key
-//     ⇒ 自家签的 token 被自家中间件 401 "signature is invalid"。
-//
-// 本测试是**行为级**断言：签发出来的 token 必须能被自家中间件接受。
-// 断言「签发与验签同源」，而不是断言某个内部字段的值。
-func TestJWTAuth_SecretRotationKeepsSignAndVerifyConsistent(t *testing.T) {
+// mustSignToken 用给定密钥/算法签出带 exp 的测试 token（不经全局状态，
+// 模拟外部签发方）。
+func mustSignToken(t *testing.T, secret, alg string, claims jwt.MapClaims) string {
+	t.Helper()
+	full := make(jwt.MapClaims, len(claims)+1)
+	for k, v := range claims {
+		full[k] = v
+	}
+	if _, ok := full["exp"]; !ok {
+		full["exp"] = time.Now().Add(time.Hour).Unix()
+	}
+	signed, err := jwt.NewWithClaims(jwt.GetSigningMethod(alg), full).SignedString([]byte(secret))
+	if err != nil {
+		t.Fatalf("sign token: %v", err)
+	}
+	return signed
+}
+
+// probeJWTStatus 直接调用中间件实例探测验签结果（200=放行，401=拒绝）。
+func probeJWTStatus(t *testing.T, h app.HandlerFunc, path, token string) int {
+	t.Helper()
+	c := app.NewContext(0)
+	c.Request.URI().SetPath(path)
+	if token != "" {
+		c.Request.Header.Set("Authorization", "Bearer "+token)
+	}
+	h(context.Background(), c)
+	return c.Response.StatusCode()
+}
+
+// TestJWTAuth_MultiInstanceSecretIsolation 钉住 #139（P0）：JWTAuth 的验签
+// 密钥必须**实例私有**——第二次注册不得覆写先前实例的密钥。缺陷形态（实测）：
+// 密钥落包级全局 ⇒ 两个实例都只认最后一次注册的 secretB，/a 拒绝 A 自己签
+// 的 token 却接受 B 签的 token，跨服务认证边界被静默跨越（持有 B 密钥的一
+// 方可以访问 A）；对照形态（攻击者密钥/缺头）验签本身没失效，坏的只是
+// 「用哪个密钥验签」这一项。
+func TestJWTAuth_MultiInstanceSecretIsolation(t *testing.T) {
+	resetJWTState()
+
+	const (
+		secretA = "service-A-secret-key-32-bytes-long-xxxx"
+		secretB = "service-B-secret-key-32-bytes-long-yyyy"
+		secretX = "attacker-secret-key-32-bytes-long-zzz!"
+	)
+
+	mwA := JWTAuth(WithJWTSecret([]byte(secretA)))
+	mwB := JWTAuth(WithJWTSecret([]byte(secretB))) // 第二次注册 ⇒ 不得覆写 A 的验签密钥
+
+	tokA := mustSignToken(t, secretA, "HS256", jwt.MapClaims{"user_id": "alice"})
+	tokB := mustSignToken(t, secretB, "HS256", jwt.MapClaims{"user_id": "alice"})
+	tokX := mustSignToken(t, secretX, "HS256", jwt.MapClaims{"user_id": "mallory"})
+
+	// /a 形态：A 实例只认 A 签的 token。
+	if code := probeJWTStatus(t, mwA, "/a", tokA); code != 200 {
+		t.Errorf("A 实例拒绝 A 签的 token: got %d, want 200（自家凭据被静默作废）", code)
+	}
+	if code := probeJWTStatus(t, mwA, "/a", tokB); code != 401 {
+		t.Errorf("★ A 实例接受了 B 签的 token: got %d, want 401（跨服务认证边界被跨越，#139）", code)
+	}
+	if code := probeJWTStatus(t, mwA, "/a", tokX); code != 401 {
+		t.Errorf("A 实例接受了攻击者密钥签的 token: got %d, want 401", code)
+	}
+	if code := probeJWTStatus(t, mwA, "/a", ""); code != 401 {
+		t.Errorf("A 实例放行了无 Authorization 头的请求: got %d, want 401", code)
+	}
+
+	// /b 形态：B 实例只认 B 签的 token。
+	if code := probeJWTStatus(t, mwB, "/b", tokB); code != 200 {
+		t.Errorf("B 实例拒绝 B 签的 token: got %d, want 200", code)
+	}
+	if code := probeJWTStatus(t, mwB, "/b", tokA); code != 401 {
+		t.Errorf("★ B 实例接受了 A 签的 token: got %d, want 401（#139）", code)
+	}
+}
+
+// TestJWTAuth_RotationReplacesSigningDefaultOnly 钉住 #139 之后的「轮换」
+// 语义：再次调用 JWTAuth(新密钥)只更新**全局签发缺省**（JWTGenerateToken/
+// JWTParse），已注册实例的验签快照在构造期冻结、不被覆写——「不该共享却
+// 共享了」的跨服务放行形态（#139）正是旧的全局覆写机制本身。
+func TestJWTAuth_RotationReplacesSigningDefaultOnly(t *testing.T) {
 	resetJWTState()
 
 	const secretA = "secret-A-at-least-32-bytes-long-for-hs256-alg-x"
 	const secretB = "secret-B-at-least-32-bytes-long-for-hs256-alg-y"
 
-	h := server.New(
-		server.WithHostPorts("127.0.0.1:0"),
-		server.WithDisablePrintRoute(true),
-	)
-	h.POST("/login", func(_ context.Context, c *app.RequestContext) {
-		tok, err := JWTGenerateToken(jwt.MapClaims{"user_id": "alice"})
-		if err != nil {
-			c.JSON(500, map[string]string{"err": err.Error()})
-			return
-		}
-		c.JSON(200, map[string]string{"token": tok})
-	})
-	protected := JWTAuth(WithJWTSecret([]byte(secretA)))
-	h.GET("/protected", protected, func(_ context.Context, c *app.RequestContext) {
-		c.JSON(200, map[string]string{"ok": "true"})
-	})
+	mwA := JWTAuth(WithJWTSecret([]byte(secretA)))
 
-	// 轮换密钥：再次调用 JWTAuth 换 secret（运维常规动作）。
-	_ = JWTAuth(WithJWTSecret([]byte(secretB)))
+	// 轮换：再次调用 JWTAuth 换 secret（运维常规动作）。
+	mwB := JWTAuth(WithJWTSecret([]byte(secretB)))
 
-	// ⚠️ 轮换必须**真的生效**：当前 instance 必须用**新**密钥。
-	//    否则就是「轮换静默失效」——旧密钥仍被接受、新密钥签的 token 被拒,
-	//    而表面一切正常(没有报错)。
-	//    这条判据是「不重建 instance」那个变异的唯一区分点。
+	// 全局签发缺省 = 新密钥（轮换的生效面）。
 	rt := globalJWTState.runtime.Load()
 	if rt == nil || rt.instance == nil {
 		t.Fatal("轮换后 runtime 未构造")
 	}
 	if got := string(rt.instance.Key); got != secretB {
-		t.Errorf("★ 轮换 secret 未生效：instance.Key = %q，期望新密钥 %q", got, secretB)
+		t.Errorf("轮换未更新签发缺省: instance.Key = %q, want %q", got, secretB)
 	}
 
-	w := ut.PerformRequest(h.Engine, "POST", "/login", nil)
-	if w.Code != 200 {
-		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	// 签发（全局缺省）产出 B 签 token，JWTParse（全局）可解。
+	tokB, err := JWTGenerateToken(jwt.MapClaims{"user_id": "alice"})
+	if err != nil {
+		t.Fatalf("JWTGenerateToken after rotation: %v", err)
 	}
-	var loginResp struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &loginResp); err != nil || loginResp.Token == "" {
-		t.Fatalf("bad login response: %v %s", err, w.Body.String())
+	if _, err := JWTParse(tokB); err != nil {
+		t.Fatalf("JWTParse after rotation: %v", err)
 	}
 
-	// 轮换后签发的 token 必须仍被自家中间件接受。
-	w2 := ut.PerformRequest(h.Engine, "GET", "/protected", nil, ut.Header{
-		Key: "Authorization", Value: "Bearer " + loginResp.Token,
-	})
-	if w2.Code != 200 {
-		t.Errorf("轮换 secret 后自签 token 被自家中间件拒绝: got %d (want 200) body=%s",
-			w2.Code, w2.Body.String())
+	// 轮换后构造的新实例用 B 验签：B 签 token 放行。
+	if code := probeJWTStatus(t, mwB, "/protected", tokB); code != 200 {
+		t.Errorf("轮换后新实例拒绝 B 签 token: got %d, want 200", code)
+	}
+
+	// ⚠️ 已注册实例不被覆写（#139 核心隔离）：A 实例仍验 A 的密钥。
+	if code := probeJWTStatus(t, mwA, "/protected", tokB); code != 401 {
+		t.Errorf("★ 轮换覆写了已注册实例的验签密钥: got %d, want 401（#139）", code)
+	}
+	tokA := mustSignToken(t, secretA, "HS256", jwt.MapClaims{"user_id": "alice"})
+	if code := probeJWTStatus(t, mwA, "/protected", tokA); code != 200 {
+		t.Errorf("A 实例拒绝 A 签 token: got %d, want 200", code)
 	}
 }
 
-// TestJWTAuth_AlgorithmChangeKeepsSignAndVerifyConsistent 同型缺陷：
-// 换签名算法（HS256 → HS512）后，签发用新算法、验签用旧算法 ⇒
-// 解析直接失败（"invalid signing algorithm"）。
-func TestJWTAuth_AlgorithmChangeKeepsSignAndVerifyConsistent(t *testing.T) {
+// TestJWTAuth_AlgorithmChangeReplacesSigningDefaultOnly 同型（#139）：换签名
+// 算法只更新全局签发缺省；已注册实例的算法快照冻结（旧实例仍按注册时的
+// HS256 验签，新实例按 HS512）。
+func TestJWTAuth_AlgorithmChangeReplacesSigningDefaultOnly(t *testing.T) {
 	resetJWTState()
 
 	const secret = "secret-at-least-32-bytes-long-for-hs256-alg-xyz"
 
-	h := server.New(
-		server.WithHostPorts("127.0.0.1:0"),
-		server.WithDisablePrintRoute(true),
-	)
-	h.POST("/login", func(_ context.Context, c *app.RequestContext) {
-		tok, err := JWTGenerateToken(jwt.MapClaims{"user_id": "bob"})
-		if err != nil {
-			c.JSON(500, map[string]string{"err": err.Error()})
-			return
-		}
-		c.JSON(200, map[string]string{"token": tok})
-	})
-	protected := JWTAuth(WithJWTSecret([]byte(secret)))
-	h.GET("/protected", protected, func(_ context.Context, c *app.RequestContext) {
-		c.JSON(200, map[string]string{"ok": "true"})
-	})
+	mwHS256 := JWTAuth(WithJWTSecret([]byte(secret)))
+	mwHS512 := JWTAuth(WithJWTSecret([]byte(secret)), WithJWTAlgorithm("HS512"))
 
-	// 换签名算法。
-	_ = JWTAuth(WithJWTSecret([]byte(secret)), WithJWTAlgorithm("HS512"))
-
-	w := ut.PerformRequest(h.Engine, "POST", "/login", nil)
-	if w.Code != 200 {
-		t.Fatalf("login failed: %d %s", w.Code, w.Body.String())
+	// 全局签发缺省 = HS512：JWTGenerateToken/JWTParse 都走新算法。
+	tok512, err := JWTGenerateToken(jwt.MapClaims{"user_id": "bob"})
+	if err != nil {
+		t.Fatalf("JWTGenerateToken after algorithm change: %v", err)
 	}
-	var loginResp struct {
-		Token string `json:"token"`
-	}
-	if err := json.Unmarshal(w.Body.Bytes(), &loginResp); err != nil || loginResp.Token == "" {
-		t.Fatalf("bad login response: %v %s", err, w.Body.String())
+	if _, err := JWTParse(tok512); err != nil {
+		t.Fatalf("JWTParse after algorithm change: %v", err)
 	}
 
-	w2 := ut.PerformRequest(h.Engine, "GET", "/protected", nil, ut.Header{
-		Key: "Authorization", Value: "Bearer " + loginResp.Token,
-	})
-	if w2.Code != 200 {
-		t.Errorf("换算法后自签 token 被自家中间件拒绝: got %d (want 200) body=%s",
-			w2.Code, w2.Body.String())
+	// 新实例（HS512）接受 HS512 token；旧实例（HS256 快照冻结）拒绝。
+	if code := probeJWTStatus(t, mwHS512, "/protected", tok512); code != 200 {
+		t.Errorf("HS512 实例拒绝 HS512 token: got %d, want 200", code)
+	}
+	if code := probeJWTStatus(t, mwHS256, "/protected", tok512); code != 401 {
+		t.Errorf("★ 换算法覆写了已注册实例: got %d, want 401（#139）", code)
 	}
 
-	// JWTParse 也必须能用新算法解析（同一 runtime）。
-	if _, err := JWTParse(loginResp.Token); err != nil {
-		t.Errorf("JWTParse 换算法后失败: %v", err)
+	// 旧实例仍接受自己算法签的 token。
+	tok256 := mustSignToken(t, secret, "HS256", jwt.MapClaims{"user_id": "bob"})
+	if code := probeJWTStatus(t, mwHS256, "/protected", tok256); code != 200 {
+		t.Errorf("HS256 实例拒绝 HS256 token: got %d, want 200", code)
 	}
 }
 
