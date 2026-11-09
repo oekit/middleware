@@ -33,6 +33,10 @@ type TrustedClaims struct {
 	// 时注入）。区分「中间件未注册」（ClaimsFrom 返回 ok=false）与
 	// 「已解析、身份为匿名」（本字段为 true）。
 	Anonymous bool
+	// Rewritten 身份在本次请求内已被 OverrideTrustedClaims 可信覆写（#136）。
+	// 审计/运维可据此辨识「这请求的身份被路由级改写过」；同时它是覆写口
+	// 的单向闸——已置位的 claims 拒绝再次覆写（防链内多方互相覆盖）。
+	Rewritten bool
 }
 
 // TrustedMissingPolicy 决定身份头缺失（UserIDHeader 无值）时的行为。
@@ -138,6 +142,11 @@ func resolveTrustedIdentityConfig(cfg TrustedIdentityConfig) *resolvedTrustedIde
 // （非导出结构体类型，杜绝键碰撞）。
 type trustedClaimsCtxKey struct{}
 
+// trustedIdentityCfgKey 是解析后的身份配置在标准 context.Context 中的键
+// （与 claims 由 TrustedHeadersIdentity 成对注入，OverrideTrustedClaims
+// 据此重算 IsAdmin）。
+type trustedIdentityCfgKey struct{}
+
 // trustedClaimsRequestKey 是 claims 在 Hertz RequestContext kv 中的键。
 const trustedClaimsRequestKey = "oekit_trusted_claims"
 
@@ -178,6 +187,13 @@ const trustedClaimsRequestKey = "oekit_trusted_claims"
 //	}))
 //	// handler 侧零样板：
 //	claims, ok := mw.ClaimsFrom(ctx) // → {UserID, Username, IsAdmin}
+//
+// # 路由级可信覆写（#136）
+//
+// 「路由级中间件改写身份」的形态（API key 归属人注入、内部服务系统身份、
+// 测试桩固定身份、多租户网关二级改写）经 OverrideTrustedClaims 与本中间件
+// 的全局单点解析共存：入口解析的 claims（含 skip_auth 路径被伪造头污染的）
+// 可被路由级中间件在身份链之后整体覆写，下游 scope 逻辑零改动。
 func TrustedHeadersIdentity(cfg TrustedIdentityConfig) app.HandlerFunc {
 	r := resolveTrustedIdentityConfig(cfg) // 启动期解析一次
 
@@ -187,8 +203,10 @@ func TrustedHeadersIdentity(cfg TrustedIdentityConfig) app.HandlerFunc {
 			return // 响应已写（401）并 Abort
 		}
 		// 单次解析、多处读取：标准 ctx（service 层/handler 的 ctx 参数）与
-		// RequestContext kv（只持有 c 的辅助函数）双写。
+		// RequestContext kv（只持有 c 的辅助函数）双写。解析配置随 ctx 注入
+		// （OverrideTrustedClaims 重算 IsAdmin 用）。
 		ctx = context.WithValue(ctx, trustedClaimsCtxKey{}, claims)
+		ctx = context.WithValue(ctx, trustedIdentityCfgKey{}, r)
 		c.Set(trustedClaimsRequestKey, claims)
 		c.Next(ctx)
 	}
@@ -290,4 +308,88 @@ func ClaimsFromRequestContext(c *app.RequestContext) (TrustedClaims, bool) {
 	}
 	claims, ok := v.(TrustedClaims)
 	return claims, ok
+}
+
+// OverrideTrustedClaims 以可信身份覆写当前请求的 claims（#136）：路由级
+// 中间件在 TrustedHeadersIdentity 身份链**之后**改写身份，与全局单点解析
+// 共存。没有覆写口时，伪造头在入口已被解析进 claims，路由级 strip-then-
+// inject 发生在解析之后——claims 里留下的仍是伪造身份；有覆写口，claims
+// 被整体替换，下游 scope 逻辑零改动。典型场景：
+//
+//   - API key 归属人注入（octopus /api/v2/ext/* 形态）：skip_auth 路径客户端
+//     可伪造 X-Auth-* 头，必须先清场再注入 key 归属人身份；
+//   - 内部服务间调用注入系统身份；
+//   - 测试桩注入固定身份；
+//   - 多租户网关二级改写。
+//
+// 返回更新后的 ctx（**必须**继续传给 c.Next，后续 handler 经 ClaimsFrom 读到
+// 覆写结果）与是否覆写成功。
+//
+// # 契约
+//
+//   - 同 key 写回：标准 ctx（context.WithValue）与 RequestContext kv 同步
+//     双写，ClaimsFrom 与 ClaimsFromRequestContext 读到同一份，覆写仅对
+//     本请求后续 handler 可见。
+//   - 单向闸：仅允许覆写一次——当前 claims 已带 Rewritten=true 时拒绝本次
+//     覆写并 Warn（防链内多方互相覆盖；保留第一次覆写结果，调用方可据
+//     ok=false 自行处置）。
+//   - 需已注册身份链：ctx 中无 TrustedHeadersIdentity 注入的 claims 时拒绝
+//     （覆写口不凭空造身份——绕过 Missing/BadRoles 等解析策略的口子不开）。
+//   - IsAdmin 按启动期口径重算：以 TrustedIdentityConfig 的 AdminRoles /
+//     RoleMatcher 对覆写后的 Roles 重新判定，调用方传入的 IsAdmin 不被
+//     采信——覆写口不提供绕过 admin 口径的通道。
+//   - 清场（strip-then-inject 的 strip 半场）：覆写同时剥离请求中的身份头
+//     （UserIDHeader/UsernameHeader/RolesHeader）——入站伪造头对下游任何
+//     直接读头的代码不可见，身份只来自本次注入。
+//   - 审计标记：覆写后的 claims.Rewritten=true，随双写出口可读。
+//
+// 用法（API key 归属人注入）：
+//
+//	func APIKeyAuth() app.HandlerFunc {
+//	    return func(ctx context.Context, c *app.RequestContext) {
+//	        owner := authOwnerByAPIKey(c) // 校验 key 并查归属人
+//	        if owner == nil {
+//	            mw.ErrorResp(c, 401, "unauthorized")
+//	            return
+//	        }
+//	        ctx, ok := mw.OverrideTrustedClaims(ctx, c, mw.TrustedClaims{
+//	            UserID:   owner.ID,
+//	            Username: owner.Name,
+//	            Roles:    owner.Roles,
+//	        })
+//	        if !ok {
+//	            mw.ErrorResp(c, 401, "unauthorized")
+//	            return
+//	        }
+//	        c.Next(ctx)
+//	    }
+//	}
+func OverrideTrustedClaims(ctx context.Context, c *app.RequestContext, claims TrustedClaims) (context.Context, bool) {
+	cur, ok := ClaimsFrom(ctx)
+	if !ok {
+		// 未注册 TrustedHeadersIdentity：覆写口不凭空造身份（fail-closed）。
+		identityLog.CtxWarn(ctx, "trusted claims override rejected: identity middleware not registered",
+			"path", string(c.Path()))
+		return ctx, false
+	}
+	if cur.Rewritten {
+		// 单向闸：仅允许覆写一次，防链内多方互相覆盖。
+		identityLog.CtxWarn(ctx, "trusted claims override rejected: already overridden",
+			"path", string(c.Path()), "user_id", cur.UserID)
+		return ctx, false
+	}
+
+	// 解析配置与 claims 成对注入；据此重算 IsAdmin（启动期口径，覆写口
+	// 不提供绕过 admin 判定的通道）并剥离身份头（清场）。
+	if cfg, ok := ctx.Value(trustedIdentityCfgKey{}).(*resolvedTrustedIdentityConfig); ok && cfg != nil {
+		claims.IsAdmin = cfg.matchAdmin(claims.Roles)
+		c.Request.Header.Del(cfg.userIDHeader)
+		c.Request.Header.Del(cfg.usernameHeader)
+		c.Request.Header.Del(cfg.rolesHeader)
+	}
+	claims.Rewritten = true
+	// 同 key 写回：标准 ctx 与 RequestContext kv 同步双写（与注入侧一致）。
+	ctx = context.WithValue(ctx, trustedClaimsCtxKey{}, claims)
+	c.Set(trustedClaimsRequestKey, claims)
+	return ctx, true
 }
