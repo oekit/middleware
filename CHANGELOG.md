@@ -2,6 +2,8 @@
 
 ## [v0.16.2] — 2026-11-11
 
+- build: 依赖地板对齐——github.com/oekit/registry v0.5.14（发版 train 检查面 G 拦下旧地板后抬升）。
+
 - fix(chainmw): AccessLog SkipPaths 构造期预检 glob 语法——坏 pattern 构造期 panic（fail-fast，同 SheddingMiddleware 姿势），不再被宽松 matcher 静默吞成「不匹配」让「不落日志」的路径恢复落日志（含 token 段）且零信号（#161）
 
 关联问题单：oekit/middleware#161。
