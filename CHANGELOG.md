@@ -1,5 +1,11 @@
 
 
+## [Unreleased] — 未发版
+
+- fix(chainmw): AccessLog SkipPaths 构造期预检 glob 语法——坏 pattern 构造期 panic（fail-fast，同 SheddingMiddleware 姿势），不再被宽松 matcher 静默吞成「不匹配」让「不落日志」的路径恢复落日志（含 token 段）且零信号（#161）
+
+关联问题单：oekit/middleware#161。
+
 ## [v0.16.1] — 2026-11-11
 
 - - build: 依赖地板对齐（floor sync，无代码变更）
