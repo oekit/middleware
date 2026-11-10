@@ -1,5 +1,9 @@
 
 
+## [v0.15.1] — 2026-11-10
+
+- - build: 依赖地板对齐（floor sync，无代码变更）
+
 ## [v0.15.0] — 2026-11-10
 
 - - feat(identity): OverrideTrustedClaims 可信覆写口——strip-then-inject 与全局解析共存，单向闸+Admin 重算+身份头剥离（#136）
