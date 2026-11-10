@@ -6,6 +6,10 @@
 
 关联问题单：oekit/middleware#161。
 
+- docs(auth): BearerTokenOptions.SubjectExtractor 字段注释订正为「默认不读任何请求头（UserID 为空）」——与 v0.28.1 安全修复后的实现及同文件其余 3 处文档口径一致，不再推荐已移除的 X-User-Id 冒充形态（#164）
+
+关联问题单：oekit/middleware#164。
+
 ## [v0.16.1] — 2026-11-11
 
 - - build: 依赖地板对齐（floor sync，无代码变更）

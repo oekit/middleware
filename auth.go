@@ -80,7 +80,10 @@ type BearerTokenOptions struct {
 	Authorizer Authorizer
 
 	// SubjectExtractor 从 RequestContext 提取 Subject 传给 Authorizer。
-	// 默认:从 X-User-Id header 读,Method/Path 自动设置。
+	// 默认不读任何请求头(UserID 为空),Method/Path 自动设置——X-User-Id 是
+	// 客户端完全可控的请求头,默认读它等于把鉴权粒度交给攻击者(v0.28.1 安全
+	// 修复已移除该默认);仅可在网关已剥离该头的内网场景经 WithAuthSubject-
+	// Extractor 显式注入提取逻辑(口径同 Subject 类型注释)。
 	SubjectExtractor SubjectExtractor
 }
 
