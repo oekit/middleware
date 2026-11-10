@@ -21,9 +21,9 @@ require (
 	github.com/hertz-contrib/reverseproxy v1.0.6
 	github.com/hertz-contrib/sessions v1.0.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
-	github.com/oekit/concurrency v0.31.1
-	github.com/oekit/logx v0.9.0
-	github.com/oekit/metrics v0.2.1
+	github.com/oekit/concurrency v0.31.2
+	github.com/oekit/logx v0.9.1
+	github.com/oekit/metrics v0.2.2
 	github.com/oekit/registry v0.5.12
 	github.com/oekit/tracing v0.3.9
 	github.com/prometheus/client_golang v1.25.0
