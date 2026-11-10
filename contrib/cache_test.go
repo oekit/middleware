@@ -643,3 +643,265 @@ func TestCache_IgnoreQueryOrderWithAuthSuffix(t *testing.T) {
 		t.Fatalf("★ 归一化 key = %q 不在记录中, got %v", want, store.Keys())
 	}
 }
+
+// idKeySuffix 计算默认 key 的身份头后缀（与 defaultCacheStrategy/
+// cacheIdentityHash 同口径）：全部非空头值按 "name=value\n" 规范拼接后
+// SHA-256 前 8 字节的 hex（16 字符）。pairs 按请求头出现顺序给出。
+func idKeySuffix(t *testing.T, pairs ...[2]string) string {
+	t.Helper()
+	var b strings.Builder
+	for _, p := range pairs {
+		if p[1] == "" {
+			continue
+		}
+		b.WriteString(p[0])
+		b.WriteByte('=')
+		b.WriteString(p[1])
+		b.WriteByte('\n')
+	}
+	if b.Len() == 0 {
+		return ""
+	}
+	sum := sha256.Sum256([]byte(b.String()))
+	return "|id:" + hex.EncodeToString(sum[:8])
+}
+
+// TestCache_AuthIdentityHeadersScopeKey middleware#142 核心回归（issue 原
+// 复现场景）：trusted-gateway 身份形态——请求带 X-Auth-User-ID 而无
+// Authorization/Cookie。修复前默认 key=RequestURI 不含身份维度，userA 的
+// 响应被 userB 命中（缓存串答，跨用户共享私有响应）。修复后 key 并入身份
+// 头哈希（|id:<hash>），不同网关用户各自持有条目；同一用户重复请求命中
+// 自己的条目。
+func TestCache_AuthIdentityHeadersScopeKey(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/whoami", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
+		func(ctx context.Context, c *app.RequestContext) {
+			n := count.Add(1)
+			c.JSON(200, map[string]string{
+				"call":       fmt.Sprint(n),
+				"served_for": string(c.Request.Header.Peek("X-Auth-User-ID")),
+			})
+		})
+
+	// A 首次：miss → handler 执行 → 写入身份隔离条目。
+	w := ut.PerformRequest(h.Engine, "GET", "/whoami", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "userA"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"served_for":"userA"`) {
+		t.Fatalf("A first: code=%d body=%s", w.Code, w.Body.String())
+	}
+	keyA := "ekit/whoami" + idKeySuffix(t, [2]string{"X-Auth-User-ID", "userA"})
+	if !containsKey(store.Keys(), keyA) {
+		t.Fatalf("★ A 的请求必须写入身份隔离 key %q, got %v", keyA, store.Keys())
+	}
+
+	// B 首次：同 URI、不同网关用户 ⇒ 不得命中 A 的缓存（issue 复现断言）。
+	w = ut.PerformRequest(h.Engine, "GET", "/whoami", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "userB"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"served_for":"userB"`) ||
+		!strings.Contains(w.Body.String(), `"call":"2"`) {
+		t.Fatalf("★ userB 被投喂 userA 的缓存响应（middleware#142 跨用户串答）: code=%d body=%s",
+			w.Code, w.Body.String())
+	}
+	keyB := "ekit/whoami" + idKeySuffix(t, [2]string{"X-Auth-User-ID", "userB"})
+	if !containsKey(store.Keys(), keyB) {
+		t.Fatalf("★ B 的请求必须写入独立 key %q, got %v", keyB, store.Keys())
+	}
+	if got := count.Load(); got != 2 {
+		t.Fatalf("B 首次请求必须真实执行 handler: ran %d times, want 2", got)
+	}
+
+	// B 二次：命中自己的条目（不再执行 handler）。
+	w = ut.PerformRequest(h.Engine, "GET", "/whoami", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "userB"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"call":"2"`) {
+		t.Fatalf("B second (cache hit): code=%d body=%s", w.Code, w.Body.String())
+	}
+	if got := count.Load(); got != 2 {
+		t.Fatalf("B 二次请求应命中缓存: handler ran %d times, want 2", got)
+	}
+
+	// 无身份维度的裸 URI key 不得出现（那是跨用户共享的老默认）。
+	if containsKey(store.Keys(), "ekit/whoami") {
+		t.Fatalf("★ 带身份头请求不得落在无身份 key 上: %v", store.Keys())
+	}
+}
+
+// TestCache_ServiceTokenTopologyScopesIdentity middleware#142 复现形态 3：
+// 「网关注入 X-Auth-* 而服务以单一共享 service token 认证」拓扑——
+// Authorization 哈希相同，身份头不同 ⇒ 必须不同条目。修复前两类请求同键
+// （auth 哈希相同 + key 无身份头维度），跨用户共享。
+func TestCache_ServiceTokenTopologyScopesIdentity(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/svc", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
+		func(ctx context.Context, c *app.RequestContext) {
+			n := count.Add(1)
+			c.JSON(200, map[string]string{
+				"run":       fmt.Sprint(n),
+				"auth_user": string(c.Request.Header.Peek("X-Auth-User-ID")),
+			})
+		})
+
+	// 同一共享 service token、两个不同的网关用户。
+	auth := ut.Header{Key: "Authorization", Value: "Bearer shared-service-token"}
+	w := ut.PerformRequest(h.Engine, "GET", "/svc", nil, auth,
+		ut.Header{Key: "X-Auth-User-ID", Value: "userA"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"auth_user":"userA"`) {
+		t.Fatalf("A first: code=%d body=%s", w.Code, w.Body.String())
+	}
+	w = ut.PerformRequest(h.Engine, "GET", "/svc", nil, auth,
+		ut.Header{Key: "X-Auth-User-ID", Value: "userB"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"auth_user":"userB"`) ||
+		!strings.Contains(w.Body.String(), `"run":"2"`) {
+		t.Fatalf("★ 同 service token 不同身份头共享了缓存条目（middleware#142 形态 3）: code=%d body=%s",
+			w.Code, w.Body.String())
+	}
+
+	// key 必须同时含 auth 与 id 两类后缀（独立叠加）。
+	authSuffix := authKeySuffix("Bearer shared-service-token")
+	keyA := "ekit/svc" + authSuffix + idKeySuffix(t, [2]string{"X-Auth-User-ID", "userA"})
+	keyB := "ekit/svc" + authSuffix + idKeySuffix(t, [2]string{"X-Auth-User-ID", "userB"})
+	for _, want := range []string{keyA, keyB} {
+		if !containsKey(store.Keys(), want) {
+			t.Fatalf("★ 缺少身份隔离 key %q, got %v", want, store.Keys())
+		}
+	}
+}
+
+// TestCache_IdentityHeaderWithCookieScopedCache middleware#142 守卫语义：
+// Cookie + X-Auth-* 请求存在稳定可哈希的身份维度 ⇒ 照常缓存且按身份隔离
+// （不同于「仅 Cookie 无身份维度」的放行不缓存——见
+// TestCache_SkipsAuthenticatedRequests）。两个带 Cookie 的不同用户不得
+// 共享条目。
+func TestCache_IdentityHeaderWithCookieScopedCache(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/mix", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
+		func(ctx context.Context, c *app.RequestContext) {
+			n := count.Add(1)
+			c.Header("Set-Cookie", "session=user-"+string(c.Request.Header.Peek("X-Auth-User-ID")))
+			c.JSON(200, map[string]string{"run": fmt.Sprint(n)})
+		})
+
+	// userA 带 Cookie 两次：同一身份 ⇒ 第二次命中缓存。
+	for i := 0; i < 2; i++ {
+		ut.PerformRequest(h.Engine, "GET", "/mix", nil,
+			ut.Header{Key: "Cookie", Value: "sid=a"},
+			ut.Header{Key: "X-Auth-User-ID", Value: "userA"})
+	}
+	if got := count.Load(); got != 1 {
+		t.Fatalf("★ 同身份+Cookie 请求应命中缓存: handler ran %d times, want 1", got)
+	}
+	// userB 带 Cookie：不得命中 A 的条目。
+	w := ut.PerformRequest(h.Engine, "GET", "/mix", nil,
+		ut.Header{Key: "Cookie", Value: "sid=b"},
+		ut.Header{Key: "X-Auth-User-ID", Value: "userB"})
+	if w.Code != 200 || !strings.Contains(w.Body.String(), `"run":"2"`) {
+		t.Fatalf("★ userB 命中了 userA 的缓存条目: code=%d body=%s", w.Code, w.Body.String())
+	}
+	// key 均含身份后缀。
+	if !containsKey(store.Keys(), "ekit/mix"+idKeySuffix(t, [2]string{"X-Auth-User-ID", "userA"})) ||
+		!containsKey(store.Keys(), "ekit/mix"+idKeySuffix(t, [2]string{"X-Auth-User-ID", "userB"})) {
+		t.Fatalf("★ Cookie+身份头请求必须落在身份隔离 key 上: %v", store.Keys())
+	}
+}
+
+// TestCache_WithCacheIdentityHeadersCustom middleware#142 可配置性：网关以
+// 非缺省头名（X-Tenant-ID）注入身份时，经 WithCacheIdentityHeaders 覆盖
+// 清单后同样按身份隔离；覆盖后缺省 X-Auth-* 头不再参与 key（显式清单是
+// 完整声明）。
+func TestCache_WithCacheIdentityHeadersCustom(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/t", Cache(
+		WithCacheStore(store),
+		WithCacheExpiration(time.Minute),
+		WithCacheIdentityHeaders("X-Tenant-ID"),
+	), func(ctx context.Context, c *app.RequestContext) {
+		count.Add(1)
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+
+	// 不同 X-Tenant-ID ⇒ 不同条目。
+	ut.PerformRequest(h.Engine, "GET", "/t", nil, ut.Header{Key: "X-Tenant-ID", Value: "t1"})
+	w := ut.PerformRequest(h.Engine, "GET", "/t", nil, ut.Header{Key: "X-Tenant-ID", Value: "t2"})
+	if w.Code != 200 {
+		t.Fatalf("t2 first: code=%d", w.Code)
+	}
+	if got := count.Load(); got != 2 {
+		t.Fatalf("★ 不同租户共享了缓存条目: handler ran %d times, want 2", got)
+	}
+	if !containsKey(store.Keys(), "ekit/t"+idKeySuffix(t, [2]string{"X-Tenant-ID", "t1"})) ||
+		!containsKey(store.Keys(), "ekit/t"+idKeySuffix(t, [2]string{"X-Tenant-ID", "t2"})) {
+		t.Fatalf("★ 自定义身份头必须参与 key: %v", store.Keys())
+	}
+
+	// 同一租户二次请求：命中自己的条目。
+	ut.PerformRequest(h.Engine, "GET", "/t", nil, ut.Header{Key: "X-Tenant-ID", Value: "t1"})
+	if got := count.Load(); got != 2 {
+		t.Fatalf("同租户二次请求应命中缓存: handler ran %d times, want 2", got)
+	}
+
+	// 覆盖后缺省 X-Auth-* 不再参与 key：两个不同 X-Auth-User-ID 命中同一
+	// （租户维度缺失 ⇒ 匿名口径的纯 URI key）条目。
+	ut.PerformRequest(h.Engine, "GET", "/t", nil, ut.Header{Key: "X-Auth-User-ID", Value: "u1"})
+	ut.PerformRequest(h.Engine, "GET", "/t", nil, ut.Header{Key: "X-Auth-User-ID", Value: "u2"})
+	if got := count.Load(); got != 3 {
+		t.Fatalf("覆盖清单后 X-Auth-* 不参与 key（u1/u2 应命中同一匿名条目）: handler ran %d times, want 3", got)
+	}
+}
+
+// TestCache_IdentityHeadersEmptyValueNotAnIdentity middleware#142 边界：
+// 身份头存在但值为空 ⇒ 对身份零贡献（与 identity.go 缺头口径一致）。
+// 此时请求仍属「无稳定身份维度」，带 Cookie 时必须被守卫放行不缓存
+// （不得落在纯 RequestURI key 上）。
+func TestCache_IdentityHeadersEmptyValueNotAnIdentity(t *testing.T) {
+	resetCacheState()
+	store := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var count atomic.Int32
+	h.GET("/edge", Cache(WithCacheStore(store), WithCacheExpiration(time.Minute)),
+		func(ctx context.Context, c *app.RequestContext) {
+			count.Add(1)
+			c.JSON(200, map[string]string{"v": "1"})
+		})
+
+	for i := 0; i < 2; i++ {
+		w := ut.PerformRequest(h.Engine, "GET", "/edge", nil,
+			ut.Header{Key: "Cookie", Value: "sid=1"},
+			ut.Header{Key: "X-Auth-User-ID", Value: ""})
+		if w.Code != 200 {
+			t.Fatalf("req %d: code=%d", i, w.Code)
+		}
+	}
+	if got := count.Load(); got != 2 {
+		t.Fatalf("★ 空身份头+Cookie 必须按无身份维度放行不缓存: handler ran %d times, want 2", got)
+	}
+	if n := len(store.Keys()); n != 0 {
+		t.Fatalf("★ store 不得出现任何 key, got %v", store.Keys())
+	}
+}
