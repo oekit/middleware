@@ -1,6 +1,6 @@
 
 
-## [Unreleased] — 未发版
+## [v0.16.2] — 2026-11-11
 
 - fix(chainmw): AccessLog SkipPaths 构造期预检 glob 语法——坏 pattern 构造期 panic（fail-fast，同 SheddingMiddleware 姿势），不再被宽松 matcher 静默吞成「不匹配」让「不落日志」的路径恢复落日志（含 token 段）且零信号（#161）
 
@@ -9,6 +9,8 @@
 - docs(auth): BearerTokenOptions.SubjectExtractor 字段注释订正为「默认不读任何请求头（UserID 为空）」——与 v0.28.1 安全修复后的实现及同文件其余 3 处文档口径一致，不再推荐已移除的 X-User-Id 冒充形态（#164）
 
 关联问题单：oekit/middleware#164。
+
+- chore: #142（contrib/cache 默认 CacheKey 身份维度）核实已由 v0.16.0（0990384）修复、5 个回归测试全绿，本版无 #142 代码变更。
 
 ## [v0.16.1] — 2026-11-11
 
