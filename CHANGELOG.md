@@ -1,5 +1,9 @@
 
 
+## [v0.16.1] — 2026-11-11
+
+- - build: 依赖地板对齐（floor sync，无代码变更）
+
 ## [v0.16.0] — 2026-11-10
 
 - - feat: AuditLog 审计日志一等中间件——who/what/when/outcome 结构化事件、AuditSink/BatchedSink 缓冲落库、显式声明制审计面（#141）
