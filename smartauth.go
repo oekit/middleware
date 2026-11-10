@@ -128,7 +128,7 @@ type GatewayTrust struct {
 	// HeaderNames 信任头名集合，零值取 DefaultTrustHeaderNames。
 	HeaderNames TrustHeaderNames
 	// TrustedSources 来源立证的内网网段（netip.Prefix）。回环地址恒可信
-	//（网关/边车同机形态），无须列入。IPv4/IPv6 前缀均可。
+	// （网关/边车同机形态），无须列入。IPv4/IPv6 前缀均可。
 	TrustedSources []netip.Prefix
 }
 
@@ -182,10 +182,10 @@ func GatewaySign(t GatewayTrust, c *app.RequestContext) (string, error) {
 		return "", errors.New("mw: GatewaySign: empty secret")
 	}
 	n := t.headerNames()
-	if string(c.GetHeader(n.UID)) == "" {
+	if len(c.GetHeader(n.UID)) == 0 {
 		return "", errors.New("mw: GatewaySign: missing uid header")
 	}
-	if string(c.GetHeader(n.Timestamp)) == "" {
+	if len(c.GetHeader(n.Timestamp)) == 0 {
 		return "", errors.New("mw: GatewaySign: missing timestamp header")
 	}
 	mac := hmac.New(sha256.New, t.Secret)
