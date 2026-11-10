@@ -18,6 +18,7 @@ package chainmw
 import (
 	"context"
 	"fmt"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -101,6 +102,10 @@ func WithLogFields(fn func(ctx context.Context, req any, rec AccessRecord) []any
 
 // WithSkipPaths 设置跳过记录的 Operation 模式列表（支持 glob，按原始值
 // 匹配、不受脱敏影响；http 侧即请求 PATH，如 "/metrics"、"/internal/**"）。
+// 非法 pattern（filepath.ErrBadPattern）在 AccessLog 构造期 panic（fail-fast，
+// #161）——匹配走的 pathx.MatchesPath 是宽松档，把 ErrBadPattern 吞成
+// 「不匹配」：坏 glob 静默永不命中，「不落日志」的路径恢复落日志（含 token
+// 段）且零信号。判据失效必须可区分，误配在启动期炸响而非运行期无声。
 // 匹配走 pathx.MatchesPath（filepath.Match 语义 + "/**" 目录前缀分支）：
 // `*` 是**单段**通配符，不跨 "/"——"/internal/*" 只命中一层直接子路径，
 // 不命中 "/internal/db/query" 等嵌套路径；整棵子树用 "/internal/**"（#127，
@@ -180,6 +185,15 @@ func AccessLog(opts ...AccessLogOption) chain.Middleware {
 	cfg := &accessLogConfig{logger: accessLog, message: "access"}
 	for _, opt := range opts {
 		opt(cfg)
+	}
+	// 构造期预检 SkipPaths glob 语法（#161，fail-fast，同 SheddingMiddleware
+	// 阈值越界/RateLimit 缺配置 panic 的姿势）：pathx.MatchesPath 宽松档把
+	// filepath.ErrBadPattern 吞成「不匹配」，一个坏 pattern 会让全部跳过判据
+	// 静默失效——「不落日志」的路径恢复落日志（含原始 token 段）且零信号。
+	for _, p := range cfg.skip {
+		if _, err := filepath.Match(p, ""); err != nil {
+			panic(fmt.Sprintf("chainmw.AccessLog: invalid SkipPaths glob pattern %q: %v", p, err))
+		}
 	}
 	logger := cfg.logger
 	return func(next chain.Handler) chain.Handler {

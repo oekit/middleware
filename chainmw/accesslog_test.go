@@ -436,6 +436,39 @@ func TestAccessLogPanicRecord(t *testing.T) {
 	}
 }
 
+// TestAccessLogSkipPathsBadGlobFailsFast middleware#161：SkipPaths 的坏 glob
+// （非法 pattern）必须留下信号——构造期 fail-fast（panic，同 SheddingMiddleware
+// 阈值越界的姿势），不得静默吞掉。pathx.MatchesPath 把 filepath.ErrBadPattern
+// 吞成「不匹配」（宽松档 fail-open）：一个 "/alert-[[" 手误 pattern 会让
+// 「不落日志」的路径全部恢复落日志（含原始 token 段），且零信号。
+func TestAccessLogSkipPathsBadGlobFailsFast(t *testing.T) {
+	defer func() {
+		r := recover()
+		if r == nil {
+			t.Fatal(`★ 坏 glob（非法 pattern "/alert-[["）行为必须有信号（构造期 panic）——当前静默吞掉：SkipPaths 永不命中，「不落日志」的路径恢复落日志（含 token 段）且零信号（middleware#161）`)
+		}
+		msg := fmt.Sprint(r)
+		if !strings.Contains(msg, "/alert-[[") {
+			t.Fatalf("信号应点名坏 pattern（便于定位配置错误），got: %v", r)
+		}
+	}()
+	_ = AccessLog(WithSkipPaths("/metrics", "/alert-[["))
+}
+
+// TestAccessLogSkipPathsValidGlobsAccepted #161 对照组：合法 glob（含 "/**"
+// 目录前缀形态）不得被误伤，照常构造。
+func TestAccessLogSkipPathsValidGlobsAccepted(t *testing.T) {
+	for _, patterns := range [][]string{
+		{"/metrics", "/health*", "/internal/**"},
+		{"/api/v2/webhook/alert/*"},
+		{"/exact/path"},
+	} {
+		if mw := AccessLog(WithSkipPaths(patterns...)); mw == nil {
+			t.Fatalf("合法 SkipPaths %v 应正常构造", patterns)
+		}
+	}
+}
+
 // TestAccessLogSilent 钉住 #38：静默下不写任何日志，但采集行为完全不变——
 // 脱敏、sink 调用照常。
 func TestAccessLogSilent(t *testing.T) {
