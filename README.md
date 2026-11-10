@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/middleware@v0.16.2
+go get github.com/oekit/middleware@v0.17.0
 ```
 
 ## 这个仓库做什么
@@ -20,7 +20,7 @@ go get github.com/oekit/middleware@v0.16.2
 
 | 包 | import 路径 | 做什么 |
 |---|---|---|
-| `mw`（模块根包） | `github.com/oekit/middleware` | `DefaultMiddleware` 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制；`DisableResponseWrap` 响应自管形态、`AccessLogOptions` 透传落库 sink）；`MinimalMiddleware` 最小安全栈（TraceID → Recovery）；另有 Prometheus 指标/RateLimit/BearerTokenAuth/I18n/Fail/Shedding 等 |
+| `mw`（模块根包） | `github.com/oekit/middleware` | `DefaultMiddleware` 一键标准栈：TraceID → Recovery → Response → AccessLog（零指标强制；`DisableResponseWrap` 响应自管形态、`AccessLogOptions` 透传落库 sink）；`MinimalMiddleware` 最小安全栈（TraceID → Recovery）；另有 Prometheus 指标/RateLimit/BearerTokenAuth/SmartAuth+SmartRBAC 双模式认证鉴权/I18n/Fail/Shedding 等 |
 | `chainmw` | `github.com/oekit/middleware/chainmw` | transport 感知的框架无关中间件（core/chain 内核）：`AccessLog`/`Recovery`/`MetadataPropagate`——根包 mw 栈复用其内核（薄壳），kitex 经 ToKitex 桥接同步获得同等能力 |
 | `contrib` | `github.com/oekit/middleware/contrib` | hertz-contrib 桥接：JWT/Sessions/Swagger/CSRF/pprof/Debug/Gzip/ETag/BasicAuth/ReverseProxy/Sentinel/Lark |
 | `hmw` | `github.com/oekit/middleware/hmw` | requestid/trace_id 注入 RequestContext 与标准 context |
@@ -50,6 +50,37 @@ func getOrder(ctx context.Context, c *app.RequestContext) {
         return
     }
 }
+```
+
+### 双模式认证/鉴权（SmartAuth/SmartRBAC）
+
+网关集中鉴权 + 内网服务本地兜底的通用部署形态：**网关信任头立证**（HMAC-SHA256
+规范串 + 90s 时间窗 + 内网来源/网关签名双立证）vs **本地 JWT/RBAC 兜底**，两模式可
+切换（`AuthModeGatewayOnly`/`AuthModeLocalOnly`）可组合（`AuthModeAuto`）。信任模型
+的安全细节（规范串/时间窗/剥头防伪造）单点收编——立证失败、免认证路径、本地模式
+一律剥掉 `X-Auth-*` 信任头（头伪造面结构上关死，含防「加一行 `X-Auth-Authorized`
+跳过本地 RBAC」）。
+
+```go
+h.Use(mw.SmartAuth(
+    func(ctx context.Context, token string) (mw.Subject, error) { // 本地 JWT 校验缝
+        return kitxToSubject(ctx, token) // 与 kitx/jwt Parse 同形收窄，包一层即得
+    },
+    &mw.GatewayTrust{Secret: secret}, // 网关信任头立证（回环/TrustedSources 或签名）
+    mw.WithSmartAuthSkipPaths("/healthz"),
+))
+h.Use(mw.SmartRBAC(localRBAC)) // X-Auth-Authorized=1 网关已鉴权跳过，否则本地 RBAC 兜底
+
+// handler 侧零样板读身份（网关/本地两模式同一读取口）：
+claims, ok := mw.ClaimsFrom(ctx) // TrustedClaims（与 TrustedHeadersIdentity 同源）
+```
+
+网关注入侧与校验侧共用同一实现（规范串单点，杜绝两侧漂移）：
+
+```go
+c.Request.Header.Set("X-Auth-Timestamp", strconv.FormatInt(time.Now().Unix(), 10))
+sig, err := mw.GatewaySign(trust, c) // 身份头已注入后调用
+c.Request.Header.Set("X-Auth-Signature", sig)
 ```
 
 ### 适用边界：响应体自管的服务

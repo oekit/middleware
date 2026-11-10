@@ -28,6 +28,10 @@
 //     Allow 拒绝 → 503/body code 50300，放行按响应状态码回填 Promise）
 //   - BearerTokenAuth   — Bearer Token 认证（Authorizer 鉴权钩子；token 未配置
 //     且未 WithAuthDisabled 时构造期 panic，fail-fast）
+//   - SmartAuth / SmartRBAC — 双模式认证/鉴权（#169）：网关信任头立证
+//     （VerifyGatewayTrust——HMAC-SHA256 规范串 + 时间窗 + 剥头防伪造）vs
+//     本地 JWT/RBAC 兜底（JWTParseFunc 校验缝，与 kitx/jwt 同形），两模式可
+//     切换/组合；成功路径 Subject 注入 TrustedClaims（ClaimsFrom 同源读取）
 //   - TrustedHeadersIdentity — 信任网关已验签、解析注入身份头 → ctx claims
 //     （zeus X-Auth-* 形态；handler 侧 ClaimsFrom 零样板读身份）
 //   - I18n              — Accept-Language 国际化（LangFromCtx / Translate）

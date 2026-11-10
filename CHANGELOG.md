@@ -1,5 +1,14 @@
 
 
+## [v0.17.0] — 2026-11-11
+
+- feat(smartauth): SmartAuth 双模式认证中间件（#169）——网关信任头立证 vs 本地 JWT 兜底，两模式可切换（AuthModeGatewayOnly / AuthModeLocalOnly）可组合（AuthModeAuto：呈现网关立证验不过 401 不降级、未呈现落本地 JWT），下游 6 服务同款装配不再各自手搓信任模型。本地校验面 JWTParseFunc 与 kitx/jwt 的 Parse/ParseSymmetric/Manager.ParseTyped 同形收窄（token 进、Subject 出，业务 adapter 包一层即得）——依赖方向先查过 go.mod：middleware→kitx 并不存在，校验面经注入缝交付，两个模块都不新增依赖、不引反向依赖。
+- feat(smartauth): 网关信任头立证原语 TrustHeaderNames / GatewayTrust / VerifyGatewayTrust / GatewaySign / GatewayCanonical（#169）——HMAC-SHA256 规范串 `method\nuri\nuid\nusername\nroleIDs\nauthorized\nmcp\ntimestamp` + 90s 时间窗防重放 + 内网来源/网关签名双立证（回环恒信，TrustedSources 网段可配），网关侧 GatewaySign 与服务侧校验同一实现（规范串单点，杜绝两侧漂移）。**头伪造防护面**单点收编：立证失败/免认证路径/本地模式一律剥掉全部信任头（剥头防伪造——含 X-Auth-Authorized，「链上加一行头跳过本地 RBAC」的伪造路径关死，全部身份头进签名规范串）、多值信任头（头注入）按伪造 fail-closed、缺 UID 不立证、签名绑定 uid/uri/时间戳（换用户/换端点重放均失配）。失败即未认证并剥头。
+- feat(smartauth): SmartRBAC「网关已鉴权放行，否则本地 RBAC 兜底」（#169）——X-Auth-Authorized=1（GatewayAuthorizedValue，网关注入侧与判定侧同常量）跳过本地 RBAC，否则调本地 RBAC handler 兜底；部署前提（须防客户端伪造该头）写进契约：置于 SmartAuth 之后（立证失败已剥头）或网关保证剥同名头。认证成功 Subject 注入 TrustedClaims 双写出口（ClaimsFrom/ClaimsFromRequestContext 零样板，网关/本地两模式同一读取口），admin 判定与 TrustedHeadersIdentity 同源（resolveTrustedIdentityConfig 单一实现）。
+- 现代语言特性：min/max 内建收编时间窗双向偏斜判定（`max(now.Sub(at), at.Sub(now))`）；errors.Join 聚合信任头名冲突（构造期 fail-fast 一次列全部冲突，不逐个挤牙膏）；for range int 收敛头名两两互异校验的计数循环；sync.OnceFunc 本版无贴合处（认证中间件无 once 收口需求，不硬凑）。
+
+关联问题单：oekit/middleware#169。
+
 ## [v0.16.2] — 2026-11-11
 
 - build: 依赖地板对齐——github.com/oekit/registry v0.5.14（发版 train 检查面 G 拦下旧地板后抬升）。
