@@ -1,5 +1,12 @@
 
 
+## [v0.16.0] — 2026-11-10
+
+- - feat: AuditLog 审计日志一等中间件——who/what/when/outcome 结构化事件、AuditSink/BatchedSink 缓冲落库、显式声明制审计面（#141）
+- - fix(contrib/cache): 缓存 key 补身份头维度——X-Auth-* 可信网关形态不再跨用户共享响应，WithCacheIdentityHeaders 可配（#142）
+
+关联问题单：middleware#141、middleware#142。
+
 ## [v0.15.1] — 2026-11-10
 
 - - build: 依赖地板对齐（floor sync，无代码变更）
