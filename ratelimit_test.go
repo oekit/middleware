@@ -481,7 +481,7 @@ type plainLimiter struct{}
 
 func (plainLimiter) Allow() bool                    { return true }
 func (plainLimiter) AllowN(n int) bool              { return true }
-func (plainLimiter) Reserve() time.Duration         { return 0 }
+func (plainLimiter) Reserve() (time.Duration, error) { return 0, nil }
 func (plainLimiter) Wait(ctx context.Context) error { return nil }
 
 // TestRateLimitMiddlewareWithLimiter_Headers_NoQuotaExit 验证负例：自定义
