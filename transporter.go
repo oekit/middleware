@@ -3,6 +3,7 @@ package mw
 import (
 	"context"
 	"sort"
+	"strings"
 
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/cloudwego/hertz/pkg/protocol"
@@ -49,8 +50,12 @@ func (a *hertzRequestHeader) Get(key string) string { return a.h.Get(key) }
 
 func (a *hertzRequestHeader) Values(key string) []string {
 	var out []string
+	// 大小写不敏感匹配（#183，与 Get 的 hertz MIME canonical 口径对齐）：
+	// hertz VisitAll 产出 canonical 键（如 "X-Trace-Id"），Get 大小写不敏感
+	// 命中而 Values 用原文相等时，"x-trace-id" 变体会落空——同构实现
+	// hertz/transportx 的 #163 修复已改 EqualFold，本副本同步（#177 漂移收窄）。
 	a.h.VisitAll(func(k, v []byte) {
-		if string(k) == key {
+		if strings.EqualFold(string(k), key) {
 			out = append(out, string(v))
 		}
 	})
@@ -76,8 +81,9 @@ func (a *hertzReplyHeader) Get(key string) string { return a.h.Get(key) }
 
 func (a *hertzReplyHeader) Values(key string) []string {
 	var out []string
+	// 大小写不敏感匹配（#183，同 hertzRequestHeader.Values）。
 	a.h.VisitAll(func(k, v []byte) {
-		if string(k) == key {
+		if strings.EqualFold(string(k), key) {
 			out = append(out, string(v))
 		}
 	})
