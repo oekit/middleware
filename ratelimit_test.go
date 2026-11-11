@@ -479,10 +479,10 @@ func TestRateLimitMiddlewareWithLimiter_Headers_QuotaExit(t *testing.T) {
 // 优雅降级（负例）。
 type plainLimiter struct{}
 
-func (plainLimiter) Allow() bool                    { return true }
-func (plainLimiter) AllowN(n int) bool              { return true }
-func (plainLimiter) Reserve() time.Duration         { return 0 }
-func (plainLimiter) Wait(ctx context.Context) error { return nil }
+func (plainLimiter) Allow() bool                     { return true }
+func (plainLimiter) AllowN(n int) bool               { return true }
+func (plainLimiter) Reserve() (time.Duration, error) { return 0, nil }
+func (plainLimiter) Wait(ctx context.Context) error  { return nil }
 
 // TestRateLimitMiddlewareWithLimiter_Headers_NoQuotaExit 验证负例：自定义
 // Limiter 无剩余配额出口时不硬算、不输出 X-RateLimit-Remaining，请求照常放行。
