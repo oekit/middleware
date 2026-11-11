@@ -442,8 +442,10 @@ func WithAuditOnDrop(fn func(ev AuditEvent)) BufferedAuditSinkOption {
 //	defer buf.Close(context.Background())
 //
 // Close 语义（平台生命周期约定 Close(ctx) error + sync.Once 幂等）：停止
-// 接收、flush 已缓冲事件后退出。与并发 Sink 存在极小在途窗口（Close 起
-// 停止保证落盘），该窗口事件按丢弃口径处置——与背压丢弃同一口径。
+// 接收、flush 已缓冲事件后退出。关闭判定与入队经 mu 原子化（#181）：不存在
+// 「Sink 侧检查通过后 Close 完成 drain 退出、发送才落地」的静默漏记窗口——
+// 事件要么赶在关闭前入缓冲（必被 drain 冲刷），要么看到 closed 按丢弃口径
+// 计数处置，两个去向都可观测。
 type BufferedAuditSink struct {
 	inner         AuditBatchSink
 	bufferSize    int
@@ -455,6 +457,12 @@ type BufferedAuditSink struct {
 	done          chan struct{}
 	dropped       atomic.Int64
 	closeOnce     sync.Once
+	// mu/closed（#181）：Sink 持 RLock 做「closed 判定 + 入队」原子化，
+	// Close 持 Lock 置 closed + close(stop)——与 wsutil.Outbox(#117) /
+	// streamx.SSESink(#144) 的收口口径同源。ch 永不关闭（run 靠 stop 退出
+	// 后 drain），单靠 select 查 stop 无原子性，必须配本锁。
+	mu     sync.RWMutex
+	closed bool
 }
 
 // NewBufferedAuditSink 构造缓冲批量 sink 并启动后台 flush goroutine。
@@ -498,12 +506,16 @@ func NewBufferedAuditSink(inner AuditBatchSink, opts ...BufferedAuditSinkOption)
 // Sink 追加一条审计事件（AuditSink 签名，方法值可直接传 WithAuditLogSink）。
 // 非阻塞：缓冲满或已关闭时按丢弃策略处置并计数，恒返回 nil——丢弃是策略
 // 不是错误，请求侧零阻塞。
+//
+// closed 判定与入队持 RLock 原子化（#181）：原实现「查 stop → 发 ch」两步
+// 无锁，窗口内 Close 完成 drain 退出后发送仍成功（ch 永不关闭），事件滞留
+// channel 永不 flush 且不计数不留痕 = 静默漏记；审计面漏记比多记危险（#141）。
 func (b *BufferedAuditSink) Sink(ctx context.Context, ev AuditEvent) error {
-	select {
-	case <-b.stop:
+	b.mu.RLock()
+	defer b.mu.RUnlock()
+	if b.closed {
 		b.drop(ev, "closing")
 		return nil
-	default:
 	}
 	select {
 	case b.ch <- ev:
@@ -526,7 +538,14 @@ func (b *BufferedAuditSink) Dropped() int64 {
 func (b *BufferedAuditSink) Close(ctx context.Context) error {
 	var err error
 	b.closeOnce.Do(func() {
+		// 持写锁置 closed + close(stop)（#181）：与 Sink 的 RLock 互斥——
+		// 任何 Sink 的「closed 判定 + 入队」要么整体发生在本段之前（事件在
+		// ch 里、必被 drain 冲刷），要么在本段之后（看到 closed、按丢弃计数）。
+		// close(stop) 放在写锁内，保证「stop 已闭 ⇒ 不再可能有新入队」。
+		b.mu.Lock()
+		b.closed = true
 		close(b.stop)
+		b.mu.Unlock()
 		select {
 		case <-b.done:
 		case <-ctx.Done():
