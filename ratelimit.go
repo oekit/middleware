@@ -2,8 +2,10 @@ package mw
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -157,6 +159,15 @@ func newRateLimitOptions(opts ...RateLimitOption) *RateLimitOptions {
 		opt(cfg)
 	}
 	cfg.SkipPaths = withInfraPathsDefault(cfg.SkipPaths) // #137 缺省兜底
+	// 构造期预检 SkipPaths glob 语法（#201，fail-fast，与 chainmw.AccessLog #161
+	// 同一份判据）：pathx.MatchesPath 宽松档把 filepath.ErrBadPattern 吞成
+	// 「不匹配」，一个坏 pattern 会让全部豁免判据静默失效——该限流的路径
+	// 429 误伤、该放行的探活路径占配额，且零信号。误配在启动期炸响。
+	for _, p := range cfg.SkipPaths {
+		if _, err := filepath.Match(p, ""); err != nil {
+			panic(fmt.Sprintf("mw.RateLimitMiddleware: invalid SkipPaths glob pattern %q: %v", p, err))
+		}
+	}
 	if cfg.KeyFunc == nil {
 		cfg.KeyFunc = defaultIPKey
 	}

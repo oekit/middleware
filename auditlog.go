@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"maps"
 	"net"
+	"path/filepath"
 	"slices"
 	"sync"
 	"sync/atomic"
@@ -278,6 +279,15 @@ func newAuditConfig(opts ...AuditLogOption) *auditConfig {
 		// 静默空转等于「以为在审计」的合规裸奔，与 BearerTokenAuth 未配置
 		// token 的构造期 panic 同口径。
 		panic("mw.AuditLogMiddleware: audited paths not configured, call WithAuditLogPaths first")
+	}
+	// 构造期预检 glob 语法（#201，fail-fast，与 chainmw.AccessLog #161 同一份
+	// 判据）：pathx.MatchesPath 宽松档把 filepath.ErrBadPattern 吞成「不匹配」，
+	// 一个坏 pattern 会让整个审计声明静默失效——敏感操作零事件落库（审计面
+	// 漏记比多记危险），且零信号。误配在启动期炸响。
+	for _, p := range o.AuditedPaths {
+		if _, err := filepath.Match(p, ""); err != nil {
+			panic(fmt.Sprintf("mw.AuditLogMiddleware: invalid audited path glob pattern %q: %v", p, err))
+		}
 	}
 	cfg := &auditConfig{
 		auditedPaths:     append([]string(nil), o.AuditedPaths...),

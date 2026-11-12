@@ -741,3 +741,21 @@ func TestAuditLogMiddleware_ClientSeams(t *testing.T) {
 		t.Fatalf("★ Extra 域字段缝未生效: %+v", ev.Extra)
 	}
 }
+
+// TestAuditLogMiddleware_BadGlobPatternPanics 构造期 glob 语法预检（#201，
+// fail-fast 与 chainmw.AccessLog #161 同判据）：坏 pattern 会被运行期宽松
+// 匹配吞成「永不命中」——审计声明静默失效、敏感操作零事件落库（漏记比
+// 多记危险）且零信号，误配必须在启动期炸响。
+func TestAuditLogMiddleware_BadGlobPatternPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("★ 坏 glob pattern 构造必须 panic(fail-loud，#201)")
+		} else if msg := fmt.Sprint(r); !strings.Contains(msg, "/api/admin/[") {
+			t.Fatalf("panic 信息应点名坏 pattern: %v", r)
+		}
+	}()
+	AuditLogMiddleware(
+		WithAuditLogPaths("/api/admin/[x"), // 未闭合的 [ = ErrBadPattern
+		WithAuditLogSink(func(context.Context, AuditEvent) error { return nil }),
+	)
+}
