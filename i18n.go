@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
 
@@ -30,9 +32,15 @@ type Catalog map[string]map[string]string
 
 // BundleLoader 是动态加载 Catalog 的钩子(可选)。
 // 首个请求到来时调用一次(在请求路径上执行,非后台异步),结果缓存到
-// 实例;加载失败记录 Warn 日志,后续请求会重试。
+// 实例;加载失败记录 Warn 日志并进入退避窗口(i18nLoadFailBackoff),窗口内
+// 请求直接降级(Translate 返 key 自身)、不重试,窗口过后首个请求重试;
+// 并发首载经 single-flight 去重,同一时刻至多一个 loader 调用(#182)。
 // 与 WithI18nCatalog 同时配置时,Catalog 优先(Loader 不执行)。
 type BundleLoader func(ctx context.Context) (Catalog, error)
+
+// i18nLoadFailBackoff 是 loader 失败后的最小重试退避窗口(#182):持续失败的
+// loader 不允许把每请求都拖进一次网络调用(单点串行放大成全站排队)。
+const i18nLoadFailBackoff = time.Second
 
 const (
 	defaultI18nLang = "en"
@@ -48,7 +56,20 @@ type i18nState struct {
 	catalog     Catalog
 	loader      BundleLoader
 
-	mu sync.Mutex // 保护 catalog 的懒加载(仅 loader 路径会写)
+	// published 是最终生效 catalog 的发布位(#182):构造期静态 catalog 或
+	// loader 成功结果都发布到这里。快速路径一次原子 Load,零锁——原实现
+	// 每请求都过 mutex,且 mutex 横跨 loader 网络调用(「锁内做阻塞调用」
+	// 反模式)。
+	published atomic.Pointer[Catalog]
+
+	// loadMu 仅用于并发首载去重(single-flight):同一时刻至多一个请求在
+	// 执行 loader,等锁的请求共享其结果而不是各自发起网络调用;发布成功后
+	// 本锁永不再被触碰。
+	loadMu sync.Mutex
+
+	// lastFailNano 是上次 loader 失败(或返回 nil catalog)的 UnixNano,
+	// 退避窗口内请求直接降级返回 nil,不再重试(#182)。
+	lastFailNano atomic.Int64
 }
 
 // I18nOptions 是 I18n 中间件的配置。
@@ -92,8 +113,8 @@ func WithI18nBundleLoader(fn BundleLoader) I18nOption {
 // handler 通过 LangFromCtx(c) 或 Translate(c, key) 取翻译。
 //
 // 流程:
-//  1. catalog 为空且配置了 BundleLoader → lazy load 一次(同步,失败记
-//     Warn 后续请求重试)
+//  1. catalog 为空且配置了 BundleLoader → lazy load 一次(同步,single-flight
+//     去重;失败记 Warn 并退避 1s,窗口内降级不重试,#182)
 //  2. 读 Accept-Language header(支持 q-value,q=0 视为不可接受;
 //     语言 tag 大小写不敏感)
 //  3. 匹配 Catalog 里已注册的语言:精确 → 连字符边界前缀(en 匹配 en-US,
@@ -130,6 +151,12 @@ func I18n(opts ...I18nOption) app.HandlerFunc {
 		catalog:     cfg.Catalog,
 		loader:      cfg.BundleLoader,
 	}
+	// 构造期静态 catalog 直接进发布位:首请求即零锁快速路径。catalog 为 nil
+	// 时不发布——发布位语义是「真实 catalog 已就绪」,nil 留给 loader 路径
+	// 处理(无 loader 时 ensureCatalog 返回 nil,与原行为一致)。
+	if cfg.Catalog != nil {
+		st.published.Store(&st.catalog)
+	}
 
 	return func(ctx context.Context, c *app.RequestContext) {
 		catalog := st.ensureCatalog(ctx)
@@ -145,25 +172,48 @@ func I18n(opts ...I18nOption) app.HandlerFunc {
 
 // ensureCatalog 返回实例 catalog;为空且有 loader 时同步加载一次。
 // 加载失败记 Warn 并返回 nil(catalog 为空,Translate 返 key 自身)。
-// 全路径持锁:发布后的 catalog 虽只读,但快速路径的 nil-check 与加载写
-// 之间无同步就是 data race(-race 实测),每请求一次 mutex 开销可忽略。
+//
+// #182 治理形态(不再全程持锁):
+//   - 快速路径一次原子 Load,零锁——发布后的 catalog 只读,无同步需求;
+//   - 并发首载 single-flight 去重(loadMu):同一时刻至多一个 loader 调用,
+//     等锁请求共享其结果,不再各自发起网络调用;
+//   - 失败退避:loader 失败/返回 nil 后进入 i18nLoadFailBackoff 窗口,
+//     窗口内请求直接降级返回 nil,持续失败的 loader 不再每请求一次网络调用。
 func (s *i18nState) ensureCatalog(ctx context.Context) Catalog {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	if s.catalog != nil || s.loader == nil {
-		return s.catalog
+	// 快速路径:静态 catalog 或已发布的 loader 结果。
+	if p := s.published.Load(); p != nil {
+		return *p
+	}
+	if s.loader == nil {
+		return nil
+	}
+	// 退避窗口内不重试(不触碰 loadMu,零网络零排队)。
+	if now := time.Now().UnixNano(); now-s.lastFailNano.Load() < int64(i18nLoadFailBackoff) {
+		return nil
+	}
+	s.loadMu.Lock()
+	defer s.loadMu.Unlock()
+	// 双检:等锁期间并发请求可能已完成加载或进入退避。
+	if p := s.published.Load(); p != nil {
+		return *p
+	}
+	if now := time.Now().UnixNano(); now-s.lastFailNano.Load() < int64(i18nLoadFailBackoff) {
+		return nil
 	}
 	loaded, err := s.loader(ctx)
 	if err != nil {
-		i18nLog.Warn("i18n bundle loader failed; serving without catalog",
+		s.lastFailNano.Store(time.Now().UnixNano())
+		i18nLog.Warn("i18n bundle loader failed; serving without catalog (retry after backoff)",
 			"err", err)
 		return nil
 	}
 	if loaded == nil {
+		// loader 成功但返回 nil:无可发布结果,按失败退避(不热循环重试)。
+		s.lastFailNano.Store(time.Now().UnixNano())
 		return nil
 	}
-	s.catalog = loaded
-	return s.catalog
+	s.published.Store(&loaded)
+	return loaded
 }
 
 // pickLang 从 Accept-Language 头解析最佳匹配。

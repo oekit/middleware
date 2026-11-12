@@ -56,14 +56,10 @@ func ResponseMiddleware(opts ...ResponseOption) app.HandlerFunc {
 		// 首选 RequestContext kv，兼容头随后清理，外部观察者看不到。
 		_, kvSkip := c.Get(skipWrapCtxKey)
 		hdrSkip := len(c.Response.Header.Peek(skipResponseWrapHeader)) > 0
-		legacySkip := len(c.Response.Header.Peek(legacySkipResponseWrapHeader)) > 0
 		if hdrSkip {
 			c.Response.Header.Del(skipResponseWrapHeader)
 		}
-		if legacySkip {
-			c.Response.Header.Del(legacySkipResponseWrapHeader)
-		}
-		if kvSkip || hdrSkip || legacySkip {
+		if kvSkip || hdrSkip {
 			return
 		}
 
@@ -371,18 +367,13 @@ const skipWrapCtxKey = "oekit_skip_response_wrap"
 // 写入响应后由 ResponseMiddleware 读取并删除——外部观察者在该响应上不会看到它。
 const skipResponseWrapHeader = "X-Oekit-No-Wrap"
 
-// legacySkipResponseWrapHeader 是旧的包装豁免响应头名（历史遗留，一版后移除）。
-//
-// Deprecated: 仅作一个版本的兼容读取，下版本删除；请用 RequestContext kv
-// （SkipResponseWrap 默认写入）或 X-Oekit-No-Wrap。
-const legacySkipResponseWrapHeader = "X-Zeus-No-Wrap"
-
 // SkipResponseWrap 标记本响应跳过统一业务包壳（RFC 标准载荷端点用：
 // OIDC /token、/userinfo、discovery、JWKS 等，第三方按规范解析顶层字段）。
 // 必须在写响应体之前调用。
 //
 // 标记同时写入 RequestContext kv（首选，外部不可见）与 X-Oekit-No-Wrap
-// 兼容头；旧名 X-Zeus-No-Wrap 仍被读取一个版本后移除。
+// 兼容头；旧名 X-Zeus-No-Wrap 兼容读取已按承诺移除（#179）——仍写旧头的
+// 调用方行为退化为「不跳过包壳」，请改用本函数。
 // 与 ResponseMiddleware 的 WithSkipPaths/WithSkipPrefixes 声明式跳过并存：
 // 本函数是 handler 级逃生舱（单响应），声明式跳过是路由级（整请求）。
 func SkipResponseWrap(c *app.RequestContext) {

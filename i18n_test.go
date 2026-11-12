@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/cloudwego/hertz/pkg/app"
 )
@@ -183,6 +184,78 @@ func TestI18n_LoaderErrorNotFatal(t *testing.T) {
 	}
 }
 
+// TestI18n_LoaderConcurrentSingleFlight 回归测试（#182）：并发首载经
+// single-flight 去重——同一时刻至多一个 loader 调用，全部请求共享同一份
+// 结果。原实现每请求各持全局锁重试 loader；改造后只允许一次网络调用。
+func TestI18n_LoaderConcurrentSingleFlight(t *testing.T) {
+	var calls atomic.Int32
+	inst := I18n(WithI18nBundleLoader(func(ctx context.Context) (Catalog, error) {
+		calls.Add(1)
+		time.Sleep(20 * time.Millisecond) // 放大并发窗口
+		return Catalog{"en": {"k": "loaded"}}, nil
+	}))
+
+	var wg sync.WaitGroup
+	for i := 0; i < 32; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx := serveWith(inst, "en")
+			if got := Translate(ctx, "k"); got != "loaded" {
+				t.Errorf("Translate = %q, want loaded (single-flight 结果共享)", got)
+			}
+		}()
+	}
+	wg.Wait()
+	if n := calls.Load(); n != 1 {
+		t.Errorf("loader calls = %d, want 1 (并发首载必须去重，#182)", n)
+	}
+}
+
+// TestI18n_LoaderFailBackoff 回归测试（#182）：loader 失败后进入退避窗口
+// （1s），窗口内请求直接降级且不再触发 loader（持续失败的 loader 不允许
+// 每请求一次网络调用）；窗口过后恢复重试，成功结果正常发布。
+func TestI18n_LoaderFailBackoff(t *testing.T) {
+	var calls atomic.Int32
+	fail := true
+	inst := I18n(WithI18nBundleLoader(func(ctx context.Context) (Catalog, error) {
+		calls.Add(1)
+		if fail {
+			return nil, context.DeadlineExceeded
+		}
+		return Catalog{"en": {"k": "loaded"}}, nil
+	}))
+
+	// 首请求触发一次失败
+	_ = serveWith(inst, "en")
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("loader calls = %d, want 1 (首载)", n)
+	}
+
+	// 退避窗口内：大量请求全部降级，loader 零重试（原实现每请求锁内重试）
+	for i := 0; i < 50; i++ {
+		ctx := serveWith(inst, "en")
+		if got := Translate(ctx, "k"); got != "k" {
+			t.Fatalf("退避窗口内 Translate = %q, want k (降级)", got)
+		}
+	}
+	if n := calls.Load(); n != 1 {
+		t.Fatalf("退避窗口内 loader calls = %d, want 1（不得每请求重试，#182）", n)
+	}
+
+	// 窗口过后恢复重试：loader 转成功，结果发布、缓存
+	time.Sleep(1100 * time.Millisecond)
+	fail = false
+	ctx := serveWith(inst, "en")
+	if got := Translate(ctx, "k"); got != "loaded" {
+		t.Fatalf("退避后 Translate = %q, want loaded (成功结果发布)", got)
+	}
+	_ = serveWith(inst, "en")
+	if n := calls.Load(); n != 2 {
+		t.Errorf("loader calls = %d, want 2 (成功结果缓存，不再重试)", n)
+	}
+}
+
 // TestI18n_CatalogWinsOverLoader 验证 Catalog 与 Loader 同时配置时
 // Catalog 优先(Loader 不执行)。
 func TestI18n_CatalogWinsOverLoader(t *testing.T) {
@@ -219,7 +292,8 @@ func TestLangFromCtx_DefaultFallback(t *testing.T) {
 }
 
 // TestI18n_ConcurrentRequests -race 验证多实例并发使用安全
-// (loader 懒加载经 mutex 保护,加载后 catalog 只读)。
+// (loader 结果经 atomic.Pointer 发布,懒加载经 single-flight 去重,
+// 加载后 catalog 只读,#182)。
 func TestI18n_ConcurrentRequests(t *testing.T) {
 	inst := I18n(WithI18nBundleLoader(func(ctx context.Context) (Catalog, error) {
 		return Catalog{"en": {"k": "v"}}, nil
