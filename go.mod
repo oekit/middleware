@@ -21,11 +21,11 @@ require (
 	github.com/hertz-contrib/reverseproxy v1.0.6
 	github.com/hertz-contrib/sessions v1.0.3
 	github.com/larksuite/oapi-sdk-go/v3 v3.12.2
-	github.com/oekit/concurrency v0.33.0
-	github.com/oekit/logx v0.9.2
-	github.com/oekit/metrics v0.2.4
-	github.com/oekit/registry v0.5.14
-	github.com/oekit/tracing v0.4.0
+	github.com/oekit/concurrency v0.34.0
+	github.com/oekit/logx v0.10.0
+	github.com/oekit/metrics v0.3.0
+	github.com/oekit/registry v0.5.15
+	github.com/oekit/tracing v0.4.1
 	github.com/prometheus/client_golang v1.25.0
 	github.com/swaggo/http-swagger v1.3.4
 	golang.org/x/crypto v0.58.0
@@ -78,7 +78,7 @@ require (
 	github.com/klauspost/cpuid/v2 v2.2.10 // indirect
 	github.com/munnerz/goautoneg v0.0.0-20191010083416-a7dc8b61c822 // indirect
 	github.com/oekit/core v0.14.2
-	github.com/oekit/pkg v0.44.0
+	github.com/oekit/pkg v0.46.0
 	github.com/pkg/errors v0.9.1 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.72.0 // indirect
