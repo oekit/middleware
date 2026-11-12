@@ -25,7 +25,7 @@ require (
 	github.com/oekit/logx v0.10.0
 	github.com/oekit/metrics v0.3.0
 	github.com/oekit/registry v0.5.15
-	github.com/oekit/tracing v0.4.1
+	github.com/oekit/tracing v0.4.2
 	github.com/prometheus/client_golang v1.25.0
 	github.com/swaggo/http-swagger v1.3.4
 	golang.org/x/crypto v0.58.0
@@ -41,6 +41,7 @@ require (
 	github.com/go-openapi/swag/typeutils v0.28.0 // indirect
 	github.com/go-openapi/swag/yamlutils v0.28.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
+	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	go.opentelemetry.io/otel v1.47.0 // indirect
 	go.opentelemetry.io/otel/trace v1.47.0 // indirect
 	go.yaml.in/yaml/v3 v3.0.5 // indirect
