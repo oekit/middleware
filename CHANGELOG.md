@@ -1,5 +1,14 @@
 
 
+## [v0.18.0] — 2026-11-12
+
+- refactor(transport): hertzTransporter 删除，统一消费 core/transport/hertzbridge 单源（#180，#177 治本）——ServerContext 适配不再自持双份实现，middleware 与 hertz 桥接单点维护；transporter Values 大小写口径缺陷（#183）随 hertzbridge 消费一并治本收敛。
+- **BREAKING**（#179）：删 legacySkipResponseWrapHeader 废弃兼容路径——旧包装豁免响应头 X-Zeus-No-Wrap 的兼容读取按承诺到期移除，SkipResponseWrap 只写 RequestContext kv + X-Oekit-No-Wrap；消费方如仍依赖旧头需改用 X-Oekit-No-Wrap 口径。
+- fix(i18n): I18n ensureCatalog 锁外发布 + single-flight 去重 + 失败退避（#182）——发布移出锁外消除竞态窗口，并发加载 single-flight 去重，失败指数退避。
+- build: 依赖地板对齐——core v0.15.0（引入 transport/hertzbridge）、concurrency v0.34.1、logx v0.10.0、metrics v0.3.0、registry v0.5.15、tracing v0.4.2、pkg v0.46.0；清理 replace 本地调试残留。
+
+关联问题单：middleware#177、middleware#179、middleware#180、middleware#182。
+
 ## [v0.17.0] — 2026-11-11
 
 - feat(smartauth): SmartAuth 双模式认证中间件（#169）——网关信任头立证 vs 本地 JWT 兜底，两模式可切换（AuthModeGatewayOnly / AuthModeLocalOnly）可组合（AuthModeAuto：呈现网关立证验不过 401 不降级、未呈现落本地 JWT），下游 6 服务同款装配不再各自手搓信任模型。本地校验面 JWTParseFunc 与 kitx/jwt 的 Parse/ParseSymmetric/Manager.ParseTyped 同形收窄（token 进、Subject 出，业务 adapter 包一层即得）——依赖方向先查过 go.mod：middleware→kitx 并不存在，校验面经注入缝交付，两个模块都不新增依赖、不引反向依赖。
