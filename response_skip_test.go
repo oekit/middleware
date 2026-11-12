@@ -144,29 +144,26 @@ func TestSkipResponseWrap_HeaderCleanup(t *testing.T) {
 
 	r := ut.PerformRequest(h, http.MethodGet, "/esc", nil).Result()
 	assertNoWrap(t, r.Body(), `"escaped"`)
-	for _, name := range []string{skipResponseWrapHeader, legacySkipResponseWrapHeader} {
-		if got := r.Header.Get(name); got != "" {
-			t.Errorf("internal marker header %s leaked to response: %q", name, got)
-		}
+	if got := r.Header.Get(skipResponseWrapHeader); got != "" {
+		t.Errorf("internal marker header %s leaked to response: %q", skipResponseWrapHeader, got)
 	}
 }
 
-// TestSkipResponseWrap_LegacyHeader 旧头名 X-Zeus-No-Wrap 一个版本内仍被识别
-// （deprecated 兼容层），命中后同样跳过包壳并清理头。
-func TestSkipResponseWrap_LegacyHeader(t *testing.T) {
+// TestSkipResponseWrap_LegacyHeaderRemoved 回归测试（#179）：旧头名
+// X-Zeus-No-Wrap 兼容读取已按承诺移除——写旧头不再跳过包壳（行为退化为
+// 正常包装，可见回归优于永久背着两套逃生舱机制），也不会把旧头留在响应上
+// 帮调用方清场。
+func TestSkipResponseWrap_LegacyHeaderRemoved(t *testing.T) {
 	h := route.NewEngine(config.NewOptions([]config.Option{}))
 	h.Use(ResponseMiddleware())
 	h.GET("/legacy", func(ctx context.Context, c *app.RequestContext) {
-		// 模拟旧客户端/handler 直接写旧头（不调 SkipResponseWrap）
-		c.Response.Header.Set(legacySkipResponseWrapHeader, "1")
+		// 模拟仍写旧头的漏网调用方：不再被识别为豁免。
+		c.Response.Header.Set("X-Zeus-No-Wrap", "1")
 		c.JSON(200, map[string]any{"legacy": true})
 	})
 
 	r := ut.PerformRequest(h, http.MethodGet, "/legacy", nil).Result()
-	assertNoWrap(t, r.Body(), `"legacy"`)
-	if got := r.Header.Get(legacySkipResponseWrapHeader); got != "" {
-		t.Errorf("legacy marker header should be cleaned, got %q", got)
-	}
+	assertWrapped(t, r.Body())
 }
 
 // TestSkipResponseWrap_NewHeaderOnly 次级机制：handler 只写新兼容头
