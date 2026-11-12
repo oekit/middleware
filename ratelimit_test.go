@@ -276,7 +276,7 @@ func TestRateLimitMiddleware_InfraPathsDefaultSkip(t *testing.T) {
 	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/api/data").Response.StatusCode())
 
 	// 标准探活/监控端点缺省豁免：配额耗尽后依旧放行（不占配额）
-	for _, p := range InfraPaths {
+	for _, p := range InfraPaths() {
 		assert.DeepEqual(t, consts.StatusOK, rlRequest(h, p).Response.StatusCode())
 	}
 }

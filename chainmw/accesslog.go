@@ -160,7 +160,7 @@ func runSink(ctx context.Context, logger logx.Logger, sink AccessSink, req any, 
 		}
 	}()
 	if err := sink(ctx, req, rec); err != nil && !silent {
-		logger.CtxWarn(ctx, "access sink failed", "op", rec.Operation, "err", err.Error())
+		logger.CtxWarn(ctx, "access sink failed", "op", rec.Operation, logx.ErrKey, err.Error())
 	}
 }
 
@@ -233,7 +233,7 @@ func AccessLog(opts ...AccessLogOption) chain.Middleware {
 					kvs = []any{"kind", rec.Kind, "op", rec.Operation, "cost", rec.Latency.String()}
 				}
 				if rec.Err != nil {
-					kvs = append(kvs, "err", rec.Err.Error())
+					kvs = append(kvs, logx.ErrKey, rec.Err.Error())
 					if rec.Panic {
 						kvs = append(kvs, "panic", true)
 					}

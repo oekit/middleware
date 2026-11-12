@@ -59,7 +59,7 @@ func getOrder(ctx context.Context, c *app.RequestContext) {
 切换（`AuthModeGatewayOnly`/`AuthModeLocalOnly`）可组合（`AuthModeAuto`）。信任模型
 的安全细节（规范串/时间窗/剥头防伪造）单点收编——立证失败、免认证路径、本地模式
 一律剥掉 `X-Auth-*` 信任头（头伪造面结构上关死，含防「加一行 `X-Auth-Authorized`
-跳过本地 RBAC」）。
+跳过本地 RBAC」）。Auto 组合下**呈现了立证却验不过**（可疑流量）返 401 + Warn 不再降级，仅未呈现立证的请求才落本地 JWT 兜底（#184 定版）。
 
 ```go
 h.Use(mw.SmartAuth(

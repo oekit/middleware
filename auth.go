@@ -69,6 +69,11 @@ type BearerTokenOptions struct {
 	Disabled bool
 
 	// SkipPaths 不需要认证的路径列表，如 ["/ping", "/healthz", "/metrics"]。
+	// 匹配语义（#187）：**精确匹配**（与 c.Path() 原文 == 比较，非 glob，
+	// `*` 与 `/**` 无特殊含义——写 "/api/**" 不会豁免 /api/ 下的任何路径）；
+	// glob 语义在同包的观测/限流家族（WithAccessLogSkipPaths/
+	// WithRateLimitSkipPaths 的 pathx.MatchesPath），认证家族豁免面按显式
+	// 声明制收窄。
 	SkipPaths []string
 
 	// SkipFunc 自定义跳过逻辑。返回 true 表示该路径不需要认证。
@@ -109,6 +114,12 @@ func WithAuthDisabled() BearerTokenOption {
 }
 
 // WithAuthSkipPaths 设置不需要认证的路径列表。
+//
+// 匹配语义（#187）：**精确匹配**（c.Path() 原文 == 比较，非 glob，`*` 与
+// "/**" 无特殊含义——写 "/api/**" 不会豁免 "/api/users"，需逐条列出
+// "/api/users"、"/api/orders"；glob 语义在同包观测/限流家族
+// WithAccessLogSkipPaths/WithRateLimitSkipPaths）。需要前缀豁免时用
+// WithAuthSkipFunc(strings.HasPrefix) 自行表达。
 func WithAuthSkipPaths(paths ...string) BearerTokenOption {
 	return func(o *BearerTokenOptions) {
 		o.SkipPaths = append(o.SkipPaths, paths...)
@@ -190,7 +201,7 @@ func cutBearerToken(header string) (string, bool) {
 //
 // 校验流程:
 //  1. WithAuthDisabled → 直接放行（显式关闭，等价于不注册本中间件）
-//  2. 路径在 SkipPaths 或命中 SkipFunc → 放行
+//  2. 路径在 SkipPaths（精确匹配，#187，非 glob）或命中 SkipFunc → 放行
 //  3. 请求头 Authorization: Bearer <token> 与配置 token 做常量时间比较
 //     - 不匹配 → 401
 //  4. Authorizer 不为 nil → 提取 Subject 调 Authorize

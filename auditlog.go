@@ -3,6 +3,9 @@ package mw
 import (
 	"context"
 	"fmt"
+	"maps"
+	"net"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -47,6 +50,20 @@ type AuditEvent struct {
 	Latency time.Duration
 	// TraceID hmw 注入的 trace_id；未挂 hmw.Middleware 时为空串。
 	TraceID string
+	// IP 客户端网络地址（#193，审计 who 的网络维度）。缺省取连接对端地址
+	// host 部分（fail-closed，不读 X-Forwarded-For——#83 同口径；代理拓扑
+	// 按 XFF 归因经 WithAuditLogClientIP 注入解析缝）。合规场景禁采网络
+	// 维度用 WithAuditLogOmitClientFields 关闭。
+	IP string
+	// UA 请求 User-Agent（#193）。缺省取 User-Agent 头原值；截断/脱敏形态
+	// 经 WithAuditLogUA 注入。
+	UA string
+	// Extra 域字段扩展承载（#193）：IP/UA/请求体摘要等审计域字段的通用
+	// 缝——WithAuditLogExtra 注入提取函数，事件产出时刻在请求 goroutine
+	// 内调用（池化红线安全），返回的 map 原样进事件（中间件产出后不再
+	// 修改；sink 异步持有安全）。nil = 未注入。内建日志 sink 会把 Extra
+	// 键值并入结构化字段。
+	Extra map[string]string
 	// Panic 为 true 表示本事件来自 panic 恢复点：事件产出后按原值重抛给
 	// 外层 Recovery（Status 按其缺省 500 记）。
 	Panic bool
@@ -58,13 +75,6 @@ type AuditEvent struct {
 // 需要缓冲批量落库（DB/队列）时用 NewBufferedAuditSink 包一层——见
 // BufferedAuditSink。
 type AuditSink func(ctx context.Context, ev AuditEvent) error
-
-// AuditBatchSink 接收一批审计事件——BufferedAuditSink 的 flush 单元
-// （chan 缓冲 + 后台 goroutine 攒批 + 按 BatchSize/FlushInterval 触发）。
-// 在后台 goroutine 内调用；events 是本次 flush 的拷贝，sink 可安全异步持有。
-// 返回 error 只记 Warn（事件已在缓冲中按丢弃策略处置过，失败重试属消费方
-// 职责）。
-type AuditBatchSink func(ctx context.Context, events []AuditEvent) error
 
 // AuditLogOptions 是 AuditLogMiddleware 的配置。
 type AuditLogOptions struct {
@@ -102,6 +112,28 @@ type AuditLogOptions struct {
 	// 在请求 goroutine 内、响应写出后调用——可读 c.Response.Body() 或
 	// handler 经 c.Set 留下的业务键。
 	BizCodeFunc func(ctx context.Context, c *app.RequestContext) int64
+
+	// IPFunc 是客户端地址提取缝（#193）。nil 走默认口径：连接对端地址
+	// host 部分（fail-closed，不读 XFF，#83 同口径）；代理拓扑按 XFF 归因
+	// 注入，如 `mw.WithAuditLogClientIP(func(ctx, c) string {
+	//     return convert.ResolveClientIP(c.RemoteAddr().String(),
+	//         string(c.GetHeader("X-Forwarded-For")), myTrustedCIDRs) })`。
+	// 显式注入优先于 OmitClientFields（显式配置是调用方对采集面的完整声明）。
+	IPFunc func(ctx context.Context, c *app.RequestContext) string
+
+	// UAFunc 是 User-Agent 提取缝（#193）。nil 走默认口径：User-Agent 头
+	// 原值；截断/脱敏形态在此注入。显式注入优先于 OmitClientFields。
+	UAFunc func(ctx context.Context, c *app.RequestContext) string
+
+	// ExtraFunc 是域字段扩展提取缝（#193）：返回的 map 合入 AuditEvent.
+	// Extra（请求体摘要/IP/UA 变体等审计域字段）。在请求 goroutine 内、
+	// 事件产出时刻调用；每事件返回新 map（事件间不共享），返回 nil 无害。
+	ExtraFunc func(ctx context.Context, c *app.RequestContext) map[string]string
+
+	// OmitClientFields 置位后 AuditEvent 不填充 IP/UA 缺省采集（#193，
+	// 合规场景：审计面禁采网络维度）。IPFunc/UAFunc 显式注入不受影响
+	// （显式配置优先于开关）。
+	OmitClientFields bool
 }
 
 // AuditLogOption 配置 AuditLogMiddleware。
@@ -181,14 +213,59 @@ func WithAuditLogBizCode(fn func(ctx context.Context, c *app.RequestContext) int
 	}
 }
 
+// WithAuditLogClientIP 注入客户端地址提取缝（#193，如可信代理 XFF 归因）。
+// nil 保持默认（对端地址 host，fail-closed 不读 XFF）。显式注入优先于
+// WithAuditLogOmitClientFields。
+func WithAuditLogClientIP(fn func(ctx context.Context, c *app.RequestContext) string) AuditLogOption {
+	return func(o *AuditLogOptions) {
+		if fn != nil {
+			o.IPFunc = fn
+		}
+	}
+}
+
+// WithAuditLogUA 注入 User-Agent 提取缝（#193，截断/脱敏形态）。nil 保持
+// 默认（User-Agent 头原值）。显式注入优先于 WithAuditLogOmitClientFields。
+func WithAuditLogUA(fn func(ctx context.Context, c *app.RequestContext) string) AuditLogOption {
+	return func(o *AuditLogOptions) {
+		if fn != nil {
+			o.UAFunc = fn
+		}
+	}
+}
+
+// WithAuditLogExtra 注入域字段扩展提取缝（#193）：返回的 map 合入
+// AuditEvent.Extra（请求体摘要等 IP/UA 之外的审计域字段）。fn 在请求
+// goroutine 内、事件产出时刻调用；每事件返回新 map（事件间不共享），
+// 返回 nil 无害。
+func WithAuditLogExtra(fn func(ctx context.Context, c *app.RequestContext) map[string]string) AuditLogOption {
+	return func(o *AuditLogOptions) {
+		if fn != nil {
+			o.ExtraFunc = fn
+		}
+	}
+}
+
+// WithAuditLogOmitClientFields 关闭 IP/UA 缺省采集（#193，合规场景：审计
+// 面禁采网络维度）。IPFunc/UAFunc 显式注入不受影响。
+func WithAuditLogOmitClientFields() AuditLogOption {
+	return func(o *AuditLogOptions) {
+		o.OmitClientFields = true
+	}
+}
+
 // auditConfig 是启动期解析完毕的审计配置（请求热路径零重复解析）。
 type auditConfig struct {
-	auditedPaths []string
-	sinks        []AuditSink
-	logger       logx.Logger
-	whoFunc      func(ctx context.Context, c *app.RequestContext) string
-	actionFunc   func(ctx context.Context, c *app.RequestContext) string
-	bizCodeFunc  func(ctx context.Context, c *app.RequestContext) int64
+	auditedPaths     []string
+	sinks            []AuditSink
+	logger           logx.Logger
+	whoFunc          func(ctx context.Context, c *app.RequestContext) string
+	actionFunc       func(ctx context.Context, c *app.RequestContext) string
+	bizCodeFunc      func(ctx context.Context, c *app.RequestContext) int64
+	ipFunc           func(ctx context.Context, c *app.RequestContext) string
+	uaFunc           func(ctx context.Context, c *app.RequestContext) string
+	extraFunc        func(ctx context.Context, c *app.RequestContext) map[string]string
+	omitClientFields bool
 }
 
 func newAuditConfig(opts ...AuditLogOption) *auditConfig {
@@ -203,12 +280,16 @@ func newAuditConfig(opts ...AuditLogOption) *auditConfig {
 		panic("mw.AuditLogMiddleware: audited paths not configured, call WithAuditLogPaths first")
 	}
 	cfg := &auditConfig{
-		auditedPaths: append([]string(nil), o.AuditedPaths...),
-		sinks:        o.Sinks,
-		logger:       o.Logger,
-		whoFunc:      o.WhoFunc,
-		actionFunc:   o.ActionFunc,
-		bizCodeFunc:  o.BizCodeFunc,
+		auditedPaths:     append([]string(nil), o.AuditedPaths...),
+		sinks:            o.Sinks,
+		logger:           o.Logger,
+		whoFunc:          o.WhoFunc,
+		actionFunc:       o.ActionFunc,
+		bizCodeFunc:      o.BizCodeFunc,
+		ipFunc:           o.IPFunc,
+		uaFunc:           o.UAFunc,
+		extraFunc:        o.ExtraFunc,
+		omitClientFields: o.OmitClientFields,
 	}
 	if cfg.whoFunc == nil {
 		cfg.whoFunc = defaultAuditWho
@@ -308,8 +389,11 @@ func AuditLogMiddleware(opts ...AuditLogOption) app.HandlerFunc {
 
 // auditEventOf 由请求上下文拼出审计事件。status 由调用方给定：正常完成取
 // c.Response.StatusCode()；panic 恢复点传 500（响应尚未写出）。
+// IP/UA 缺省口径（#193）：IP=连接对端地址 host（fail-closed，不读 XFF——
+// #83 同口径；在请求 goroutine 内提取，池化红线安全）；UA=User-Agent 头。
+// OmitClientFields 关闭缺省采集；IPFunc/UAFunc/ExtraFunc 显式注入优先。
 func auditEventOf(ctx context.Context, c *app.RequestContext, cfg *auditConfig, start time.Time, status int, panicked bool) AuditEvent {
-	return AuditEvent{
+	ev := AuditEvent{
 		When:    start,
 		Who:     cfg.whoFunc(ctx, c),
 		Action:  cfg.actionFunc(ctx, c),
@@ -321,12 +405,37 @@ func auditEventOf(ctx context.Context, c *app.RequestContext, cfg *auditConfig, 
 		TraceID: hmw.FromRequestContext(c),
 		Panic:   panicked,
 	}
+	if cfg.ipFunc != nil {
+		ev.IP = cfg.ipFunc(ctx, c)
+	} else if !cfg.omitClientFields {
+		ev.IP = defaultAuditClientIP(c)
+	}
+	if cfg.uaFunc != nil {
+		ev.UA = cfg.uaFunc(ctx, c)
+	} else if !cfg.omitClientFields {
+		ev.UA = string(c.GetHeader("User-Agent"))
+	}
+	if cfg.extraFunc != nil {
+		ev.Extra = cfg.extraFunc(ctx, c)
+	}
+	return ev
+}
+
+// defaultAuditClientIP 缺省客户端地址口径：连接对端地址的 host 部分
+// （不读任何转发头，X-Forwarded-For 客户端可控——#83/#136 同一安全 stance）。
+// 解析失败（畸形 RemoteAddr）原样保留全串，不静默丢维。
+func defaultAuditClientIP(c *app.RequestContext) string {
+	addr := c.RemoteAddr().String()
+	if host, _, err := net.SplitHostPort(addr); err == nil {
+		return host
+	}
+	return addr
 }
 
 // emit 交付审计事件：无 sink 时写内建结构化日志（message "audit"，
-// 字段 who/action/method/path/status/biz_code/latency_ms/trace_id，
-// panic 事件升 Warn）；有 sink 时逐个隔离交付。交付失败只 Warn——审计
-// 是旁路，不把请求拖垮。
+// 字段 who/action/method/path/status/biz_code/latency_ms/trace_id/ip/ua
+// 与 WithAuditLogExtra 注入的域字段键值，panic 事件升 Warn）；有 sink 时
+// 逐个隔离交付。交付失败只 Warn——审计是旁路，不把请求拖垮。
 func (cfg *auditConfig) emit(ctx context.Context, ev AuditEvent) {
 	if len(cfg.sinks) == 0 {
 		logger := cfg.logger
@@ -343,6 +452,8 @@ func (cfg *auditConfig) emit(ctx context.Context, ev AuditEvent) {
 
 // logAuditEvent 内建 logx sink：kv 结构化风格（平台契约，trace_id 经 Ctx*
 // 方法自动携带——buffered 形态下请求 ctx 已失效，故 trace_id 字段显式进 kv）。
+// IP/UA（#193）与 Extra 键值一并并入结构化字段（Extra 键排序保证输出
+// 确定性，不因 map 遍历顺序抖动）。
 func logAuditEvent(ctx context.Context, logger logx.Logger, ev AuditEvent) {
 	kv := []any{
 		"who", ev.Who,
@@ -353,6 +464,17 @@ func logAuditEvent(ctx context.Context, logger logx.Logger, ev AuditEvent) {
 		"biz_code", ev.BizCode,
 		"latency_ms", ev.Latency.Milliseconds(),
 		"trace_id", ev.TraceID,
+	}
+	if ev.IP != "" {
+		kv = append(kv, "ip", ev.IP)
+	}
+	if ev.UA != "" {
+		kv = append(kv, "ua", ev.UA)
+	}
+	if len(ev.Extra) > 0 {
+		for _, k := range slices.Sorted(maps.Keys(ev.Extra)) {
+			kv = append(kv, k, ev.Extra[k])
+		}
 	}
 	if ev.Panic {
 		kv = append(kv, "panic", true)
@@ -377,8 +499,20 @@ func deliverAuditEvent(ctx context.Context, sink AuditSink, ev AuditEvent) {
 	}
 }
 
-// BufferedAuditSinkOptions 是 NewBufferedAuditSink 的配置。
-type BufferedAuditSinkOptions struct {
+// bufferedSinkLog 是缓冲批量 sink 原语（泛型面）的丢弃/flush 失败告警
+// logger——原语不再绑定 audit 语义，独立 scoped logger（平台契约 §3）。
+var bufferedSinkLog = logx.Delegating("middleware-bufferedsink")
+
+// BatchSink 是缓冲批量 sink 原语（#192 泛型化）的 flush 单元：T 为消费方
+// 域模型类型（fuxi *models.AuditLog、zeus op_log 行等）——不再被 AuditEvent
+// 特化挡在批量原语门外，chan 攒批/背压丢弃/关闭原子化的重复手搓面单点收编。
+// 在后台 goroutine 内调用；events 是本次 flush 的拷贝，sink 可安全异步持有。
+// 返回 error 只记 Warn（事件已在缓冲中按丢弃策略处置过，失败重试属消费方
+// 职责）。
+type BatchSink[T any] func(ctx context.Context, events []T) error
+
+// BufferedSinkOptions 是 NewBufferedSink 的配置（#192 泛型化）。
+type BufferedSinkOptions[T any] struct {
 	// BufferSize 事件缓冲 chan 容量。缺省 1024。
 	BufferSize int
 	// BatchSize 单次 flush 的事件数阈值（攒够即刷，不等间隔）。缺省 100。
@@ -388,57 +522,59 @@ type BufferedAuditSinkOptions struct {
 	FlushInterval time.Duration
 	// OnDrop 事件被丢弃（缓冲满/Close 在途）时的回调；nil 记 Warn 日志
 	// （含累计丢弃数）。在请求 goroutine 内同步调用，保持轻量。
-	OnDrop func(ev AuditEvent)
+	OnDrop func(ev T)
 }
 
-// BufferedAuditSinkOption 配置 BufferedAuditSink。
-type BufferedAuditSinkOption func(*BufferedAuditSinkOptions)
+// BufferedSinkOption 配置 BufferedSink。
+type BufferedSinkOption[T any] func(*BufferedSinkOptions[T])
 
-// WithAuditBufferSize 设置事件缓冲 chan 容量（缺省 1024；负值构造期 panic）。
-func WithAuditBufferSize(n int) BufferedAuditSinkOption {
-	return func(o *BufferedAuditSinkOptions) {
+// WithSinkBufferSize 设置事件缓冲 chan 容量（缺省 1024；负值构造期 panic）。
+func WithSinkBufferSize[T any](n int) BufferedSinkOption[T] {
+	return func(o *BufferedSinkOptions[T]) {
 		o.BufferSize = n
 	}
 }
 
-// WithAuditBatchSize 设置单次 flush 的事件数阈值（缺省 100；负值构造期 panic）。
-func WithAuditBatchSize(n int) BufferedAuditSinkOption {
-	return func(o *BufferedAuditSinkOptions) {
+// WithSinkBatchSize 设置单次 flush 的事件数阈值（缺省 100；负值构造期 panic）。
+func WithSinkBatchSize[T any](n int) BufferedSinkOption[T] {
+	return func(o *BufferedSinkOptions[T]) {
 		o.BatchSize = n
 	}
 }
 
-// WithAuditFlushInterval 设置定时 flush 间隔（缺省 5s；负值构造期 panic）。
-func WithAuditFlushInterval(d time.Duration) BufferedAuditSinkOption {
-	return func(o *BufferedAuditSinkOptions) {
+// WithSinkFlushInterval 设置定时 flush 间隔（缺省 5s；负值构造期 panic）。
+func WithSinkFlushInterval[T any](d time.Duration) BufferedSinkOption[T] {
+	return func(o *BufferedSinkOptions[T]) {
 		o.FlushInterval = d
 	}
 }
 
-// WithAuditOnDrop 设置丢弃回调（缺省记 Warn 日志）。nil 不覆盖既有配置。
-func WithAuditOnDrop(fn func(ev AuditEvent)) BufferedAuditSinkOption {
-	return func(o *BufferedAuditSinkOptions) {
+// WithSinkOnDrop 设置丢弃回调（缺省记 Warn 日志）。nil 不覆盖既有配置。
+func WithSinkOnDrop[T any](fn func(ev T)) BufferedSinkOption[T] {
+	return func(o *BufferedSinkOptions[T]) {
 		if fn != nil {
 			o.OnDrop = fn
 		}
 	}
 }
 
-// BufferedAuditSink 是审计事件的缓冲批量 sink 原语（middleware#141 后半）：
+// BufferedSink 是缓冲批量 sink **原语**（#192 泛型化，middleware#141 后半）：
 // chan 缓冲 + 后台 goroutine 攒批 + 按 BatchSize/FlushInterval 触发 flush +
 // 背压丢弃策略——fuxi_engine bufferWriter（351 行手搓）里最重复、最容易写错
-// 的「缓冲/批量/背压/关闭」生命周期的原语化。DB/队列消费方只需实现
-// AuditBatchSink。
+// 的「缓冲/批量/背压/关闭」生命周期的原语化。元素类型参数化（T = 消费方
+// 域模型），域模型消费者不再因 AuditEvent 特化重新手搓 chan+ticker+batch
+// （#181 的关闭竞态修复对全部 T 自动生效）。
 //
-// 背压口径：缓冲满时丢弃事件并计数（审计是旁路，绝不阻塞/拖垮请求）——
-// 丢弃是显式策略而非静默失败（Dropped() 可观测，OnDrop 可接管处置）。
+// 背压口径：缓冲满时丢弃事件并计数（缓冲批量是旁路，绝不阻塞/拖垮请求）——
+// 丢弃是显式策略而非静默失败（Dropped() 可观测，WithSinkOnDrop 可接管处置）。
 //
-// 方法 Sink 与 AuditSink 签名一致（方法值直接传 WithAuditLogSink）：
+// 方法 Sink 签名与事件投递面一致（AuditEvent 特化的方法值直接传
+// WithAuditLogSink；其它域模型按各自投递面包装）。泛型选项构造器需显式
+// 带元素类型实参（T 不从 flush 参数跨函数推断）：
 //
-//	buf := mw.NewBufferedAuditSink(dao.SaveAuditBatch,
-//	    mw.WithAuditBatchSize(200), mw.WithAuditFlushInterval(3*time.Second))
-//	h.Use(mw.AuditLogMiddleware(mw.WithAuditLogPaths("/api/admin/**"),
-//	    mw.WithAuditLogSink(buf.Sink)))
+//	buf := mw.NewBufferedSink(mydao.SaveBatch,
+//	    mw.WithSinkBatchSize[models.AuditLog](200),
+//	    mw.WithSinkFlushInterval[models.AuditLog](3*time.Second))
 //	defer buf.Close(context.Background())
 //
 // Close 语义（平台生命周期约定 Close(ctx) error + sync.Once 幂等）：停止
@@ -446,17 +582,24 @@ func WithAuditOnDrop(fn func(ev AuditEvent)) BufferedAuditSinkOption {
 // 「Sink 侧检查通过后 Close 完成 drain 退出、发送才落地」的静默漏记窗口——
 // 事件要么赶在关闭前入缓冲（必被 drain 冲刷），要么看到 closed 按丢弃口径
 // 计数处置，两个去向都可观测。
-type BufferedAuditSink struct {
-	inner         AuditBatchSink
+type BufferedSink[T any] struct {
+	inner         BatchSink[T]
 	bufferSize    int
 	batchSize     int
 	flushInterval time.Duration
-	onDrop        func(ev AuditEvent)
-	ch            chan AuditEvent
-	stop          chan struct{}
-	done          chan struct{}
-	dropped       atomic.Int64
-	closeOnce     sync.Once
+	onDrop        func(ev T)
+	// dropDetail（特化钩子，#192）：AuditEvent 特化保留 who/path 域字段的
+	// 缺省丢弃日志形态（NewBufferedAuditSink 注入）；nil 走通用缺省（只记
+	// 计数面——通用原语不解读域模型）。
+	dropDetail func(ev T, reason string, total int64)
+	// flushFail（特化钩子，#192）：AuditEvent 特化保留 first_path 域字段的
+	// flush 失败日志形态；nil 走通用缺省（只记事件数）。
+	flushFail func(err error, events []T)
+	ch        chan T
+	stop      chan struct{}
+	done      chan struct{}
+	dropped   atomic.Int64
+	closeOnce sync.Once
 	// mu/closed（#181）：Sink 持 RLock 做「closed 判定 + 入队」原子化，
 	// Close 持 Lock 置 closed + close(stop)——与 wsutil.Outbox(#117) /
 	// streamx.SSESink(#144) 的收口口径同源。ch 永不关闭（run 靠 stop 退出
@@ -465,18 +608,18 @@ type BufferedAuditSink struct {
 	closed bool
 }
 
-// NewBufferedAuditSink 构造缓冲批量 sink 并启动后台 flush goroutine。
+// NewBufferedSink 构造缓冲批量 sink 原语并启动后台 flush goroutine。
 // inner 为 nil 或选项为负值时构造期 panic（fail-fast）。
-func NewBufferedAuditSink(inner AuditBatchSink, opts ...BufferedAuditSinkOption) *BufferedAuditSink {
+func NewBufferedSink[T any](inner BatchSink[T], opts ...BufferedSinkOption[T]) *BufferedSink[T] {
 	if inner == nil {
-		panic("mw.NewBufferedAuditSink: inner sink must not be nil")
+		panic("mw.NewBufferedSink: inner sink must not be nil")
 	}
-	var o BufferedAuditSinkOptions
+	var o BufferedSinkOptions[T]
 	for _, opt := range opts {
 		opt(&o)
 	}
 	if o.BufferSize < 0 || o.BatchSize < 0 || o.FlushInterval < 0 {
-		panic("mw.NewBufferedAuditSink: negative BufferSize/BatchSize/FlushInterval")
+		panic("mw.NewBufferedSink: negative BufferSize/BatchSize/FlushInterval")
 	}
 	if o.BufferSize == 0 {
 		o.BufferSize = 1024
@@ -487,13 +630,13 @@ func NewBufferedAuditSink(inner AuditBatchSink, opts ...BufferedAuditSinkOption)
 	if o.FlushInterval == 0 {
 		o.FlushInterval = 5 * time.Second
 	}
-	b := &BufferedAuditSink{
+	b := &BufferedSink[T]{
 		inner:         inner,
 		bufferSize:    o.BufferSize,
 		batchSize:     o.BatchSize,
 		flushInterval: o.FlushInterval,
 		onDrop:        o.OnDrop,
-		ch:            make(chan AuditEvent, o.BufferSize),
+		ch:            make(chan T, o.BufferSize),
 		stop:          make(chan struct{}),
 		done:          make(chan struct{}),
 	}
@@ -503,14 +646,13 @@ func NewBufferedAuditSink(inner AuditBatchSink, opts ...BufferedAuditSinkOption)
 	return b
 }
 
-// Sink 追加一条审计事件（AuditSink 签名，方法值可直接传 WithAuditLogSink）。
-// 非阻塞：缓冲满或已关闭时按丢弃策略处置并计数，恒返回 nil——丢弃是策略
-// 不是错误，请求侧零阻塞。
+// Sink 追加一条事件。非阻塞：缓冲满或已关闭时按丢弃策略处置并计数，恒
+// 返回 nil——丢弃是策略不是错误，请求侧零阻塞。
 //
 // closed 判定与入队持 RLock 原子化（#181）：原实现「查 stop → 发 ch」两步
 // 无锁，窗口内 Close 完成 drain 退出后发送仍成功（ch 永不关闭），事件滞留
 // channel 永不 flush 且不计数不留痕 = 静默漏记；审计面漏记比多记危险（#141）。
-func (b *BufferedAuditSink) Sink(ctx context.Context, ev AuditEvent) error {
+func (b *BufferedSink[T]) Sink(ctx context.Context, ev T) error {
 	b.mu.RLock()
 	defer b.mu.RUnlock()
 	if b.closed {
@@ -528,14 +670,14 @@ func (b *BufferedAuditSink) Sink(ctx context.Context, ev AuditEvent) error {
 
 // Dropped 返回累计丢弃事件数（背压观测口：>0 说明下游消费能力不足或
 // 缓冲偏小，消费方据此调 BufferSize/BatchSize 或告警）。
-func (b *BufferedAuditSink) Dropped() int64 {
+func (b *BufferedSink[T]) Dropped() int64 {
 	return b.dropped.Load()
 }
 
 // Close 停止接收并落盘已缓冲事件，幂等（sync.Once）。ctx 控制 final flush
 // 的等待上限，超时返回包装后的 ctx.Err()（已缓冲事件的最终处置以 inner
 // sink 的实际表现为准）。Close 之后 Sink 的调用按丢弃口径计数。
-func (b *BufferedAuditSink) Close(ctx context.Context) error {
+func (b *BufferedSink[T]) Close(ctx context.Context) error {
 	var err error
 	b.closeOnce.Do(func() {
 		// 持写锁置 closed + close(stop)（#181）：与 Sink 的 RLock 互斥——
@@ -549,36 +691,38 @@ func (b *BufferedAuditSink) Close(ctx context.Context) error {
 		select {
 		case <-b.done:
 		case <-ctx.Done():
-			err = fmt.Errorf("mw.BufferedAuditSink: close timed out waiting final flush: %w", ctx.Err())
+			err = fmt.Errorf("mw.BufferedSink: close timed out waiting final flush: %w", ctx.Err())
 		}
 	})
 	return err
 }
 
-// drop 丢弃一条事件：计数 + OnDrop（或缺省 Warn 日志）。
-func (b *BufferedAuditSink) drop(ev AuditEvent, reason string) {
+// drop 丢弃一条事件：计数 + OnDrop（或特化缺省/通用缺省 Warn 日志）。
+func (b *BufferedSink[T]) drop(ev T, reason string) {
 	total := b.dropped.Add(1)
 	if b.onDrop != nil {
 		b.onDrop(ev)
 		return
 	}
-	auditLog.Warn("audit event dropped",
+	if b.dropDetail != nil {
+		b.dropDetail(ev, reason, total)
+		return
+	}
+	bufferedSinkLog.Warn("buffered sink event dropped",
 		"reason", reason,
 		"dropped_total", total,
 		"buffer_size", b.bufferSize,
-		"who", ev.Who,
-		"path", ev.Path,
 	)
 }
 
 // run 后台攒批循环：BatchSize 攒满即刷、FlushInterval 兜底刷、stop 后
 // drain 余量再退出。batch 交付前拷贝（sink 可安全异步持有），flush 失败
 // 只记 Warn——缓冲链路的失败不回灌、不阻塞下一次攒批。
-func (b *BufferedAuditSink) run() {
+func (b *BufferedSink[T]) run() {
 	defer close(b.done)
 	ticker := time.NewTicker(b.flushInterval)
 	defer ticker.Stop()
-	batch := make([]AuditEvent, 0, b.batchSize)
+	batch := make([]T, 0, b.batchSize)
 	for {
 		select {
 		case ev := <-b.ch:
@@ -611,17 +755,98 @@ func (b *BufferedAuditSink) run() {
 	}
 }
 
-// flush 单次批量交付：拷贝后交 inner sink，error 只记 Warn（logx.ErrKey）。
-func (b *BufferedAuditSink) flush(ctx context.Context, batch []AuditEvent) {
+// flush 单次批量交付：拷贝后交 inner sink，error 只记 Warn（logx.ErrKey，
+// 特化钩子或通用缺省）。
+func (b *BufferedSink[T]) flush(ctx context.Context, batch []T) {
 	if len(batch) == 0 {
 		return
 	}
-	events := append([]AuditEvent(nil), batch...)
+	events := append([]T(nil), batch...)
 	if err := b.inner(ctx, events); err != nil {
+		if b.flushFail != nil {
+			b.flushFail(err, events)
+			return
+		}
+		bufferedSinkLog.Warn("buffered sink batch failed",
+			logx.ErrKey, err,
+			"events", len(events),
+		)
+	}
+}
+
+// —— 以下为 AuditEvent 特化（#192）：薄别名 + 缺省日志形态保留，现有 API
+// 零变化（构造函数/选项/方法签名与 v0.17 完全一致）。
+
+// AuditBatchSink 是 AuditEvent 特化的 flush 单元（BatchSink[AuditEvent]
+// 别名，历史签名原样保留）。
+type AuditBatchSink = BatchSink[AuditEvent]
+
+// BufferedAuditSink 是审计事件的缓冲批量 sink（BufferedSink[AuditEvent]
+// 别名）：AuditLogMiddleware 高频审计面配它缓冲批量落库——原语全量能力
+// （#192 泛型化后与任意域模型共享同一实现）+ AuditEvent 特化的缺省日志
+// 形态（丢弃 Warn 带 who/path、flush 失败 Warn 带 first_path）。
+type BufferedAuditSink = BufferedSink[AuditEvent]
+
+// BufferedAuditSinkOptions 是 NewBufferedAuditSink 的配置（特化别名）。
+type BufferedAuditSinkOptions = BufferedSinkOptions[AuditEvent]
+
+// BufferedAuditSinkOption 配置 BufferedAuditSink（特化别名）。
+type BufferedAuditSinkOption = BufferedSinkOption[AuditEvent]
+
+// WithAuditBufferSize 设置事件缓冲 chan 容量（缺省 1024；负值构造期 panic）。
+func WithAuditBufferSize(n int) BufferedAuditSinkOption {
+	return WithSinkBufferSize[AuditEvent](n)
+}
+
+// WithAuditBatchSize 设置单次 flush 的事件数阈值（缺省 100；负值构造期 panic）。
+func WithAuditBatchSize(n int) BufferedAuditSinkOption {
+	return WithSinkBatchSize[AuditEvent](n)
+}
+
+// WithAuditFlushInterval 设置定时 flush 间隔（缺省 5s；负值构造期 panic）。
+func WithAuditFlushInterval(d time.Duration) BufferedAuditSinkOption {
+	return WithSinkFlushInterval[AuditEvent](d)
+}
+
+// WithAuditOnDrop 设置丢弃回调（缺省记 Warn 日志）。nil 不覆盖既有配置。
+func WithAuditOnDrop(fn func(ev AuditEvent)) BufferedAuditSinkOption {
+	return WithSinkOnDrop[AuditEvent](fn)
+}
+
+// NewBufferedAuditSink 构造审计事件缓冲批量 sink 并启动后台 flush
+// goroutine。inner 为 nil 或选项为负值时构造期 panic（fail-fast）。
+// 与直接 NewBufferedSink[AuditEvent] 的差别仅在缺省日志形态：丢弃 Warn
+// 带 who/path、flush 失败 Warn 带 first_path（v0.17 行为原样保留）。
+func NewBufferedAuditSink(inner AuditBatchSink, opts ...BufferedAuditSinkOption) *BufferedAuditSink {
+	if inner == nil {
+		panic("mw.NewBufferedAuditSink: inner sink must not be nil")
+	}
+	// 预校验负值选项，保留 v0.17 的 panic 文案（特化构造函数的历史契约）。
+	var probe BufferedAuditSinkOptions
+	for _, opt := range opts {
+		opt(&probe)
+	}
+	if probe.BufferSize < 0 || probe.BatchSize < 0 || probe.FlushInterval < 0 {
+		panic("mw.NewBufferedAuditSink: negative BufferSize/BatchSize/FlushInterval")
+	}
+	b := NewBufferedSink[AuditEvent](inner, opts...)
+	// AuditEvent 特化的缺省日志形态（#192：原语不解读域模型，特化在此
+	// 注入域字段）。onDrop 显式接管时这两个缺省都不生效。
+	b.dropDetail = func(ev AuditEvent, reason string, total int64) {
+		auditLog.Warn("audit event dropped",
+			"reason", reason,
+			"dropped_total", total,
+			"buffer_size", b.bufferSize,
+			"who", ev.Who,
+			"path", ev.Path,
+		)
+	}
+	b.flushFail = func(err error, events []AuditEvent) {
 		auditLog.Warn("audit batch sink failed",
 			logx.ErrKey, err,
 			"events", len(events),
 			"first_path", events[0].Path,
 		)
 	}
+	return b
 }

@@ -17,7 +17,7 @@ func TestValidTraceID(t *testing.T) {
 		id   string
 		want bool
 	}{
-		{"abc123def456", true},                     // 本包生成格式（12 位十六进制）
+		{"abc123def456", true},                     // 本包白名单形态（字母数字连字符；生成格式=8hex+"-"+3hex，#189）
 		{"0123456789abcdef0123456789abcdef", true}, // W3C trace-id 32 位十六进制
 		{"trace-abc-123", true},                    // 连字符白名单内
 		{"", false},                                // 空
@@ -64,5 +64,29 @@ func TestMiddleware_InvalidClientTraceID_Regenerated(t *testing.T) {
 	w := ut.PerformRequest(h.Engine, "GET", "/t", nil, ut.Header{Key: "X-Trace-Id", Value: "trace-ok-123"})
 	if got := w.Header().Get("X-Trace-Id"); got != "trace-ok-123" {
 		t.Errorf("valid inbound should be preserved, got %q", got)
+	}
+}
+
+// TestNewTraceID_Format 钉住 #189 勘误后的真实格式：12 字符 = 8 hex + '-'
+// + 3 hex（UUID 字符串前缀截断，第 9 字符恒为 '-'）——注释曾失实为
+// 「12 位十六进制」，按注释写格式断言/正则的下游以本测试为准。
+func TestNewTraceID_Format(t *testing.T) {
+	for i := 0; i < 100; i++ {
+		id := newTraceID()
+		if len(id) != 12 {
+			t.Fatalf("trace_id 长度 = %d, want 12: %q", len(id), id)
+		}
+		if id[8] != '-' {
+			t.Fatalf("★ 第 9 字符应为 '-'（UUID 前缀截断）: %q", id)
+		}
+		for j := 0; j < 12; j++ {
+			if j == 8 {
+				continue
+			}
+			r := id[j]
+			if (r < '0' || r > '9') && (r < 'a' || r > 'f') {
+				t.Fatalf("★ 非 hex 字符 %q at %d: %q", r, j, id)
+			}
+		}
 	}
 }

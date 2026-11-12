@@ -43,8 +43,9 @@ func FromRequestContext(c *app.RequestContext) string {
 // # 客户端 trace ID 白名单校验
 //
 // 客户端传入的 X-Trace-Id 经 validTraceID 白名单校验：非空、长度 ≤ 64、
-// 字符集仅 [0-9a-zA-Z-]（本包生成 12 位十六进制、W3C trace-id 为 32 位十六进制，
-// 弹性接受字母数字连字符格式；白名单防日志注入/ID 伪造关联）。
+// 字符集仅 [0-9a-zA-Z-]（本包生成 12 字符——UUID 字符串前缀截断：8 hex +
+// '-' + 3 hex，第 9 字符恒为 '-'，#189 注释勘误；W3C trace-id 为 32 位
+// 十六进制，弹性接受字母数字连字符格式；白名单防日志注入/ID 伪造关联）。
 // 不在白名单的越界 ID（超长/任意字符/空）被静默丢弃并重新生成合法 ID，
 // 三处注入（响应头 / RequestContext / 标准 context）保持一致，该请求 trace 链路不断。
 //
@@ -91,13 +92,17 @@ func Middleware() []app.HandlerFunc {
 }
 
 // newTraceID 生成 traceid.IDLength 位随机 ID（与 requestid generator 同源）。
+// 格式为 12 字符：UUID 字符串前缀截断 ⇒ 8 hex + '-' + 3 hex（第 9 字符恒
+// 为 '-'，#189——注释曾失实为「12 位十六进制」，按注释写格式断言的下游
+// 会被钉子测试 TestNewTraceID_Format 的实际格式拦住）。
 func newTraceID() string {
 	return uuid.New().String()[:traceid.IDLength]
 }
 
 // validTraceID 校验客户端提供的 trace ID：非空、长度上限 64，字符白名单
-// [0-9a-zA-Z-]（本包生成 12 位十六进制、W3C trace-id 为 32 位十六进制，
-// 弹性接受字母数字连字符格式；白名单防日志注入/洪水）。
+// [0-9a-zA-Z-]（本包生成 12 字符 = 8 hex + '-' + 3 hex，#189 勘误；
+// W3C trace-id 为 32 位十六进制，弹性接受字母数字连字符格式；
+// 白名单防日志注入/洪水）。
 func validTraceID(id string) bool {
 	if id == "" || len(id) > 64 {
 		return false

@@ -544,3 +544,200 @@ func TestBufferedAuditSink_FlushErrorWarned(t *testing.T) {
 		t.Fatal("★ flush 失败后后续攒批被阻塞")
 	}
 }
+
+// —— #192 BufferedSink[T] 泛型原语 ——
+
+// oplogRow 是泛型原语测试用的消费方域模型（模拟 fuxi *models.AuditLog 形态
+// ——与 AuditEvent 字段集不相交，#192 的收编评估实证）。
+type oplogRow struct {
+	Action string
+	IP     string
+}
+
+// TestBufferedSink_GenericDomainModel 泛型原语以任意域模型为元素类型（#192）：
+// chan 攒批/批量 flush/顺序保持对 T=oplogRow 生效——AuditEvent 特化不再把
+// 域模型挡在批量原语门外（旧 API 只收 func(ctx, []AuditEvent)）。
+func TestBufferedSink_GenericDomainModel(t *testing.T) {
+	flushed := make(chan []oplogRow, 4)
+	buf := NewBufferedSink(func(_ context.Context, rows []oplogRow) error {
+		flushed <- rows
+		return nil
+	},
+		WithSinkBatchSize[oplogRow](2),
+		WithSinkFlushInterval[oplogRow](time.Hour), // 攒批触发，不等间隔
+	)
+	defer buf.Close(context.Background())
+
+	for i := 0; i < 2; i++ {
+		if err := buf.Sink(context.Background(), oplogRow{Action: fmt.Sprint(i), IP: "10.0.0.1"}); err != nil {
+			t.Fatalf("Sink err: %v", err)
+		}
+	}
+	select {
+	case rows := <-flushed:
+		if len(rows) != 2 {
+			t.Fatalf("★ 泛型批量 flush = %d rows, want 2", len(rows))
+		}
+		if rows[0].Action != "0" || rows[1].Action != "1" || rows[1].IP != "10.0.0.1" {
+			t.Fatalf("★ flush 顺序/内容必须保持: %+v", rows)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ 攒满 BatchSize 未触发 flush")
+	}
+}
+
+// TestBufferedSink_GenericFailFastAndDrop 泛型原语的生命周期契约对任意 T
+// 一致（#192）：inner nil / 负值选项构造期 panic；Close 后 Sink 按丢弃口径
+// 计数（#181 修复对全部 T 自动生效）。
+func TestBufferedSink_GenericFailFastAndDrop(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func()
+	}{
+		{"nil inner", func() { NewBufferedSink[oplogRow](nil) }},
+		{"negative buffer", func() {
+			NewBufferedSink(func(context.Context, []oplogRow) error { return nil },
+				WithSinkBufferSize[oplogRow](-1))
+		}},
+		{"negative batch", func() {
+			NewBufferedSink(func(context.Context, []oplogRow) error { return nil },
+				WithSinkBatchSize[oplogRow](-1))
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("★ %s: 构造必须 panic(fail-fast)", c.name)
+				}
+			}()
+			c.run()
+		})
+	}
+
+	// Close 后 Sink 丢弃计数（#181 口径随泛型收编对任意 T 生效）。
+	buf := NewBufferedSink(func(context.Context, []oplogRow) error { return nil })
+	if err := buf.Close(context.Background()); err != nil {
+		t.Fatalf("close: %v", err)
+	}
+	_ = buf.Sink(context.Background(), oplogRow{Action: "late"})
+	if got := buf.Dropped(); got != 1 {
+		t.Fatalf("★ Close 后 Sink 必须计入丢弃: dropped=%d, want 1", got)
+	}
+}
+
+// —— #193 AuditEvent IP/UA/Extra 域字段缝 ——
+
+// TestAuditLogMiddleware_ClientFieldsDefault 缺省采集口径（#193）：
+// IP=连接对端地址 host（fail-closed，不读 XFF——#83 同口径）、
+// UA=User-Agent 头原值。
+func TestAuditLogMiddleware_ClientFieldsDefault(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/admin/**"),
+		WithAuditLogSink(collected.sinkFunc),
+	))
+	h.GET("/api/admin/users", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+
+	ut.PerformRequest(h.Engine, "GET", "/api/admin/users", nil,
+		ut.Header{Key: "User-Agent", Value: "audit-probe/1.0"},
+		ut.Header{Key: "X-Forwarded-For", Value: "203.0.113.99"}, // 可控头：缺省口径必须不读
+	)
+
+	events := collected.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.IP == "" {
+		t.Fatal("★ 缺省 IP 必须采对端地址（非空）")
+	}
+	if strings.Contains(ev.IP, ":") {
+		t.Fatalf("★ IP 应为 host 部分（不带端口）: %q", ev.IP)
+	}
+	if ev.UA != "audit-probe/1.0" {
+		t.Fatalf("★ UA 缺省=User-Agent 头原值: got %q", ev.UA)
+	}
+}
+
+// TestAuditLogMiddleware_OmitClientFields OmitClientFields 置位后 IP/UA 缺省
+// 采集关闭（#193，合规禁采网络维度）；显式注入的 IPFunc 不受开关影响。
+func TestAuditLogMiddleware_OmitClientFields(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/admin/**"),
+		WithAuditLogSink(collected.sinkFunc),
+		WithAuditLogOmitClientFields(),
+	))
+	h.GET("/api/admin/users", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+
+	ut.PerformRequest(h.Engine, "GET", "/api/admin/users", nil,
+		ut.Header{Key: "User-Agent", Value: "audit-probe/1.0"},
+	)
+
+	events := collected.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	if events[0].IP != "" || events[0].UA != "" {
+		t.Fatalf("★ OmitClientFields 后 IP/UA 必须为空: ip=%q ua=%q", events[0].IP, events[0].UA)
+	}
+}
+
+// TestAuditLogMiddleware_ClientSeams IP/UA/Extra 提取缝（#193）：显式注入
+// 覆盖缺省口径——代理拓扑按可信网段归因 IP、UA 截断形态、Extra 承载
+// Body 摘要等审计域字段（fuxi op_log 域表收编的字段缝）。
+func TestAuditLogMiddleware_ClientSeams(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/admin/**"),
+		WithAuditLogSink(collected.sinkFunc),
+		WithAuditLogClientIP(func(ctx context.Context, c *app.RequestContext) string {
+			return "resolved-client-ip"
+		}),
+		WithAuditLogUA(func(ctx context.Context, c *app.RequestContext) string {
+			return "ua-truncated"
+		}),
+		WithAuditLogExtra(func(ctx context.Context, c *app.RequestContext) map[string]string {
+			return map[string]string{"body_digest": "sha256:deadbeef", "resource_type": "policy"}
+		}),
+	))
+	h.GET("/api/admin/users", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+
+	ut.PerformRequest(h.Engine, "GET", "/api/admin/users", nil,
+		ut.Header{Key: "User-Agent", Value: "original-ua/9.9"},
+	)
+
+	events := collected.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	ev := events[0]
+	if ev.IP != "resolved-client-ip" {
+		t.Fatalf("★ IPFunc 注入必须覆盖缺省: %q", ev.IP)
+	}
+	if ev.UA != "ua-truncated" {
+		t.Fatalf("★ UAFunc 注入必须覆盖缺省: %q", ev.UA)
+	}
+	if ev.Extra["body_digest"] != "sha256:deadbeef" || ev.Extra["resource_type"] != "policy" {
+		t.Fatalf("★ Extra 域字段缝未生效: %+v", ev.Extra)
+	}
+}
