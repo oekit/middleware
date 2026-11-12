@@ -262,6 +262,24 @@ func (t GatewayTrust) verify(c *app.RequestContext, n TrustHeaderNames) (Subject
 	return sub, true
 }
 
+// gatewayTrustPresented 判定请求是否**呈现了**网关立证。折叠条件与
+// GatewayTrust.verify 的「未呈现」分支同源（#184）：UID 与 Signature 均
+// 缺席且无任何信任头多值走私 ⇒ 未呈现；任一信任头多值（走私注入）或
+// UID/Signature 任一存在 ⇒ 已呈现——「呈现了但验不过」在 AuthModeAuto
+// 下不再与「未呈现」混同降级，而是 401 + Warn（可疑流量显式拒绝）。
+//
+// ⚠️ 必须在剥头前调用：VerifyGatewayTrust 失败路径会把全部信任头剥掉，
+// 剥头后呈现状态无从判定。
+func gatewayTrustPresented(c *app.RequestContext, n TrustHeaderNames) bool {
+	for _, name := range n.all() {
+		if len(c.Request.Header.PeekAll(name)) > 1 {
+			return true // 多值走私：头是呈现了的，只是不成立
+		}
+	}
+	return strings.TrimSpace(string(c.GetHeader(n.UID))) != "" ||
+		len(c.GetHeader(n.Signature)) != 0
+}
+
 // sourceTrusted 判定来源立证：对端地址是回环（网关/边车同机形态）或落在
 // TrustedSources 网段。取连接对端地址（c.RemoteAddr）——不读任何转发头，
 // X-Forwarded-For 是客户端可控的（#83 同口径）。
@@ -355,8 +373,9 @@ type AuthMode int
 
 const (
 	// AuthModeAuto（默认，组合）：请求呈现网关立证走网关信任（立证失败
-	// 401——呈现了立证却验不过是可疑流量，不再降级）；未呈现则落本地
-	// JWT 兜底。
+	// 401——呈现了立证却验不过是可疑流量，不再降级，#184 定版并兑现：
+	// 「呈现」= UID/Signature 任一存在或任一信任头多值走私，判定与
+	// VerifyGatewayTrust 的未呈现折叠条件同源）；未呈现则落本地 JWT 兜底。
 	AuthModeAuto AuthMode = iota
 	// AuthModeGatewayOnly（切换）：仅网关信任——未呈现立证或立证失败都
 	// 401，本地 JWT 不启用。
@@ -372,6 +391,13 @@ type SmartAuthOptions struct {
 	Mode AuthMode
 	// SkipPaths 不需要认证的路径（如 /healthz）。命中即放行——但信任头
 	// 照样剥除：skip ≠ 可携带伪造身份头继续（#136 教训）。
+	//
+	// 匹配语义（#187）：**精确匹配**（与 c.Path() 原文 == 比较，非 glob，
+	// `*` 与 `/**` 无特殊含义——写 "/api/**" 不会豁免 /api/ 下的任何路径）；
+	// glob 语义在同包的观测/限流家族（WithAccessLogSkipPaths/
+	// WithRateLimitSkipPaths 的 pathx.MatchesPath）。两类语义不对称是
+	// 认证家族的有意选择（豁免认证面按显式声明制收窄），文档在此对称
+	// 声明以防迁移误用。
 	SkipPaths []string
 	// SkipFunc 自定义跳过逻辑（与 SkipPaths 任一命中即跳过）。
 	SkipFunc func(path string) bool
@@ -395,6 +421,11 @@ func WithSmartAuthMode(m AuthMode) SmartAuthOption {
 }
 
 // WithSmartAuthSkipPaths 设置免认证路径。
+//
+// 匹配语义（#187）：**精确匹配**（c.Path() 原文 == 比较，非 glob，`*` 与
+// "/**" 无特殊含义——"/api/**" 不会豁免 "/api/users"）；glob 语义在同包
+// 观测/限流家族（WithAccessLogSkipPaths/WithRateLimitSkipPaths），认证家族
+// 豁免面按显式声明制收窄。
 func WithSmartAuthSkipPaths(paths ...string) SmartAuthOption {
 	return func(o *SmartAuthOptions) { o.SkipPaths = append(o.SkipPaths, paths...) }
 }
@@ -435,8 +466,10 @@ func WithSmartAuthAdminMatcher(fn func(role string) bool) SmartAuthOption {
 //
 //  1. SkipPaths/SkipFunc 命中 ⇒ 剥信任头后放行（免认证路径不留伪造头）；
 //  2. 网关路径（trust 非 nil 且非 LocalOnly）：VerifyGatewayTrust 立证——
-//     成功用网关 Subject（身份头保留）；失败已剥头，GatewayOnly 返 401，
-//     Auto 落本地；
+//     成功用网关 Subject（身份头保留）；失败已剥头，GatewayOnly 一律 401，
+//     Auto 仅在**未呈现**立证时落本地——呈现了立证（UID/Signature/任一
+//     信任头多值走私）却验不过是可疑流量，同样 401 + Warn（#184 定版，
+//     不再静默降级）；
 //  3. 本地路径：剥信任头后取 Authorization Bearer 交 parse（kitx/jwt 等
 //     校验面），失败 401；
 //  4. Authorizer（可选）：拒绝 403 / 故障 500；
@@ -514,18 +547,24 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 		var sub Subject
 		attested := false
 		if trust != nil && cfg.Mode != AuthModeLocalOnly {
+			// presented 判定必须在 VerifyGatewayTrust 之前：其失败路径会把
+			// 全部信任头剥掉，剥头后「呈现过什么」无从判定（#184）。
+			presented := gatewayTrustPresented(c, names)
 			s, ok := VerifyGatewayTrust(*trust, c) // false 路径已剥头
 			if ok {
 				sub, attested = s, true
-			} else if cfg.Mode == AuthModeGatewayOnly {
-				// 呈现立证却验不过（或未呈现）在 gateway-only 下都是 401；
-				// 伪造尝试是安全信号，Warn 留痕（认证 401 本身静默）。
+			} else if cfg.Mode == AuthModeGatewayOnly || presented {
+				// GatewayOnly：未呈现/验不过都 401；Auto：呈现了立证却验不过
+				// 是可疑流量（客户端伪造或网关密钥/拓扑漂移），不再静默降级
+				// 落本地——401 + Warn 留痕（认证 401 本身静默，这里是显式
+				// 安全信号，#184 定版，与 AuthModeAuto 常量注释的承诺对齐）。
 				smartAuthLog.CtxWarn(ctx, "gateway trust verification failed",
 					"path", path, "remote", c.RemoteAddr().String())
 				ErrorResp(c, 401, "unauthorized")
 				return
 			}
-			// AuthModeAuto：落本地 JWT 兜底（信任头已剥净，伪造头进不了链路）。
+			// AuthModeAuto 且未呈现立证：落本地 JWT 兜底（信任头已剥净，
+			// 伪造头进不了链路）。
 		} else {
 			// 无立证面（trust nil）或 LocalOnly：信任头一律剥除——身份只
 			// 来自本地 JWT，头伪造面从结构上关死。

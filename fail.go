@@ -48,7 +48,7 @@ func WithNotFoundChecker(checker func(error) bool) FailOption {
 //  2. err 匹配 NotFoundErrChecker -> ErrorResp(c, 404, "resource not found")
 //  3. err 包装 registry.ErrNoInstances -> ErrorResp(c, 503, "service unavailable")
 //     （依赖服务无可用实例是依赖不可用而非本服务 bug，Warn 级日志避免误告警）
-//  4. 其他 err -> failLog.CtxError(ctx, "internal error", "err", err) + ErrorResp(c, 500, "internal server error")
+//  4. 其他 err -> failLog.CtxError(ctx, "internal error", logx.ErrKey, err) + ErrorResp(c, 500, "internal server error")
 //
 // 500 fallback 路径必 log (unexpected server error), BizError / not-found / 503
 // 走 4xx/5xx 语义码是 expected 状态, 不打 error noise.
@@ -81,7 +81,7 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 	}
 	// 发现类错误：上游无可用实例 → 503（依赖不可用语义）
 	if stderrors.Is(err, registry.ErrNoInstances) {
-		failLog.CtxWarn(ctx, "dependency has no instances", "err", err)
+		failLog.CtxWarn(ctx, "dependency has no instances", logx.ErrKey, err)
 		ErrorResp(c, 503, "service unavailable")
 		return
 	}
@@ -100,7 +100,7 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 		ErrorResp(c, 404, "resource not found")
 		return
 	}
-	failLog.CtxError(ctx, "internal error", "err", err)
+	failLog.CtxError(ctx, "internal error", logx.ErrKey, err)
 	ErrorResp(c, 500, "internal server error")
 }
 

@@ -204,7 +204,7 @@ func (s *i18nState) ensureCatalog(ctx context.Context) Catalog {
 	if err != nil {
 		s.lastFailNano.Store(time.Now().UnixNano())
 		i18nLog.Warn("i18n bundle loader failed; serving without catalog (retry after backoff)",
-			"err", err)
+			logx.ErrKey, err)
 		return nil
 	}
 	if loaded == nil {

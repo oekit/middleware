@@ -2,6 +2,7 @@ package mw
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"strconv"
 	"strings"
@@ -276,7 +277,7 @@ func TestRateLimitMiddleware_InfraPathsDefaultSkip(t *testing.T) {
 	assert.DeepEqual(t, consts.StatusTooManyRequests, rlRequest(h, "/api/data").Response.StatusCode())
 
 	// 标准探活/监控端点缺省豁免：配额耗尽后依旧放行（不占配额）
-	for _, p := range InfraPaths {
+	for _, p := range InfraPaths() {
 		assert.DeepEqual(t, consts.StatusOK, rlRequest(h, p).Response.StatusCode())
 	}
 }
@@ -499,4 +500,22 @@ func TestRateLimitMiddlewareWithLimiter_Headers_NoQuotaExit(t *testing.T) {
 	if got := string(c.Response.Header.Peek(headerRateLimitRemaining)); got != "" {
 		t.Errorf("X-RateLimit-Remaining = %q, want empty (no Tokens() exit)", got)
 	}
+}
+
+// TestRateLimitMiddleware_BadGlobPatternPanics 构造期 glob 语法预检（#201，
+// fail-fast 与 chainmw.AccessLog #161 同判据）：坏 pattern（filepath.
+// ErrBadPattern）在启动期 panic——pathx.MatchesPath 宽松档会把它吞成
+// 「不匹配」，豁免判据静默失效、该限流的路径 429 误伤且零信号。
+func TestRateLimitMiddleware_BadGlobPatternPanics(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("★ 坏 glob pattern 构造必须 panic(fail-fast，#201)")
+		} else if msg := fmt.Sprint(r); !strings.Contains(msg, "/api/[admin") {
+			t.Fatalf("panic 信息应点名坏 pattern: %v", r)
+		}
+	}()
+	RateLimitMiddleware(
+		WithRateLimit(100, 200),
+		WithRateLimitSkipPaths("/api/[admin"), // 未闭合的 [ = ErrBadPattern
+	)
 }

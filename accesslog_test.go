@@ -199,12 +199,12 @@ func TestAccessLogMiddleware_InfraPathsDefaultSkip(t *testing.T) {
 		WithAccessLogSink(func(context.Context, *app.RequestContext, AccessRecord) error { calls++; return nil }),
 	))
 	handler := func(ctx context.Context, c *app.RequestContext) { c.String(200, "ok") }
-	for _, p := range InfraPaths {
+	for _, p := range InfraPaths() {
 		h.GET(p, handler)
 	}
 	h.GET("/api/data", handler)
 
-	for _, p := range InfraPaths {
+	for _, p := range InfraPaths() {
 		before := calls
 		ut.PerformRequest(h, http.MethodGet, p, nil)
 		if calls != before {
@@ -238,5 +238,31 @@ func TestAccessLogMiddleware_ExplicitSkipPathsOverride(t *testing.T) {
 	ut.PerformRequest(h, http.MethodGet, "/internal/inspect", nil)
 	if calls != 1 {
 		t.Fatalf("显式清单内的 /internal/inspect 应被跳过，期望仍 1 次，got %d", calls)
+	}
+}
+
+// TestInfraPaths_ReturnsIsolatedCopy 钉住 #188：InfraPaths() 返回独立副本——
+// 消费方对返回值的修改（改元素/追加）不得污染库内清单（旧形态是导出可变
+// 包级切片，一次 append 即全进程污染 accesslog/ratelimit 豁免面且静默）。
+func TestInfraPaths_ReturnsIsolatedCopy(t *testing.T) {
+	want := []string{"/metrics", "/ping", "/healthz", "/livez", "/readyz", "/health", "/ready", "/buildVersion"}
+	first := InfraPaths()
+	if len(first) != len(want) {
+		t.Fatalf("InfraPaths() 内容漂移: %v", first)
+	}
+	for i := range want {
+		if first[i] != want[i] {
+			t.Fatalf("InfraPaths()[%d] = %q, want %q", i, first[i], want[i])
+		}
+	}
+	// 修改返回值（改元素 + 追加）：两次调用互不影响，库内清单不被污染。
+	first[0] = "/evil"
+	mutated := append(first, "/extra")
+	if len(mutated) != len(want)+1 {
+		t.Fatalf("mutated append 应独立于库内清单: %v", mutated)
+	}
+	second := InfraPaths()
+	if len(second) != len(want) || second[0] != want[0] {
+		t.Fatalf("★ InfraPaths() 必须返回独立副本（#188），got %v", second)
 	}
 }

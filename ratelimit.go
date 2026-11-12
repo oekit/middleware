@@ -2,8 +2,10 @@ package mw
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"net"
+	"path/filepath"
 	"strconv"
 	"time"
 
@@ -34,7 +36,7 @@ type RateLimitOptions struct {
 	// 用于 /ping /healthz /ready /metrics 等探活/监控路径——没有豁免口时
 	// 健康检查会被业务流量的 429 误伤。
 	//
-	// 缺省语义（#137）：未显式传时用 mw.InfraPaths 兜底（标准探活/监控
+	// 缺省语义（#137）：未显式传时用 mw.InfraPaths() 兜底（标准探活/监控
 	// 端点不占配额，探针风暴不进限流计数）；显式传则**完全覆盖**缺省——
 	// 不在显式清单内的路径（含 InfraPaths 里的）照常限流，不是
 	// 「InfraPaths + 显式清单」的并集。
@@ -88,8 +90,8 @@ func WithLimiterTTL(ttl time.Duration) RateLimitOption {
 // 429 误伤。
 //
 // ⚠️ 显式传即**完全覆盖** InfraPaths 缺省（#137）：不在显式清单内的路径
-// 照常限流——需要额外豁免业务路径又想保留探活豁免时，把 mw.InfraPaths
-// 一并写进清单（`append(mw.InfraPaths, "/api/**")`）。
+// 照常限流——需要额外豁免业务路径又想保留探活豁免时，把 mw.InfraPaths()
+// 一并写进清单（`append(mw.InfraPaths(), "/api/**")`）。
 //
 // ⚠️ glob 语义是 filepath.Match（pathx.MatchesPath）：`*` 单段不跨 "/"，
 // "/ready*" 只命中 /readyz 等同段路径，不命中 /ready/deep-check 等嵌套
@@ -157,6 +159,15 @@ func newRateLimitOptions(opts ...RateLimitOption) *RateLimitOptions {
 		opt(cfg)
 	}
 	cfg.SkipPaths = withInfraPathsDefault(cfg.SkipPaths) // #137 缺省兜底
+	// 构造期预检 SkipPaths glob 语法（#201，fail-fast，与 chainmw.AccessLog #161
+	// 同一份判据）：pathx.MatchesPath 宽松档把 filepath.ErrBadPattern 吞成
+	// 「不匹配」，一个坏 pattern 会让全部豁免判据静默失效——该限流的路径
+	// 429 误伤、该放行的探活路径占配额，且零信号。误配在启动期炸响。
+	for _, p := range cfg.SkipPaths {
+		if _, err := filepath.Match(p, ""); err != nil {
+			panic(fmt.Sprintf("mw.RateLimitMiddleware: invalid SkipPaths glob pattern %q: %v", p, err))
+		}
+	}
 	if cfg.KeyFunc == nil {
 		cfg.KeyFunc = defaultIPKey
 	}
@@ -177,7 +188,7 @@ func newRateLimitOptions(opts ...RateLimitOption) *RateLimitOptions {
 // RateLimitMiddlewareWithLimiter 自建并持有 KeyedLimiter。
 //
 // 可选能力（默认全关，保持既有消费方行为不变）：
-//   - SkipPaths — 探活/监控路径豁免限流；缺省按 mw.InfraPaths 兜底（#137，
+//   - SkipPaths — 探活/监控路径豁免限流；缺省按 mw.InfraPaths() 兜底（#137，
 //     标准探活/监控端点不占配额），显式传则完全覆盖缺省（不是追加）
 //   - WithRateLimitHeaders — 限流响应头（X-RateLimit-Remaining / Retry-After /
 //     X-RateLimit-Reset，数字读自 TokenBucket 的剩余配额出口）

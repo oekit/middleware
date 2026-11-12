@@ -298,3 +298,37 @@ func TestBearerTokenAuth_MultipleSpacesToken(t *testing.T) {
 	runBearerAuth(t, c, WithBearerToken(testBearerToken))
 	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
 }
+
+// TestBearerTokenAuth_SkipPathsExactMatchNotGlob 钉住 #187：认证家族
+// SkipPaths 是**精确匹配**（c.Path() 原文 == 比较）——glob 形态 "/api/**"
+// 不豁免 "/api/users"，`*` 无特殊含义；glob 语义仅存在于同包观测/限流家族
+// （WithAccessLogSkipPaths/WithRateLimitSkipPaths 的 pathx.MatchesPath）。
+// 从限流中间件迁移过来的调用方写 glob 给认证家族会静默零命中，本钉子测试
+// 与 WithAuthSkipPaths 的文档声明互为印证。
+func TestBearerTokenAuth_SkipPathsExactMatchNotGlob(t *testing.T) {
+	// glob 形态不豁免：/api/users 不匹配 "/api/**"（精确匹配语义）。
+	auth := &fakeAuthorizer{allowed: true}
+	c := buildCtx(testBearerToken)
+	c.Request.URI().SetPath("/api/users")
+	runBearerAuth(t, c,
+		WithBearerToken(testBearerToken),
+		WithAuthSkipPaths("/api/**"),
+		WithAuthAuthorizer(auth),
+	)
+	if auth.called != 1 {
+		t.Fatalf("★ \"/api/**\" 不得豁免 /api/users（精确匹配，非 glob，#187）: called=%d", auth.called)
+	}
+
+	// 原文精确命中才豁免。
+	auth2 := &fakeAuthorizer{allowed: true}
+	c2 := buildCtx(testBearerToken)
+	c2.Request.URI().SetPath("/healthz")
+	runBearerAuth(t, c2,
+		WithBearerToken(testBearerToken),
+		WithAuthSkipPaths("/healthz"),
+		WithAuthAuthorizer(auth2),
+	)
+	if auth2.called != 0 {
+		t.Fatalf("精确命中仍应豁免: called=%d", auth2.called)
+	}
+}

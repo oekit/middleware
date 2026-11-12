@@ -424,9 +424,12 @@ func TestSmartAuth_AutoFallsBackToLocal(t *testing.T) {
 	}
 }
 
-// TestSmartAuth_AutoForgedGatewayHeadersStripped 组合模式 + 头伪造：伪造头
-// 必须剥掉（含 Authorized——SmartRBAC 跳过面），身份只来自本地 JWT。
-func TestSmartAuth_AutoForgedGatewayHeadersStripped(t *testing.T) {
+// TestSmartAuth_AutoForgedGatewayHeadersRejected401 组合模式 + 头伪造（#184
+// 定版）：呈现了立证（UID 头存在）却验不过 = 可疑流量，Auto 不再静默降级
+// 落本地——401 且剥头（含 Authorized——SmartRBAC 跳过面），本地 parse 不启用。
+// 旧形态（剥头后落本地 JWT）在 #184 前是实现，与 AuthModeAuto 常量注释的
+// 承诺矛盾，定版以注释承诺为准（fail-closed）。
+func TestSmartAuth_AutoForgedGatewayHeadersRejected401(t *testing.T) {
 	probe := &parseProbe{sub: Subject{UserID: "jwt-user"}}
 	trust := GatewayTrust{Secret: []byte("sec")}
 	h := SmartAuth(probe.parse, &trust)
@@ -436,15 +439,56 @@ func TestSmartAuth_AutoForgedGatewayHeadersStripped(t *testing.T) {
 		ut.Header{Key: "Authorization", Value: "Bearer tok-1"},
 	)
 	h(context.Background(), c)
-	if c.IsAborted() {
-		t.Fatalf("本地 JWT 有效应放行: %d", c.Response.StatusCode())
+	if !c.IsAborted() || c.Response.StatusCode() != 401 {
+		t.Fatalf("呈现立证却验不过应 401（不降级，#184）: status=%d", c.Response.StatusCode())
 	}
 	if left := hasTrustHeaders(c, trust.headerNames()); len(left) != 0 {
 		t.Fatalf("伪造信任头不得进入链路（含 Authorized），残留: %v", left)
 	}
-	claims, ok := loadClaims(c)
-	if !ok || claims.UserID != "jwt-user" {
-		t.Fatalf("身份必须来自 JWT 而非伪造头: ok=%v %+v", ok, claims)
+	if got := probe.calls(); len(got) != 0 {
+		t.Fatalf("呈现立证失败后不得回落本地 parse（可疑流量不降级）: %v", got)
+	}
+}
+
+// TestSmartAuth_AutoBadSignatureRejected401 组合模式 + 签名验不过（#184 钉子
+// 测试）：呈现了完整立证形态（UID+Signature）但签名错误（且来源不可信——
+// 回环/TrustedSources 的来源立证独立成立，不进签名路径）→ 401，本地 parse
+// 不启用——「立证验不过不降级」的承诺只对呈现了立证的请求生效。
+func TestSmartAuth_AutoBadSignatureRejected401(t *testing.T) {
+	probe := &parseProbe{sub: Subject{UserID: "jwt-user"}}
+	trust := GatewayTrust{Secret: []byte("sec")}
+	h := SmartAuth(probe.parse, &trust)
+	c := newTrustCtx(t, "GET", "/api/users", "203.0.113.7",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+		ut.Header{Key: "X-Auth-Signature", Value: "forged-signature"},
+		ut.Header{Key: "Authorization", Value: "Bearer tok-1"},
+	)
+	h(context.Background(), c)
+	if !c.IsAborted() || c.Response.StatusCode() != 401 {
+		t.Fatalf("伪造签名应 401（不降级，#184）: status=%d", c.Response.StatusCode())
+	}
+	if got := probe.calls(); len(got) != 0 {
+		t.Fatalf("验签失败不得回落本地 parse: %v", got)
+	}
+}
+
+// TestSmartAuth_AutoDuplicateHeaderRejected401 组合模式 + 多值走私头（#184）：
+// 任一信任头多值 = 走私注入信号，已呈现立证 → 401，本地 parse 不启用。
+func TestSmartAuth_AutoDuplicateHeaderRejected401(t *testing.T) {
+	probe := &parseProbe{sub: Subject{UserID: "jwt-user"}}
+	trust := GatewayTrust{Secret: []byte("sec")}
+	h := SmartAuth(probe.parse, &trust)
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-MCP", Value: "a"},
+		ut.Header{Key: "Authorization", Value: "Bearer tok-1"},
+	)
+	c.Request.Header.Add("X-Auth-MCP", "b") // Set 会覆盖，Add 才造出多值
+	h(context.Background(), c)
+	if !c.IsAborted() || c.Response.StatusCode() != 401 {
+		t.Fatalf("多值走私头应 401（可疑流量不降级）: status=%d", c.Response.StatusCode())
+	}
+	if got := probe.calls(); len(got) != 0 {
+		t.Fatalf("走私头请求不得回落本地 parse: %v", got)
 	}
 }
 

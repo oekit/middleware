@@ -127,7 +127,7 @@ func RecoveryMiddleware(opts ...RecoveryOption) app.HandlerFunc {
 	kernel := chainmw.Recovery(
 		chainmw.WithRecoveryLogger(recoveryLog),
 		chainmw.WithRecoveryLogFields(func(_ context.Context, req any, pv *chain.PanicError) []any {
-			kvs := []any{"err", pv.Value}
+			kvs := []any{logx.ErrKey, pv.Value}
 			if c, ok := req.(*app.RequestContext); ok {
 				kvs = append(kvs,
 					"method", string(c.Method()),

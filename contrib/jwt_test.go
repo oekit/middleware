@@ -3,6 +3,8 @@ package contrib
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -510,5 +512,109 @@ func TestJWTAuth_SigningMaterialComesFromRuntime(t *testing.T) {
 	// 双保险：JWTParse（走 runtime）也必须能解。
 	if _, err := JWTParse(tok); err != nil {
 		t.Errorf("JWTParse 失败: %v", err)
+	}
+}
+
+// TestJWTAuth_NonSymmetricAlgorithmFailsFast 非对称算法构造期 fail-fast
+// （#185）：WithJWTAlgorithm 只支持对称密钥算法（HS256/384/512）——本组件
+// 只向 hertz-contrib/jwt 注入对称 Key，公钥算法在上游必败 ErrNoPrivKeyFile
+// （文档此前宣称支持 RS256 系为失实）。现构造期即返回 ErrJWTBadAlgorithm
+// 哨兵，中间件保持 fail-closed（500）。
+func TestJWTAuth_NonSymmetricAlgorithmFailsFast(t *testing.T) {
+	resetJWTState()
+
+	rt := buildJWTRuntime(&jwtOptions{secret: []byte(testJWTSecret), algorithm: "RS256"})
+	if rt.err == nil {
+		t.Fatal("★ RS256 必须构造期失败（本组件无 PrivKeyBytes 注入面）")
+	}
+	if !errors.Is(rt.err, ErrJWTBadAlgorithm) {
+		t.Fatalf("★ 构造失败必须可 errors.Is(ErrJWTBadAlgorithm)（#186 哨兵）: %v", rt.err)
+	}
+	if !strings.Contains(rt.err.Error(), "RS256") {
+		t.Fatalf("★ 错误信息必须点名具体算法: %v", rt.err)
+	}
+
+	// 实例级 fail-closed：返回的中间件把请求 500。
+	handler := JWTAuth(WithJWTSecret([]byte(testJWTSecret)), WithJWTAlgorithm("RS256"))
+	c := app.NewContext(0)
+	handler(context.Background(), c)
+	if !c.IsAborted() || c.Response.StatusCode() != 500 {
+		t.Fatalf("RS256 实例应 fail-closed 500: status=%d aborted=%v", c.Response.StatusCode(), c.IsAborted())
+	}
+}
+
+// TestJWTAuth_GlobalRuntimeSurvivesFailedRebuild 全局签发 runtime 毒化修复
+// （#185）：先成功注册 HS512 签发缺省并签发成功；再注册一个必然构造失败的
+// 配置（RS256 fail-fast）——失败快照不得 Store 覆盖全局 runtime，签发缺省
+// 必须仍是「最后一次成功注册的密钥」（旧实现会把全局毒化为错误快照，
+// JWTGenerateToken 恒返 ErrJWTNotInitialized，登录端点静默变砖）。
+func TestJWTAuth_GlobalRuntimeSurvivesFailedRebuild(t *testing.T) {
+	resetJWTState()
+
+	goodSecret := []byte("good-default-secret-key-at-least-32-bytes-long")
+	_ = JWTAuth(WithJWTSecret(goodSecret), WithJWTAlgorithm("HS512"))
+	tok1, err := JWTGenerateToken(jwt.MapClaims{"user_id": "before"})
+	if err != nil {
+		t.Fatalf("首次成功注册后签发: %v", err)
+	}
+
+	// 失败注册：RS256 构造期 fail-fast（全局 opts 被累积污染的形态保留——
+	// 关键断言是失败不得毒化 runtime）。
+	_ = JWTAuth(WithJWTSecret([]byte("another-secret-key-at-least-32-bytes")), WithJWTAlgorithm("RS256"))
+
+	// 签发缺省不被毒化：仍可签发，且签出的 token 用旧密钥（HS512/goodSecret）
+	// 可被 JWTParse 验回。
+	tok2, err := JWTGenerateToken(jwt.MapClaims{"user_id": "after"})
+	if err != nil {
+		t.Fatalf("★ 失败注册后签发缺省不得变砖（#185）: %v", err)
+	}
+	if tok2 == tok1 {
+		t.Fatal("两次签发应为不同 token（user_id 不同）")
+	}
+	if _, err := JWTParse(tok2); err != nil {
+		t.Fatalf("★ 失败注册后签发的 token 必须仍可验回（runtime 未被毒化）: %v", err)
+	}
+}
+
+// TestJWTSentinels_ExportedComparableAndStable 哨兵错误面（#186）：四个
+// errJWT* 哨兵导出为 ErrJWT*，可 errors.Is 分流；字符串值保持历史原文
+// （既有日志/断言兼容）。
+func TestJWTSentinels_ExportedComparableAndStable(t *testing.T) {
+	resetJWTState()
+
+	// 字符串值冻结（兼容承诺，#186）。
+	if got := ErrJWTSecretRequired.Error(); got != "ekit jwt: secret is required (use WithJWTSecret)" {
+		t.Fatalf("ErrJWTSecretRequired 文案漂移: %q", got)
+	}
+	if got := ErrJWTNotInitialized.Error(); got != "ekit jwt: middleware not initialized (call JWTAuth first)" {
+		t.Fatalf("ErrJWTNotInitialized 文案漂移: %q", got)
+	}
+	if got := ErrJWTBadClaims.Error(); got != "ekit jwt: bad claims type (expected jwt.MapClaims)" {
+		t.Fatalf("ErrJWTBadClaims 文案漂移: %q", got)
+	}
+	if got := ErrJWTBadAlgorithm.Error(); got != "ekit jwt: invalid signing algorithm (check WithJWTAlgorithm)" {
+		t.Fatalf("ErrJWTBadAlgorithm 文案漂移: %q", got)
+	}
+
+	// errors.Is 分流（#186 的核心诉求：调用方不再字符串匹配）。
+	if !errors.Is(ErrJWTSecretRequired, ErrJWTSecretRequired) ||
+		!errors.Is(ErrJWTNotInitialized, ErrJWTNotInitialized) {
+		t.Fatal("哨兵必须可 errors.Is 判定")
+	}
+
+	// 未初始化路径返回哨兵（而非裸错误）。
+	_, err := JWTParse("some.jwt.token")
+	if !errors.Is(err, ErrJWTNotInitialized) {
+		t.Fatalf("未初始化 JWTParse 必须 errors.Is(ErrJWTNotInitialized): %v", err)
+	}
+	_, err = JWTGenerateToken(jwt.MapClaims{"user_id": "alice"})
+	if !errors.Is(err, ErrJWTNotInitialized) {
+		t.Fatalf("未初始化 JWTGenerateToken 必须 errors.Is(ErrJWTNotInitialized): %v", err)
+	}
+
+	// 包装错误同样可分流（buildJWTRuntime 对非对称算法 %w 包装哨兵）。
+	rt := buildJWTRuntime(&jwtOptions{secret: []byte(testJWTSecret), algorithm: "ES256"})
+	if !errors.Is(rt.err, ErrJWTBadAlgorithm) {
+		t.Fatalf("包装形态必须保持 errors.Is 分流: %v", rt.err)
 	}
 }

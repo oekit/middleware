@@ -2,6 +2,7 @@ package contrib
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"sync"
 	"sync/atomic"
@@ -112,7 +113,12 @@ func WithJWTSecret(secret []byte) JWTOption {
 }
 
 // WithJWTAlgorithm 设置签名算法,默认 HS256。
-// 支持:HS256, HS384, HS512, RS256, RS384, RS512。
+//
+// 仅支持对称密钥算法:HS256, HS384, HS512（#185 修正失实文档——此前宣称
+// 支持 RS256/RS384/RS512,但本组件只向 hertz-contrib/jwt 注入对称 Key,
+// 公钥算法上游构造期必败 ErrNoPrivKeyFile;现构造期即 fail-fast 并返回
+// ErrJWTBadAlgorithm,fail-closed 语义不变）。RSA 签发/验签业务直接用
+// hertz-contrib/jwt 的 HertzJWTMiddleware（配 PrivKeyBytes/PrivKeyFile）。
 func WithJWTAlgorithm(alg string) JWTOption {
 	return func(o *jwtOptions) { o.algorithm = alg }
 }
@@ -130,6 +136,10 @@ func WithJWTRealm(realm string) JWTOption {
 }
 
 // WithJWTSkipPaths 设置不需要认证的路径(同 BearerTokenAuth)。
+//
+// 匹配语义（#187）：**精确匹配**（c.Path() 原文 == 比较，非 glob，`*` 与
+// "/**" 无特殊含义——写 "/api/**" 不会豁免 "/api/users"）；glob 语义在
+// 根包观测/限流家族（mw.WithAccessLogSkipPaths/mw.WithRateLimitSkipPaths）。
 func WithJWTSkipPaths(paths ...string) JWTOption {
 	return func(o *jwtOptions) { o.skipPaths = append(o.skipPaths, paths...) }
 }
@@ -199,14 +209,21 @@ func JWTAuth(opts ...JWTOption) app.HandlerFunc {
 	if globalJWTState.runtime.Load() == nil ||
 		globalJWTState.builtKey != globalJWTState.opts.materialKey() {
 		grt := buildJWTRuntimeLocked()
-		globalJWTState.runtime.Store(grt)
+		// 失败快照**不 Store**（#185）：一次构造失败把全局签发 runtime 毒化
+		// 成错误快照，会让此前成功注册的签发缺省（JWTGenerateToken/JWTParse
+		// 的密钥来源）静默变砖。文档承诺的签发缺省 =「最后一次**成功**注册
+		// 的密钥」——失败只告警，旧 runtime 原位保留继续签发；首次注册即
+		// 失败时 runtime 保持 nil（JWTGenerateToken 返回 ErrJWTNotInitialized，
+		// 语义不变）。失败重建每次调用都会重试（builtKey 未推进），errLogged
+		// 保证同一段失败配置只告警一次。
 		if grt.err == nil {
+			globalJWTState.runtime.Store(grt)
 			globalJWTState.builtKey = globalJWTState.opts.materialKey()
 			globalJWTState.errLogged = false
 		} else if !globalJWTState.errLogged {
 			globalJWTState.errLogged = true
-			jwtLog.Error("jwt signing default init failed (JWTGenerateToken/JWTParse unavailable)",
-				"err", grt.err)
+			jwtLog.Error("jwt signing default init failed (JWTGenerateToken/JWTParse keep last good key)",
+				logx.ErrKey, grt.err)
 		}
 	}
 	globalJWTState.mu.Unlock()
@@ -214,7 +231,7 @@ func JWTAuth(opts ...JWTOption) app.HandlerFunc {
 	if rt.err != nil {
 		// 本实例构造失败 ⇒ fail-closed(所有请求 500)。实例即构造事件,
 		// 每次失败的构造各告警一次。
-		jwtLog.Error("jwt middleware init failed; failing closed (all requests 500)", "err", rt.err)
+		jwtLog.Error("jwt middleware init failed; failing closed (all requests 500)", logx.ErrKey, rt.err)
 		return func(_ context.Context, c *app.RequestContext) {
 			c.AbortWithStatus(http.StatusInternalServerError)
 		}
@@ -263,9 +280,20 @@ func newJWTOptions(opts ...JWTOption) *jwtOptions {
 // 返回值是**不可变快照**:instance 与 inner 一一对应,构造后不再变化。
 // JWTAuth 实例在构造期持有自己的快照验签;签发缺省(JWTGenerateToken)读
 // 全局快照——同一实例注册时的密钥即签发缺省,单实例应用签发与验签同源。
+//
+// 构造期校验（#185 fail-fast）：secret 缺失 → ErrJWTSecretRequired；
+// 非 HS256/384/512 算法 → ErrJWTBadAlgorithm（本组件只注入对称 Key，
+// 公钥算法在上游必败 ErrNoPrivKeyFile——与其让上游报一个与配置无关的
+// 错误，不如在这里给出指向 WithJWTAlgorithm 文档的明确失败）。
 func buildJWTRuntime(o *jwtOptions) *jwtRuntime {
 	if len(o.secret) == 0 {
-		return &jwtRuntime{err: errJWTSecretRequired}
+		return &jwtRuntime{err: ErrJWTSecretRequired}
+	}
+	switch o.algorithm {
+	case "HS256", "HS384", "HS512":
+		// 仅对称密钥算法可达上游构造（#185）。
+	default:
+		return &jwtRuntime{err: fmt.Errorf("%w: %q (only HS256/HS384/HS512 are supported; RSA/ECDSA needs PrivKeyBytes via hertz-contrib/jwt directly)", ErrJWTBadAlgorithm, o.algorithm)}
 	}
 	mw, err := jwthertz.New(&jwthertz.HertzJWTMiddleware{
 		Realm:            o.realm,
@@ -303,7 +331,7 @@ func buildJWTRuntimeLocked() *jwtRuntime {
 func JWTGenerateToken(claims jwt.MapClaims) (string, error) {
 	rt := globalJWTState.runtime.Load()
 	if rt == nil || rt.err != nil || rt.instance == nil {
-		return "", errJWTNotInitialized
+		return "", ErrJWTNotInitialized
 	}
 	// 从 instance 取签发材料(上游把 Key/Algorithm/Timeout 拷进自己的字段)
 	algorithm := rt.instance.SigningAlgorithm
@@ -331,7 +359,7 @@ func JWTGenerateToken(claims jwt.MapClaims) (string, error) {
 	func() {
 		defer func() {
 			if r := recover(); r != nil {
-				err = errJWTBadAlgorithm
+				err = ErrJWTBadAlgorithm
 			}
 		}()
 		method := jwt.GetSigningMethod(algorithm)
@@ -346,7 +374,7 @@ func JWTGenerateToken(claims jwt.MapClaims) (string, error) {
 func JWTParse(tokenString string) (jwt.MapClaims, error) {
 	rt := globalJWTState.runtime.Load()
 	if rt == nil || rt.err != nil || rt.instance == nil {
-		return nil, errJWTNotInitialized
+		return nil, ErrJWTNotInitialized
 	}
 	tok, err := rt.instance.ParseTokenString(tokenString)
 	if err != nil {
@@ -354,19 +382,27 @@ func JWTParse(tokenString string) (jwt.MapClaims, error) {
 	}
 	claims, ok := tok.Claims.(jwt.MapClaims)
 	if !ok {
-		return nil, errJWTBadClaims
+		return nil, ErrJWTBadClaims
 	}
 	return claims, nil
 }
 
-// 错误类型
+// JWT 组件的可分流错误哨兵（#186）：JWTGenerateToken/JWTParse/JWTAuth 返回
+// 的错误可经 errors.Is 与下列哨兵判定，无需字符串匹配。字符串值保持历史
+// 原文（既有日志/断言兼容）。
 type jwtError string
 
 func (e jwtError) Error() string { return string(e) }
 
 const (
-	errJWTSecretRequired jwtError = "ekit jwt: secret is required (use WithJWTSecret)" //nolint:gosec // 错误消息含"secret"关键词,无凭证硬编码
-	errJWTNotInitialized jwtError = "ekit jwt: middleware not initialized (call JWTAuth first)"
-	errJWTBadClaims      jwtError = "ekit jwt: bad claims type (expected jwt.MapClaims)"
-	errJWTBadAlgorithm   jwtError = "ekit jwt: invalid signing algorithm (check WithJWTAlgorithm)"
+	// ErrJWTSecretRequired 未配置签名密钥（漏传 WithJWTSecret）。
+	ErrJWTSecretRequired jwtError = "ekit jwt: secret is required (use WithJWTSecret)" //nolint:gosec // 错误消息含"secret"关键词,无凭证硬编码
+	// ErrJWTNotInitialized 尚无可用签发缺省（JWTAuth 从未成功注册——构造
+	// 失败不毒化全局 runtime，#185）：区分「配置错误须告警」与「token 无效
+	// （常态拒绝）」的分流哨兵。
+	ErrJWTNotInitialized jwtError = "ekit jwt: middleware not initialized (call JWTAuth first)"
+	// ErrJWTBadClaims 验证通过但 claims 类型不是 jwt.MapClaims。
+	ErrJWTBadClaims jwtError = "ekit jwt: bad claims type (expected jwt.MapClaims)"
+	// ErrJWTBadAlgorithm 签名算法不可用（仅支持 HS256/HS384/HS512，#185）。
+	ErrJWTBadAlgorithm jwtError = "ekit jwt: invalid signing algorithm (check WithJWTAlgorithm)"
 )
