@@ -1,5 +1,9 @@
 
 
+## [v0.19.1] — 2026-11-14
+
+- refactor(i18n,response): sort.Slice/SortStable → slices.SortFunc/SortStableFunc（q 值稳定排序语义保持）+ JSON 深度扫描 for 计数 → range over int——行为等价现代化
+
 ## [v0.19.0] — 2026-11-13
 
 - 关停/审计/I18n 批：legacy 路径删除（#179）、hertz header 单源 core/transport/hertzbridge（#180）、I18n 锁外发布+single-flight+退避（#182）、SmartAuth Auto 立证不降级（#184）、JWT runtime 毒化修复（#185）、WithJWTAlgorithm 文档修正与 errJWT 哨兵导出（#186）、SkipPaths 语义声明统一（#187）、InfraPaths 函数化（#188）、hmw trace_id 注释勘误（#189）、BufferedSink 泛型化（#192）、AuditEvent IP/UA/Extra 缝（#193）、logx.ErrKey 收口（#196）、hook panic 隔离（#207）、Close 超时回归钉（#208）、flush 失败计数（#209）、AuditLog 钩子 panic 隔离（#210）、I18n loader 预算（#211）
