@@ -1,5 +1,11 @@
 
 
+## [v0.18.1] — 2026-11-13
+
+- fix: 审计/i18n 面第六轮 sweep 五单——BufferedSink flush panic 就地收编+循环不死+丢弃留痕（#207）、flush 失败按事件数计入 Dropped/OnDrop 观测口（#208）、Close 超时错误透传语义与 Sink∥Close 并发 -race 回归钉（#209）、auditEventOf 六个 With*Func 提取钩子 panic 隔离（#210）、I18n loader 单次预算（缺省 3s 可配 WithI18nLoaderTimeout）+single-flight 等待位有界+失败退避阀对挂起态生效（#211）
+
+关联问题单：middleware#207、middleware#208、middleware#209、middleware#210、middleware#211。
+
 ## [v0.18.0] — 2026-11-12
 
 - refactor(transport): hertzTransporter 删除，统一消费 core/transport/hertzbridge 单源（#180，#177 治本）——ServerContext 适配不再自持双份实现，middleware 与 hertz 桥接单点维护；transporter Values 大小写口径缺陷（#183）随 hertzbridge 消费一并治本收敛。
