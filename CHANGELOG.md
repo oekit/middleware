@@ -1,5 +1,9 @@
 
 
+## [v0.19.2] — 2026-11-14
+
+- refactor(lark): interface{} → any(1.18 别名),零行为差异
+
 ## [v0.19.1] — 2026-11-14
 
 - refactor(i18n,response): sort.Slice/SortStable → slices.SortFunc/SortStableFunc（q 值稳定排序语义保持）+ JSON 深度扫描 for 计数 → range over int——行为等价现代化
