@@ -8,7 +8,7 @@
 ## 安装
 
 ```bash
-go get github.com/oekit/middleware@v0.19.1
+go get github.com/oekit/middleware@v0.19.2
 ```
 
 ## 这个仓库做什么
