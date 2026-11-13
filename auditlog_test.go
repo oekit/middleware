@@ -759,3 +759,290 @@ func TestAuditLogMiddleware_BadGlobPatternPanics(t *testing.T) {
 		WithAuditLogSink(func(context.Context, AuditEvent) error { return nil }),
 	)
 }
+
+// —— #207/#208/#209/#210 回归钉 ——
+
+// TestBufferedAuditSink_FlushPanicLoopSurvives 回归钉（#207）：inner（用户
+// 落库回调）flush panic 必须就地收编——GoSafe 只保进程不保循环，原实现一次
+// 裸 panic 让 run() 静默退出（done 闭合、Close 看似正常），此后缓冲只进不出。
+// 修复后：panic 转 Warn + 整批按丢弃留痕（reason=flush_failed，OnDrop 同路）
+// + 循环继续——首次 panic 后第二次事件仍能 flush。
+func TestBufferedAuditSink_FlushPanicLoopSurvives(t *testing.T) {
+	var flushed []string
+	flushDone := make(chan struct{}, 8)
+	var onDropCalls atomic.Int32
+	// releases 每次 flush 上交一个独立放行柄（无共享可变变量——复用同一
+	// release chan 会被 -race 判为测试自身竞态）。
+	releases := make(chan chan struct{}, 8)
+	buf := NewBufferedAuditSink(func(_ context.Context, events []AuditEvent) error {
+		rel := make(chan struct{})
+		releases <- rel
+		<-rel
+		if events[0].Who == "boom" {
+			panic("db driver exploded")
+		}
+		for _, ev := range events {
+			flushed = append(flushed, ev.Who)
+		}
+		flushDone <- struct{}{}
+		return nil
+	},
+		WithAuditBatchSize(2),
+		WithAuditFlushInterval(time.Hour), // 只由攒批触发,排除定时干扰
+		WithAuditOnDrop(func(AuditEvent) { onDropCalls.Add(1) }),
+	)
+	defer func() {
+		for { // 放行仍在门上的 flush,Close 才能收口
+			select {
+			case rel := <-releases:
+				close(rel)
+				continue
+			default:
+			}
+			break
+		}
+		if err := buf.Close(context.Background()); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	// 第一批（panic 批）：2 条攒满触发 flush，inner panic。
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "boom", Path: "/a"})
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "boom2", Path: "/a"})
+	rel1 := <-releases // flush 已抵达,停在其 panic 点前
+	close(rel1)
+	deadline := time.Now().Add(5 * time.Second)
+	for buf.Dropped() < 2 { // panic 批收编完成 = 整批计入丢弃(循环未死的旁证)
+		if time.Now().After(deadline) {
+			t.Fatalf("★ flush panic 批未按事件数计入 Dropped: got %d, want 2", buf.Dropped())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 整批按丢弃留痕（#207+#208 口径）：2 条事件计入 Dropped,OnDrop 同路。
+	if got := buf.Dropped(); got != 2 {
+		t.Fatalf("★ flush panic 整批必须按事件数计入 Dropped: got %d, want 2", got)
+	}
+	if n := onDropCalls.Load(); n != 2 {
+		t.Fatalf("★ flush panic 必须走 OnDrop 同路: got %d calls, want 2", n)
+	}
+
+	// 循环存活：第二批正常 flush（原实现这里永远收不到 flush）。
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "after", Path: "/b"})
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "after2", Path: "/b"})
+	rel2 := <-releases
+	close(rel2)
+	select {
+	case <-flushDone:
+		if len(flushed) != 2 || flushed[0] != "after" {
+			t.Fatalf("★ panic 后循环必须继续 flush 后续事件: got %v", flushed)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ flush panic 杀死后台循环(#207 病灶未修)")
+	}
+}
+
+// TestBufferedAuditSink_FlushFailureCountsDropped 回归钉（#208）：flush 失败
+// = 整批事件未落盘，必须按事件数计入 Dropped()（OnDrop 同路，reason 区分
+// 归因），既有 Warn 面保留——下游彻底失败（DB 挂）时观测口不再恒 0。
+func TestBufferedAuditSink_FlushFailureCountsDropped(t *testing.T) {
+	var dropTotal atomic.Int32
+	releases := make(chan chan struct{}, 8)
+	buf := NewBufferedAuditSink(func(_ context.Context, _ []AuditEvent) error {
+		rel := make(chan struct{})
+		releases <- rel
+		<-rel
+		return errors.New("db down")
+	},
+		WithAuditBatchSize(3),
+		WithAuditFlushInterval(time.Hour),
+		WithAuditOnDrop(func(AuditEvent) { dropTotal.Add(1) }),
+	)
+	defer func() {
+		for {
+			select {
+			case rel := <-releases:
+				close(rel)
+				continue
+			default:
+			}
+			break
+		}
+		if err := buf.Close(context.Background()); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	for i := 0; i < 3; i++ {
+		_ = buf.Sink(context.Background(), AuditEvent{Who: fmt.Sprint(i), Path: "/f"})
+	}
+	rel := <-releases
+	close(rel) // 放行 flush(失败路径)
+
+	deadline := time.Now().Add(5 * time.Second)
+	for buf.Dropped() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("★ flush 失败必须按事件数计入 Dropped: got %d, want 3 (#208)", buf.Dropped())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if n := dropTotal.Load(); n != 3 {
+		t.Fatalf("★ flush 失败必须走 OnDrop 同路: got %d calls, want 3", n)
+	}
+}
+
+// TestBufferedSink_ConcurrentSinkClose 回归钉（#209，-race）：多 goroutine
+// Sink 撞 Close——closed 判定与入队原子化（#181）+ Close 终态传播（#209）
+// 的并发面回归。断言：无 panic、无竞态（-race 下红即修回）、关停前入队事件
+// 全部 flush 或按丢弃口径计数（两个去向都可观测，不漏记）。
+func TestBufferedSink_ConcurrentSinkClose(t *testing.T) {
+	var flushed atomic.Int64
+	buf := NewBufferedSink(func(_ context.Context, rows []oplogRow) error {
+		flushed.Add(int64(len(rows)))
+		return nil
+	},
+		WithSinkBatchSize[oplogRow](10),
+		WithSinkFlushInterval[oplogRow](50*time.Millisecond), // 快速兜底,Close 前大概率冲完
+	)
+
+	var wg sync.WaitGroup
+	const writers = 8
+	const perWriter = 200
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for i := 0; i < perWriter; i++ {
+				_ = buf.Sink(context.Background(), oplogRow{Action: fmt.Sprint(i), IP: "10.0.0.1"})
+			}
+		}()
+	}
+	// Close 与写并发：不等写完就关（原 #181 竞态面 + #209 终态传播面）。
+	var closerErr error
+	var closeOnce sync.Once
+	for c := 0; c < 4; c++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			err := buf.Close(context.Background())
+			closeOnce.Do(func() { closerErr = err })
+		}()
+	}
+	wg.Wait()
+	if closerErr != nil {
+		t.Fatalf("close err: %v", closerErr)
+	}
+	// 关停前入队的全部事件必须有两个去向之一：flush 出去 或 按丢弃计数。
+	// 总数 = writers*perWriter；flushed + Dropped >= 总数即为不漏记。
+	if got := flushed.Load() + buf.Dropped(); got < writers*perWriter {
+		t.Fatalf("★ 并发 Sink∥Close 存在漏记窗口: flushed %d + dropped %d < total %d",
+			flushed.Load(), buf.Dropped(), writers*perWriter)
+	}
+}
+
+// TestBufferedSink_CloseTimeoutErrorPropagates 回归钉（#209）：Close 超时错误
+// 只活在首调用栈曾是假成功源——首调超时后，后续 Close（哪怕 ctx 宽裕）必须
+// 回读同一份真实终态，不得返回 nil。
+func TestBufferedSink_CloseTimeoutErrorPropagates(t *testing.T) {
+	gate := make(chan struct{}, 8)
+	release := make(chan struct{})
+	buf := NewBufferedSink(func(_ context.Context, _ []oplogRow) error {
+		gate <- struct{}{}
+		<-release // 卡住 final flush,制造首调超时
+		return nil
+	})
+	_ = buf.Sink(context.Background(), oplogRow{Action: "tail"})
+
+	first := buf.Close(shortCtx(50 * time.Millisecond))
+	if first == nil || !errors.Is(first, context.DeadlineExceeded) {
+		t.Fatalf("★ 首调 Close 应返回超时错误: got %v", first)
+	}
+	// 放行 final flush,后台循环收口(done 闭合);closeErr 已在首调超时刻录下。
+	close(release)
+	// 次调（ctx 宽裕）等 done 后回读终态——不得假报成功（#209）。
+	second := buf.Close(context.Background())
+	if second == nil || !errors.Is(second, context.DeadlineExceeded) {
+		t.Fatalf("★ 次调 Close 必须回读首调超时终态(不得假报成功,#209): got %v", second)
+	}
+	third := buf.Close(context.Background())
+	if third == nil || !errors.Is(third, context.DeadlineExceeded) {
+		t.Fatalf("★ done 闭合后 Close 终态应保持超时错误: got %v", third)
+	}
+}
+
+// shortCtx 造一个 d 后超时的 ctx（测试辅助）。
+func shortCtx(d time.Duration) context.Context {
+	ctx, cancel := context.WithTimeout(context.Background(), d)
+	go func() {
+		<-ctx.Done()
+		cancel() // 复位资源
+	}()
+	return ctx
+}
+
+// TestAuditLogMiddleware_HookPanicIsolated 回归钉（#210）：auditEventOf 的
+// 六个 With*Func 提取钩子逐个 panic 收编——panic 钩子按空值处理 + Warn 留痕，
+// 其余字段照常提取、事件照常产出（提取缝坏钩子不劫持请求与 panic 恢复点）。
+func TestAuditLogMiddleware_HookPanicIsolated(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/admin/**"),
+		WithAuditLogSink(collected.sinkFunc),
+		// 全部六个钩子都 panic:事件必须照常产出,对应字段为空值。
+		WithAuditLogWho(func(context.Context, *app.RequestContext) string { panic("who hook boom") }),
+		WithAuditLogAction(func(context.Context, *app.RequestContext) string { panic("action hook boom") }),
+		WithAuditLogBizCode(func(context.Context, *app.RequestContext) int64 { panic("bizcode hook boom") }),
+		WithAuditLogClientIP(func(context.Context, *app.RequestContext) string { panic("ip hook boom") }),
+		WithAuditLogUA(func(context.Context, *app.RequestContext) string { panic("ua hook boom") }),
+		WithAuditLogExtra(func(context.Context, *app.RequestContext) map[string]string { panic("extra hook boom") }),
+	))
+	h.GET("/api/admin/users", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+
+	ut.PerformRequest(h.Engine, "GET", "/api/admin/users", nil)
+	events := collected.snapshot()
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1（坏钩子不得吞掉审计事件，#210）", len(events))
+	}
+	ev := events[0]
+	if ev.Who != "" || ev.Action != "" || ev.BizCode != 0 || ev.IP != "" || ev.UA != "" || ev.Extra != nil {
+		t.Fatalf("★ panic 钩子必须按空值处理: %+v", ev)
+	}
+	if ev.Method != "GET" || ev.Path != "/api/admin/users" || ev.Status != 200 {
+		t.Fatalf("★ 其余字段必须照常提取: %+v", ev)
+	}
+
+	// 正常路径双回归（#210）：钩子正常时字段照常填充（隔离壳零行为变化）。
+	collected2 := &collectingAuditSink{}
+	h2 := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h2.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/admin/**"),
+		WithAuditLogSink(collected2.sinkFunc),
+		WithAuditLogWho(func(context.Context, *app.RequestContext) string { return "u1" }),
+		WithAuditLogAction(func(context.Context, *app.RequestContext) string { return "policy.delete" }),
+		WithAuditLogBizCode(func(context.Context, *app.RequestContext) int64 { return 7 }),
+		WithAuditLogExtra(func(context.Context, *app.RequestContext) map[string]string {
+			return map[string]string{"k": "v"}
+		}),
+	))
+	h2.GET("/api/admin/users", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	})
+	ut.PerformRequest(h2.Engine, "GET", "/api/admin/users", nil)
+	events2 := collected2.snapshot()
+	if len(events2) != 1 {
+		t.Fatalf("got %d events, want 1", len(events2))
+	}
+	ev2 := events2[0]
+	if ev2.Who != "u1" || ev2.Action != "policy.delete" || ev2.BizCode != 7 || ev2.Extra["k"] != "v" {
+		t.Fatalf("★ 正常钩子字段必须照常填充: %+v", ev2)
+	}
+}

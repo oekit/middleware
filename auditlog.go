@@ -7,6 +7,7 @@ import (
 	"net"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/oekit/concurrency/async"
 	"github.com/oekit/logx"
 	"github.com/oekit/middleware/hmw"
+	"github.com/oekit/pkg/errors"
 	"github.com/oekit/pkg/pathx"
 )
 
@@ -87,6 +89,10 @@ type AuditLogOptions struct {
 	// 「默认不审计」的静默形态。清单是审计面的完整声明：未声明的路径
 	// （含 InfraPaths 探活/监控端点——它们从不该进审计面，无需另行排除）
 	// 不产出事件、不触发 sink。
+	//
+	// 空/纯空白项（#206）与坏 glob 同口径构造期 panic：配置源回落空串、
+	// 模板渲染出空项时，清单长度 ≥1 过检、运行期却永不命中——审计声明
+	// 静默归零且零信号，正是本字段要防的形态。
 	AuditedPaths []string
 
 	// Sinks 是审计事件的消费者列表（落库/上报），见 WithAuditLogSink。
@@ -142,7 +148,8 @@ type AuditLogOption func(*AuditLogOptions)
 
 // WithAuditLogPaths 声明需要审计的路径清单（必填，glob 语义同 SkipPaths）。
 // 清单为空时 AuditLogMiddleware 构造期 panic——审计面显式声明制
-// （middleware#141），漏记比多记危险，不存在「静默不审计」的缺省。
+// （middleware#141），漏记比多记危险，不存在「静默不审计」的缺省；
+// 空/纯空白串项同样构造期 panic（#206，坏 glob #201 同判据）。
 //
 //	mw.AuditLogMiddleware(mw.WithAuditLogPaths("/api/admin/**", "/api/v2/policy/*"))
 func WithAuditLogPaths(paths ...string) AuditLogOption {
@@ -284,7 +291,15 @@ func newAuditConfig(opts ...AuditLogOption) *auditConfig {
 	// 判据）：pathx.MatchesPath 宽松档把 filepath.ErrBadPattern 吞成「不匹配」，
 	// 一个坏 pattern 会让整个审计声明静默失效——敏感操作零事件落库（审计面
 	// 漏记比多记危险），且零信号。误配在启动期炸响。
+	//
+	// 空/纯空白 pattern（#206）是 #201 的同族残留面：len 只拦空切片（[""]
+	// 长度 1 过检）；filepath.Match("", "") 返回 (true, nil) 不报错（#201 预检
+	// 全绿）；运行期 MatchesPath 宽松档对空 pattern 直接跳过——三道闸全放行，
+	// 构造期全绿、运行期零事件零信号。与坏 glob 同口径点名炸响。
 	for _, p := range o.AuditedPaths {
+		if strings.TrimSpace(p) == "" {
+			panic(fmt.Sprintf("mw.AuditLogMiddleware: empty audited path glob pattern %q——declare concrete audited paths via WithAuditLogPaths", p))
+		}
 		if _, err := filepath.Match(p, ""); err != nil {
 			panic(fmt.Sprintf("mw.AuditLogMiddleware: invalid audited path glob pattern %q: %v", p, err))
 		}
@@ -397,36 +412,55 @@ func AuditLogMiddleware(opts ...AuditLogOption) app.HandlerFunc {
 	}
 }
 
+// auditHookCall 提取钩子的收编壳（#210）：六个 With*Func 缝（who/action/
+// biz_code/ip/ua/extra）都是用户注入的业务回调，在请求 goroutine 内、事件
+// 产出时刻调用——坏钩子（nil map 写入/类型断言/下游透传）一旦 panic 会沿
+// 提取缝上抛，打断审计事件产出甚至劫持 panic 恢复点语义（panic 路径的
+// auditEventOf 跑在 Recovery 的 defer 里，二次 panic 会替换原始 panic 值）。
+// 就地 Recovered 收编：panic 钩子按空值（零值）处理 + Warn 留痕，其余字段
+// 照常提取——提取缝与 sink 缝（deliverAuditEvent）的隔离口径一致。
+func auditHookCall[V any](ctx context.Context, name string, fn func() V) (v V) {
+	defer func() {
+		if perr := errors.Recovered(recover()); perr != nil {
+			auditLog.CtxWarn(ctx, "audit hook panicked (isolated, zero value used)",
+				"hook", name, logx.ErrKey, perr)
+		}
+	}()
+	return fn()
+}
+
 // auditEventOf 由请求上下文拼出审计事件。status 由调用方给定：正常完成取
 // c.Response.StatusCode()；panic 恢复点传 500（响应尚未写出）。
 // IP/UA 缺省口径（#193）：IP=连接对端地址 host（fail-closed，不读 XFF——
 // #83 同口径；在请求 goroutine 内提取，池化红线安全）；UA=User-Agent 头。
 // OmitClientFields 关闭缺省采集；IPFunc/UAFunc/ExtraFunc 显式注入优先。
+// 六个注入钩子逐个 panic 收编（#210）：坏钩子按空值处理 + Warn，事件产出
+// 与其余字段不受牵连。
 func auditEventOf(ctx context.Context, c *app.RequestContext, cfg *auditConfig, start time.Time, status int, panicked bool) AuditEvent {
 	ev := AuditEvent{
 		When:    start,
-		Who:     cfg.whoFunc(ctx, c),
-		Action:  cfg.actionFunc(ctx, c),
+		Who:     auditHookCall(ctx, "who", func() string { return cfg.whoFunc(ctx, c) }),
+		Action:  auditHookCall(ctx, "action", func() string { return cfg.actionFunc(ctx, c) }),
 		Method:  string(c.Method()),
 		Path:    string(c.Path()),
 		Status:  status,
-		BizCode: cfg.bizCodeFunc(ctx, c),
+		BizCode: auditHookCall(ctx, "biz_code", func() int64 { return cfg.bizCodeFunc(ctx, c) }),
 		Latency: time.Since(start),
 		TraceID: hmw.FromRequestContext(c),
 		Panic:   panicked,
 	}
 	if cfg.ipFunc != nil {
-		ev.IP = cfg.ipFunc(ctx, c)
+		ev.IP = auditHookCall(ctx, "client_ip", func() string { return cfg.ipFunc(ctx, c) })
 	} else if !cfg.omitClientFields {
 		ev.IP = defaultAuditClientIP(c)
 	}
 	if cfg.uaFunc != nil {
-		ev.UA = cfg.uaFunc(ctx, c)
+		ev.UA = auditHookCall(ctx, "ua", func() string { return cfg.uaFunc(ctx, c) })
 	} else if !cfg.omitClientFields {
 		ev.UA = string(c.GetHeader("User-Agent"))
 	}
 	if cfg.extraFunc != nil {
-		ev.Extra = cfg.extraFunc(ctx, c)
+		ev.Extra = auditHookCall(ctx, "extra", func() map[string]string { return cfg.extraFunc(ctx, c) })
 	}
 	return ev
 }
@@ -530,8 +564,11 @@ type BufferedSinkOptions[T any] struct {
 	// FlushInterval 定时 flush 间隔（兜住不满一批的低频事件）。缺省 5s
 	// （治理类默认区间内）。
 	FlushInterval time.Duration
-	// OnDrop 事件被丢弃（缓冲满/Close 在途）时的回调；nil 记 Warn 日志
-	// （含累计丢弃数）。在请求 goroutine 内同步调用，保持轻量。
+	// OnDrop 事件被丢弃时的回调；nil 记 Warn 日志（含累计丢弃数）。丢弃
+	// 三去向同路：缓冲满（buffer_full）、Close 在途（closing）、flush 失败/
+	// panic 整批逐事件（flush_failed，#207/#208）。在请求 goroutine 或后台
+	// flush goroutine 内同步调用，保持轻量（自身 panic 会被 flush 侧
+	// recover，不会杀死后台循环）。
 	OnDrop func(ev T)
 }
 
@@ -577,6 +614,8 @@ func WithSinkOnDrop[T any](fn func(ev T)) BufferedSinkOption[T] {
 //
 // 背压口径：缓冲满时丢弃事件并计数（缓冲批量是旁路，绝不阻塞/拖垮请求）——
 // 丢弃是显式策略而非静默失败（Dropped() 可观测，WithSinkOnDrop 可接管处置）。
+// flush 失败/panic（#207/#208）同口径：整批按丢弃计数、循环不死——「送了
+// 没成」与「没送出」一样必须可观测。
 //
 // 方法 Sink 签名与事件投递面一致（AuditEvent 特化的方法值直接传
 // WithAuditLogSink；其它域模型按各自投递面包装）。泛型选项构造器需显式
@@ -610,6 +649,10 @@ type BufferedSink[T any] struct {
 	done      chan struct{}
 	dropped   atomic.Int64
 	closeOnce sync.Once
+	// closeErr（#209）：首次 Close 的 final flush 终态（超时错误）——错误
+	// 不只活在首调用栈上，后续（含并发）调用回读同一终态。写入只在
+	// closeOnce.Do 内，sync.Once 的 happens-before 保证后续回读无竞态。
+	closeErr error
 	// mu/closed（#181）：Sink 持 RLock 做「closed 判定 + 入队」原子化，
 	// Close 持 Lock 置 closed + close(stop)——与 wsutil.Outbox(#117) /
 	// streamx.SSESink(#144) 的收口口径同源。ch 永不关闭（run 靠 stop 退出
@@ -680,6 +723,10 @@ func (b *BufferedSink[T]) Sink(ctx context.Context, ev T) error {
 
 // Dropped 返回累计丢弃事件数（背压观测口：>0 说明下游消费能力不足或
 // 缓冲偏小，消费方据此调 BufferSize/BatchSize 或告警）。
+//
+// 计入三去向（#208）：缓冲满（buffer_full）、关停在途（closing）、flush
+// 失败/panic 整批逐事件（flush_failed，#207/#208——下游彻底失败时本计数
+// 持续上涨，是最需要告警的形态；归因经 OnDrop/dropDetail 的 reason 区分）。
 func (b *BufferedSink[T]) Dropped() int64 {
 	return b.dropped.Load()
 }
@@ -687,8 +734,12 @@ func (b *BufferedSink[T]) Dropped() int64 {
 // Close 停止接收并落盘已缓冲事件，幂等（sync.Once）。ctx 控制 final flush
 // 的等待上限，超时返回包装后的 ctx.Err()（已缓冲事件的最终处置以 inner
 // sink 的实际表现为准）。Close 之后 Sink 的调用按丢弃口径计数。
+//
+// 终态传播（#209）：final flush 的超时错误记录在 sink 状态（closeErr）上，
+// 后续（含并发）Close 调用一律等 done（以各自 ctx 为等待上限）后回读同一
+// 终态——依赖「Close 返回 nil = 已落盘」的关停编排不再被「首调超时、次调
+// 报成功」误导。sync.Once 保证 Do 内写入与后续回读的 happens-before。
 func (b *BufferedSink[T]) Close(ctx context.Context) error {
-	var err error
 	b.closeOnce.Do(func() {
 		// 持写锁置 closed + close(stop)（#181）：与 Sink 的 RLock 互斥——
 		// 任何 Sink 的「closed 判定 + 入队」要么整体发生在本段之前（事件在
@@ -701,10 +752,21 @@ func (b *BufferedSink[T]) Close(ctx context.Context) error {
 		select {
 		case <-b.done:
 		case <-ctx.Done():
-			err = fmt.Errorf("mw.BufferedSink: close timed out waiting final flush: %w", ctx.Err())
+			b.closeErr = fmt.Errorf("mw.BufferedSink: close timed out waiting final flush: %w", ctx.Err())
 		}
 	})
-	return err
+	// 终态回读（#209）：每个调用方都等到 final flush 终结（done 闭合，以
+	// 自己的 ctx 为上限）再取 recorded 终态——首调在途时次调不再空转返回
+	// 假成功；首调超时后，次调（哪怕 ctx 宽裕）也拿到同一份真实终态。
+	select {
+	case <-b.done:
+	case <-ctx.Done():
+		if b.closeErr != nil {
+			return b.closeErr
+		}
+		return fmt.Errorf("mw.BufferedSink: close timed out waiting final flush: %w", ctx.Err())
+	}
+	return b.closeErr
 }
 
 // drop 丢弃一条事件：计数 + OnDrop（或特化缺省/通用缺省 Warn 日志）。
@@ -723,6 +785,16 @@ func (b *BufferedSink[T]) drop(ev T, reason string) {
 		"dropped_total", total,
 		"buffer_size", b.bufferSize,
 	)
+}
+
+// dropBatch 整批按丢弃口径留痕（#207/#208）：flush 失败/panic 意味着整批
+// 事件已出缓冲且未落盘——与缓冲满/关停丢弃同一观测口（Dropped() 逐事件
+// 计入、OnDrop/dropDetail 逐事件同路，reason=flush_failed 区分归因），
+// 消费方的丢弃处置面（告警/补偿/留痕）对「送了没成」同样生效。
+func (b *BufferedSink[T]) dropBatch(events []T, reason string) {
+	for _, ev := range events {
+		b.drop(ev, reason)
+	}
 }
 
 // run 后台攒批循环：BatchSize 攒满即刷、FlushInterval 兜底刷、stop 后
@@ -765,14 +837,32 @@ func (b *BufferedSink[T]) run() {
 	}
 }
 
-// flush 单次批量交付：拷贝后交 inner sink，error 只记 Warn（logx.ErrKey，
-// 特化钩子或通用缺省）。
+// flush 单次批量交付：拷贝后交 inner sink，error/panic 均就地收编（#207/#208）。
+// panic 收编（#207）：inner（用户落库回调）一次裸 panic 曾沿 run 循环上抛——
+// GoSafe 在 goroutine 级 recover 只保进程不保循环，run() 静默退出（done 闭合、
+// Close 看似正常），此后缓冲只进不出、全部按 buffer_full 丢弃（归因错位）。
+// 对齐单事件路径（deliverAuditEvent）的隔离口径：panic 转 Warn + 整批按丢弃
+// 留痕 + 循环继续。失败留痕（#208）：落库失败=整批未落盘，逐事件计入
+// Dropped()/OnDrop（reason=flush_failed）；既有 Warn 面保留。
 func (b *BufferedSink[T]) flush(ctx context.Context, batch []T) {
 	if len(batch) == 0 {
 		return
 	}
 	events := append([]T(nil), batch...)
+	// per-call recover（#207）：flush 活在 run 循环体内，就地收编保证循环不死
+	// ——GoSafe 兜底只救进程，审计面的连续性靠这里。
+	defer func() {
+		if perr := errors.Recovered(recover()); perr != nil {
+			b.dropBatch(events, "flush_failed")
+			bufferedSinkLog.Warn("buffered sink flush panicked (isolated, loop continues)",
+				logx.ErrKey, perr,
+				"events", len(events),
+			)
+		}
+	}()
 	if err := b.inner(ctx, events); err != nil {
+		// #208：批量失败按事件数计入丢弃观测口（OnDrop 同路），Warn 照旧。
+		b.dropBatch(events, "flush_failed")
 		if b.flushFail != nil {
 			b.flushFail(err, events)
 			return
