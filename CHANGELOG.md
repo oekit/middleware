@@ -1,5 +1,11 @@
 
 
+## [v0.19.0] — 2026-11-13
+
+- 关停/审计/I18n 批：legacy 路径删除（#179）、hertz header 单源 core/transport/hertzbridge（#180）、I18n 锁外发布+single-flight+退避（#182）、SmartAuth Auto 立证不降级（#184）、JWT runtime 毒化修复（#185）、WithJWTAlgorithm 文档修正与 errJWT 哨兵导出（#186）、SkipPaths 语义声明统一（#187）、InfraPaths 函数化（#188）、hmw trace_id 注释勘误（#189）、BufferedSink 泛型化（#192）、AuditEvent IP/UA/Extra 缝（#193）、logx.ErrKey 收口（#196）、hook panic 隔离（#207）、Close 超时回归钉（#208）、flush 失败计数（#209）、AuditLog 钩子 panic 隔离（#210）、I18n loader 预算（#211）
+
+关联问题单：middleware#179、middleware#180、middleware#182、middleware#184、middleware#185、middleware#186、middleware#187、middleware#188、middleware#189、middleware#192、middleware#193、middleware#196、middleware#207、middleware#208、middleware#209、middleware#210、middleware#211。
+
 ## [v0.18.1] — 2026-11-13
 
 - fix: 审计/i18n 面第六轮 sweep 五单——BufferedSink flush panic 就地收编+循环不死+丢弃留痕（#207）、flush 失败按事件数计入 Dropped/OnDrop 观测口（#208）、Close 超时错误透传语义与 Sink∥Close 并发 -race 回归钉（#209）、auditEventOf 六个 With*Func 提取钩子 panic 隔离（#210）、I18n loader 单次预算（缺省 3s 可配 WithI18nLoaderTimeout）+single-flight 等待位有界+失败退避阀对挂起态生效（#211）
