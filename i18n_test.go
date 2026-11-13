@@ -335,3 +335,163 @@ func TestI18n_PickLang_ReturnsOriginalCatalogKey(t *testing.T) {
 		t.Errorf("Translate(welcome) via picked lang %q = %q, want 欢迎", lang, got)
 	}
 }
+
+// —— #211 loader 挂起预算 / 有界 single-flight / 挂起态退避 ——
+
+// TestI18n_LoaderBudgetTimeout 回归钉（#211）：挂起 loader 带单次预算——
+// 请求按预算降级返回（不被挂死 loader 无限拖住）、退避阀置位、在途结果
+// 不作废（成功晚到照常发布，下个请求直接受益，loader 零重复调用）。
+func TestI18n_LoaderBudgetTimeout(t *testing.T) {
+	var calls atomic.Int32
+	inst := I18n(
+		WithI18nBundleLoader(func(ctx context.Context) (Catalog, error) {
+			calls.Add(1)
+			// 挂起形态：睡过预算（本测试预算 100ms）再返回成功——不看 ctx
+			// 的挂死 loader 的温和版，预算耗尽路径必须先返回。
+			time.Sleep(150 * time.Millisecond)
+			return Catalog{"en": {"k": "loaded"}}, nil
+		}),
+		WithI18nLoaderTimeout(100*time.Millisecond),
+	)
+
+	start := time.Now()
+	ctx := serveWith(inst, "en")
+	elapsed := time.Since(start)
+	if got := Translate(ctx, "k"); got != "k" {
+		t.Fatalf("预算耗尽请求必须降级(返 key 自身): got %q", got)
+	}
+	if elapsed > 400*time.Millisecond {
+		t.Fatalf("★ 请求被挂起 loader 拖住: elapsed %v > 预算 100ms (#211)", elapsed)
+	}
+
+	// 在途结果不作废：晚到成功照常发布。
+	deadline := time.Now().Add(2 * time.Second)
+	for Translate(serveWith(inst, "en"), "k") != "loaded" {
+		if time.Now().After(deadline) {
+			t.Fatal("★ 晚到的 loader 成功结果未发布(#211 在途结果不作废)")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("loader calls = %d, want 1(预算耗尽不得立即重试,退避阀已置位)", n)
+	}
+}
+
+// TestI18n_LoaderHangBackoffValve 回归钉（#211）：退避阀对挂起态生效——
+// 预算耗尽置位 lastFailNano 后，退避窗口内的后续请求零排队降级（不再发起
+// 任何 loader 调用），挂死 loader 也不叠加并发调用（single-flight 口径）。
+func TestI18n_LoaderHangBackoffValve(t *testing.T) {
+	var calls atomic.Int32
+	gate := make(chan struct{}) // loader 挂死在门上(不看 ctx,极端形态)
+	inst := I18n(
+		WithI18nBundleLoader(func(ctx context.Context) (Catalog, error) {
+			calls.Add(1)
+			<-gate // 挂死:预算耗尽后仍在途
+			return Catalog{"en": {"k": "loaded"}}, nil
+		}),
+		WithI18nLoaderTimeout(50*time.Millisecond),
+	)
+
+	ctx := serveWith(inst, "en")
+	if got := Translate(ctx, "k"); got != "k" {
+		t.Fatalf("预算耗尽必须降级: got %q", got)
+	}
+	// 挂死 loader 仍在途:窗口内+窗口过后的并发请求一律降级,零新增调用、
+	// 零并发叠加（loaderInflight 在途门）。
+	for i := 0; i < 10; i++ {
+		ctx := serveWith(inst, "en")
+		if got := Translate(ctx, "k"); got != "k" {
+			t.Fatalf("挂死在途期间请求必须降级: got %q", got)
+		}
+		time.Sleep(60 * time.Millisecond) // 跨越退避窗口,退避阀与在途门双重拦截
+	}
+	if n := calls.Load(); n != 1 {
+		t.Errorf("★ 挂死 loader 期间 loader calls = %d, want 1(退避阀+在途门必须拦截,#211)", n)
+	}
+	close(gate) // 收尾:挂死 loader 完成并发布,资源不泄漏
+}
+
+// TestI18n_LoaderQueueBounded 回归钉（#211）：single-flight 等待位有界——
+// 队列满的请求立即降级不排队（loader 挂起时单点等待不放大成全站无界堆积），
+// 排队请求共享同一份加载结果（single-flight 去重不破）。
+func TestI18n_LoaderQueueBounded(t *testing.T) {
+	var calls atomic.Int32
+	gate := make(chan struct{})
+	release := make(chan struct{})
+	inst := I18n(
+		WithI18nBundleLoader(func(ctx context.Context) (Catalog, error) {
+			calls.Add(1)
+			gate <- struct{}{} // 抵达 loader(阻塞式:leader 未完成)
+			<-release
+			return Catalog{"en": {"k": "loaded"}}, nil
+		}),
+		WithI18nLoaderTimeout(5*time.Second), // 预算宽裕:纯看队列有界
+	)
+
+	const total = i18nMaxLoadWaiters + 16 // 1 个 leader + 队列满 + 溢出降级
+	type result struct{ got string }
+	results := make(chan result, total)
+	var wg sync.WaitGroup
+	for i := 0; i < total; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			ctx := serveWith(inst, "en")
+			results <- result{got: Translate(ctx, "k")}
+		}()
+	}
+	<-gate // leader 已停在 loader 内
+
+	// 队列满 + 溢出的请求必须立即降级返回（不等 leader 完成）。
+	deadline := time.Now().Add(2 * time.Second)
+	degraded := 0
+	for degraded < total-i18nMaxLoadWaiters-1 {
+		select {
+		case r := <-results:
+			if r.got != "k" {
+				t.Fatalf("★ 溢出请求应降级返 key, got %q", r.got)
+			}
+			degraded++
+		case <-time.After(time.Until(deadline)):
+			t.Fatalf("★ 溢出请求被排队拖住: only %d/%d degraded (#211 有界队列缺失)",
+				degraded, total-i18nMaxLoadWaiters-1)
+		}
+	}
+
+	close(release) // 放行 leader,排队请求共享结果
+	wg.Wait()
+	close(gate)
+	if n := calls.Load(); n != 1 {
+		t.Errorf("loader calls = %d, want 1(single-flight 去重不破,#182/#211)", n)
+	}
+	// 全部请求终态:溢出者降级、排到队者拿到发布结果——两态都是显式契约。
+	// (poll 已消费 degraded 份,剩余 total-degraded 份)
+	loadedCount := 0
+	for i := 0; i < total-degraded; i++ {
+		if (<-results).got == "loaded" {
+			loadedCount++
+		}
+	}
+	if loadedCount < 1 {
+		t.Fatal("★ 排队请求必须共享 leader 的加载结果")
+	}
+}
+
+// TestI18n_LoaderTimeoutOption 预算选项契约（#211）：缺省 3s（对齐
+// registry/kitex #191 / nns-kitex #212 注册面先例）；d <= 0 构造期 panic
+// （fail-fast,预算是防挂起的护栏）。
+func TestI18n_LoaderTimeoutOption(t *testing.T) {
+	if defaultI18nLoaderTimeout != 3*time.Second {
+		t.Fatalf("defaultI18nLoaderTimeout = %v, want 3s(先例口径)", defaultI18nLoaderTimeout)
+	}
+	for _, d := range []time.Duration{0, -time.Second} {
+		func() {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Errorf("★ WithI18nLoaderTimeout(%v) 必须构造期 panic(fail-fast)", d)
+				}
+			}()
+			I18n(WithI18nLoaderTimeout(d))
+		}()
+	}
+}
