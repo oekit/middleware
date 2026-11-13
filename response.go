@@ -312,7 +312,7 @@ func hasCodeField(body []byte) bool {
 	inString := false
 	escaped := false
 
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		b := s[i]
 
 		if inString {
