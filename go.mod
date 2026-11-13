@@ -25,7 +25,7 @@ require (
 	github.com/oekit/logx v0.10.0
 	github.com/oekit/metrics v0.3.1
 	github.com/oekit/registry v0.5.17
-	github.com/oekit/tracing v0.4.3
+	github.com/oekit/tracing v0.4.4
 	github.com/prometheus/client_golang v1.25.0
 	github.com/swaggo/http-swagger v1.3.4
 	golang.org/x/crypto v0.58.0
