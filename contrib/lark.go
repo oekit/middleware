@@ -30,7 +30,7 @@ type LarkEventOption = larkevent.OptionFunc
 //
 // 用法:
 //
-//	cardHandler := larkcard.NewCardActionHandler("verification_token", func(ctx context.Context, c *larkcard.CardAction) (interface{}, error) {
+//	cardHandler := larkcard.NewCardActionHandler("verification_token", func(ctx context.Context, c *larkcard.CardAction) (any, error) {
 //	    // 业务处理用户点卡片按钮
 //	    return nil, nil
 //	})
