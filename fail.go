@@ -79,13 +79,10 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 		writeBizError(c, bizErr, nil)
 		return
 	}
-	// 发现类错误：上游无可用实例 → 503（依赖不可用语义）
-	if stderrors.Is(err, registry.ErrNoInstances) {
-		failLog.CtxWarn(ctx, "dependency has no instances", logx.ErrKey, err)
-		ErrorResp(c, 503, "service unavailable")
-		return
-	}
 	// Resolve not-found checker: per-call option overrides global default.
+	// 判定顺序按 godoc 编号钉死（#254）：tier 2 NotFoundErrChecker 先于
+	// tier 3 ErrNoInstances——同一错误同时命中两者时 checker 说了算（404），
+	// 与文档一致；旧实现反序，文档承诺的 404 被 503 顶掉。
 	checker := *notFoundChecker.Load()
 	if len(opts) > 0 {
 		o := &failOptions{}
@@ -98,6 +95,12 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 	}
 	if checker(err) {
 		ErrorResp(c, 404, "resource not found")
+		return
+	}
+	// 发现类错误：上游无可用实例 → 503（依赖不可用语义）
+	if stderrors.Is(err, registry.ErrNoInstances) {
+		failLog.CtxWarn(ctx, "dependency has no instances", logx.ErrKey, err)
+		ErrorResp(c, 503, "service unavailable")
 		return
 	}
 	failLog.CtxError(ctx, "internal error", logx.ErrKey, err)
