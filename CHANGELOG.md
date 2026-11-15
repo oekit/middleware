@@ -1,5 +1,16 @@
 
 
+## [v0.19.3] — 2026-11-15
+
+- SmartAuth AuthModeAuto nil parse 兜底（#250）：parse 为 nil 不再走空指针路径
+- SkipPaths 单源两中间件同口径（#251）：同一份 StackConfig.SkipPaths 不再喂出两套语义
+- AccessLog 用法示例与默认配置一致（#252）：示例宣称的默认行为与实现对齐
+- ClientIPFunc 第三参不再恒传 nil（#253）：按签名约定传递真实参数
+- Fail 三级判定顺序与文档编号对齐（#254）：NotFoundErrChecker 判定序按文档口径实现
+- RegisterDebugGroup 文档指向修正（#255）：不存在的 README 锚点改指真实位置
+
+关联问题单：middleware#250、middleware#251、middleware#252、middleware#253、middleware#254、middleware#255。
+
 ## [v0.19.2] — 2026-11-14
 
 - refactor(lark): interface{} → any(1.18 别名),零行为差异
