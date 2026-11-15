@@ -588,7 +588,8 @@ func TestSmartAuth_AuthorizerRejectAndError(t *testing.T) {
 }
 
 // TestSmartAuth_ConstructionPanics 构造期 fail-fast（#97 同哲学）：没有
-// 认证面/立证面的配置必须在启动期炸响。
+// 认证面/立证面的配置必须在启动期炸响。#250 补 AuthModeAuto 配 nil parse
+// ——组合模式缺本地兜底入口，旧实现构造期放行、请求期对 nil parse 调用 panic。
 func TestSmartAuth_ConstructionPanics(t *testing.T) {
 	trust := &GatewayTrust{Secret: []byte("sec")}
 	noPath := &GatewayTrust{} // Secret 与 TrustedSources 均空
@@ -608,6 +609,7 @@ func TestSmartAuth_ConstructionPanics(t *testing.T) {
 		want  string // panic 信息须包含的子串
 	}{
 		{"both nil", nil, nil, nil, "fail-open"},
+		{"auto without parse (#250)", nil, trust, nil, "AuthModeAuto"},
 		{"gateway-only without trust", probe, nil, []SmartAuthOption{WithSmartAuthMode(AuthModeGatewayOnly)}, "GatewayTrust"},
 		{"local-only without parse", nil, trust, []SmartAuthOption{WithSmartAuthMode(AuthModeLocalOnly)}, "JWTParseFunc"},
 		{"trust without attestation path", probe, noPath, nil, "no attestation path"},
