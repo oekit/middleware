@@ -115,7 +115,7 @@ type AccessLogOptions struct {
 	ClientIPFunc func(remoteAddr, xff string, trustedProxies []string) string
 
 	// TrustedProxies 是 ClientIPFunc 第三参（可信代理 CIDR 列表）的数据源
-	//（#253）：WithAccessLogTrustedProxies 设置，缺省 nil（= 默认口径的
+	// （#253）：WithAccessLogTrustedProxies 设置，缺省 nil（= 默认口径的
 	// 「可信网段为空」fail-closed 不变）。只在注入了 ClientIPFunc 时有意义。
 	TrustedProxies []string
 }
