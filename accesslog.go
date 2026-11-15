@@ -95,17 +95,29 @@ type AccessLogOptions struct {
 
 	// ClientIPFunc 是客户端 IP 解析缝（#83）：签名与 pkg/convert.ResolveClientIP
 	// 一致（对端地址、XFF 头、可信代理 CIDR 列表 → 客户端 IP），nil 走默认口径。
+	// 第三参（可信代理 CIDR 列表）由 TrustedProxies 字段供给（#253）——
+	// 旧实现恒传 nil，签名一致却拿不到清单，注入 convert.ResolveClientIP
+	// 静默退化为「只取对端地址」。
 	//
 	// ⚠️ 默认口径自 v0.13.9 起**不再采信任意来源的 XFF**（fail-closed）：
 	// 此前走 `c.ClientIP()`——hertz 默认信任任意网段的 X-Forwarded-For，直连方
 	// 可随意伪造，落库消费方（审计/安全分析按 IP 归因）的来源 IP 全被毒化，
 	// 且与同仓 ratelimit 的防伪造口径（defaultIPKey 用直连地址）自相矛盾。
 	// 默认=「对端地址，可信网段为空」；代理拓扑（RemoteAddr=上游网关）下按真实
-	// 客户端 IP 记录：注入本缝，如 `mw.WithAccessLogClientIP(func(remote, xff string, _ []string) string {
-	//     return convert.ResolveClientIP(remote, xff, myTrustedCIDRs)
-	// })`（或直接用 oekit/hertz 的 clientip.GetClientIP 包一层）。字段含义与
-	// 日志 ip 字段、sink 的 AccessRecord.ClientIP 同源同值。
+	// 客户端 IP 记录：注入本缝 + 可信网段清单，
+	//
+	//	mw.AccessLogMiddleware(
+	//	    mw.WithAccessLogClientIP(convert.ResolveClientIP),
+	//	    mw.WithAccessLogTrustedProxies("10.0.0.0/8", "192.168.0.0/16"),
+	//	)
+	//
+	// 字段含义与日志 ip 字段、sink 的 AccessRecord.ClientIP 同源同值。
 	ClientIPFunc func(remoteAddr, xff string, trustedProxies []string) string
+
+	// TrustedProxies 是 ClientIPFunc 第三参（可信代理 CIDR 列表）的数据源
+	//（#253）：WithAccessLogTrustedProxies 设置，缺省 nil（= 默认口径的
+	// 「可信网段为空」fail-closed 不变）。只在注入了 ClientIPFunc 时有意义。
+	TrustedProxies []string
 }
 
 // AccessRecord 是 AccessLogMiddleware 单次请求的 HTTP 采集结果，与日志字段
@@ -253,12 +265,14 @@ func WithAccessLogLogger(l logx.Logger) AccessLogOption {
 }
 
 // WithAccessLogClientIP 注入客户端 IP 解析函数（#83）：代理拓扑下按可信代理
-// 网段解析真实客户端 IP，推荐直接包一层 pkg/convert.ResolveClientIP（或
-// oekit/hertz clientip.GetClientIP，同源实现）：
+// 网段解析真实客户端 IP。签名与 pkg/convert.ResolveClientIP 一致，第三参
+// （可信代理 CIDR 列表）由 WithAccessLogTrustedProxies 供给（#253），
+// 可直传不再需要闭包手工携带清单：
 //
-//	mw.AccessLogMiddleware(mw.WithAccessLogClientIP(func(remote, xff string, _ []string) string {
-//	    return convert.ResolveClientIP(remote, xff, []string{"10.0.0.0/8"})
-//	}))
+//	mw.AccessLogMiddleware(
+//	    mw.WithAccessLogClientIP(convert.ResolveClientIP),
+//	    mw.WithAccessLogTrustedProxies("10.0.0.0/8"),
+//	)
 //
 // nil 不覆盖既有配置。函数在每请求路径上调用，保持轻量。
 func WithAccessLogClientIP(fn func(remoteAddr, xff string, trustedProxies []string) string) AccessLogOption {
@@ -269,14 +283,24 @@ func WithAccessLogClientIP(fn func(remoteAddr, xff string, trustedProxies []stri
 	}
 }
 
+// WithAccessLogTrustedProxies 设置 ClientIPFunc 第三参（可信代理 CIDR 列表）
+// 的数据源（#253）：如 ["10.0.0.0/8", "192.168.0.0/16"]。不设置时第三参为
+// nil（默认口径 fail-closed 不变）。可多次调用追加；只在注入了 ClientIPFunc
+// 时有意义。
+func WithAccessLogTrustedProxies(proxies ...string) AccessLogOption {
+	return func(o *AccessLogOptions) {
+		o.TrustedProxies = append(o.TrustedProxies, proxies...)
+	}
+}
+
 // resolveClientIP 统一出口（#83）：默认 fail-closed——只取对端地址（去端口），
 // 不采信任何代理头（hertz c.ClientIP() 默认信任任意网段 XFF，直连方可伪造，
 // 与同仓 ratelimit defaultIPKey 的防伪造口径必须一致——审计链的 IP 比限流
 // key 更不能被毒化）。可信网段解析属部署形态知识，经 WithAccessLogClientIP
-// 显式注入。
-func resolveClientIP(c *app.RequestContext, fn func(remoteAddr, xff string, trustedProxies []string) string) string {
+// 显式注入；注入缝的第三参由 trustedProxies（TrustedProxies 字段）透传（#253）。
+func resolveClientIP(c *app.RequestContext, fn func(remoteAddr, xff string, trustedProxies []string) string, trustedProxies []string) string {
 	if fn != nil {
-		return fn(c.RemoteAddr().String(), string(c.Request.Header.Peek("X-Forwarded-For")), nil)
+		return fn(c.RemoteAddr().String(), string(c.Request.Header.Peek("X-Forwarded-For")), trustedProxies)
 	}
 	return hostOnly(c.RemoteAddr().String())
 }
@@ -293,8 +317,9 @@ func newAccessLogOptions(opts ...AccessLogOption) *AccessLogOptions {
 var accessLog = logx.Delegating("access")
 
 // accessRecordOf 由 Hertz 请求上下文与内核采集结果拼出 HTTP 语义的访问记录。
-// clientIPFunc 是 AccessLogOptions.ClientIPFunc 的透传（#83 口径缝）。
-func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFunc func(remoteAddr, xff string, trustedProxies []string) string) AccessRecord {
+// clientIPFunc/trustedProxies 是 AccessLogOptions 同名字段的透传（#83 口径缝，
+// #253 第三参数据源）。
+func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFunc func(remoteAddr, xff string, trustedProxies []string) string, trustedProxies []string) AccessRecord {
 	status := c.Response.StatusCode()
 	if rec.Panic {
 		status = 500 // panic 恢复点状态码尚未写出，按 Recovery 缺省 500 记（#20）
@@ -304,7 +329,7 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 		Path:      rec.Operation,
 		Status:    status,
 		Latency:   rec.Latency,
-		ClientIP:  resolveClientIP(c, clientIPFunc),
+		ClientIP:  resolveClientIP(c, clientIPFunc, trustedProxies),
 		UserAgent: string(c.UserAgent()),
 		TraceID:   hmw.FromRequestContext(c),
 		Panic:     rec.Panic,
@@ -406,7 +431,7 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 				"path", rec.Operation,
 				"status", status,
 				"latency_ms", rec.Latency.Milliseconds(),
-				"ip", resolveClientIP(c, cfg.ClientIPFunc),
+				"ip", resolveClientIP(c, cfg.ClientIPFunc, cfg.TrustedProxies),
 			}
 		}),
 	)
@@ -421,7 +446,7 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 			if !ok {
 				return nil
 			}
-			return sink(ctx, c, accessRecordOf(c, rec, cfg.ClientIPFunc))
+			return sink(ctx, c, accessRecordOf(c, rec, cfg.ClientIPFunc, cfg.TrustedProxies))
 		}))
 	}
 	kernel := chainmw.AccessLog(kernelOpts...)
