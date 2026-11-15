@@ -1,5 +1,11 @@
 
 
+## [v0.19.4] — 2026-11-15
+
+- feat: GatewayTrust 新增 TrustLoopback *bool——显式 false 关闭回环恒可信豁免（回环来源必须签名立证，防同机伪造漏写即放行），nil/true 保持既有语义、显式 TrustedSources 命中仍优先（#261）
+
+关联问题单：middleware#261。
+
 ## [v0.19.3] — 2026-11-15
 
 - SmartAuth AuthModeAuto nil parse 兜底（#250）：parse 为 nil 不再走空指针路径
