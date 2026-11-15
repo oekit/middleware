@@ -43,11 +43,15 @@ func InfraPaths() []string {
 	return append([]string(nil), infraPaths...)
 }
 
-// withInfraPathsDefault SkipPaths 缺省兜底（#137）：未显式传时用 InfraPaths；
-// 显式传则**完全覆盖**缺省（不是追加）——显式清单是调用方对豁免面的完整
-// 声明，不存在「补丁式追加」的隐式并集。
+// withInfraPathsDefault SkipPaths 缺省兜底（#137）：未显式传（nil）时用
+// InfraPaths；显式传则**完全覆盖**缺省（不是追加）——显式清单是调用方对
+// 豁免面的完整声明，不存在「补丁式追加」的隐式并集。
+//
+// nil 与空切片语义有别（#252）：nil = 未设置 ⇒ 走 InfraPaths 兜底；
+// 非 nil 空切片 = 显式声明「一条不跳」⇒ 原样返回（WithAccessLogSkipAll
+// 的表达面）。历史判据 len(paths)>0 会让两者都落兜底，「全量记录」无从表达。
 func withInfraPathsDefault(paths []string) []string {
-	if len(paths) > 0 {
+	if paths != nil {
 		return paths
 	}
 	return InfraPaths()
@@ -61,7 +65,7 @@ type AccessLogOptions struct {
 	// 缺省语义（#137）：未显式传时用 mw.InfraPaths() 兜底（标准探活/监控
 	// 端点零日志零 sink）；显式传则**完全覆盖**缺省——不在显式清单内的
 	// 路径（含 InfraPaths 里的）照常记录，不是「InfraPaths + 显式清单」
-	// 的并集。
+	// 的并集。需要**一条不跳**的全量记录时用 WithAccessLogSkipAll（#252）。
 	SkipPaths []string
 
 	// RedactPathPrefixes 是需要脱敏的路径前缀列表。命中前缀的路径只保留
@@ -160,6 +164,21 @@ type AccessLogOption func(*AccessLogOptions)
 func WithAccessLogSkipPaths(paths ...string) AccessLogOption {
 	return func(o *AccessLogOptions) {
 		o.SkipPaths = append(o.SkipPaths, paths...)
+	}
+}
+
+// WithAccessLogSkipAll 显式全量记录（#252）：豁免面清空，一条不跳——
+// 与缺省（未传任何 SkipPaths 选项 ⇒ InfraPaths 兜底）相反的另一极。
+// 历史上「全量记录」无表达式：WithAccessLogSkipPaths() 空参 append 空、
+// 仍落 InfraPaths 兜底，想按示例字面「不跳过任何路径」做不到。
+//
+// ⚠️ 与 WithAccessLogSkipPaths 同函数内按**调用顺序**生效：后调用者胜
+// （SkipAll 清空此前清单，SkipPaths 追加到 SkipAll 之后的空清单上）。
+//
+//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipAll()))
+func WithAccessLogSkipAll() AccessLogOption {
+	return func(o *AccessLogOptions) {
+		o.SkipPaths = []string{}
 	}
 }
 
@@ -325,11 +344,15 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 //
 // 使用方式:
 //
-//	// 默认配置（不跳过任何路径）
+//	// 缺省按 mw.InfraPaths() 兜底（#137）：/metrics、/healthz 等标准
+//	// 探活/监控端点零日志；显式传 SkipPaths 则完全覆盖缺省
 //	h.Use(mw.AccessLogMiddleware())
 //
 //	// 跳过健康检查和指标端点（支持 glob 模式；"/internal/**" 豁免整棵子树）
 //	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipPaths("/metrics", "/ping", "/health", "/internal/**")))
+//
+//	// 全量记录：显式清空豁免面（连 InfraPaths 缺省也不跳，#252）
+//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipAll()))
 //
 //	// webhook 凭证路径脱敏
 //	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogRedactPathPrefixes("/api/v2/webhook/alert", "/api/v2/task/trigger")))
