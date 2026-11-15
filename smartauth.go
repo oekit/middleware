@@ -112,8 +112,8 @@ func validateTrustHeaderNames(n TrustHeaderNames) error {
 // 可信的——客户端直连时可自带同名头冒充任意身份。立证路径二选一或并存
 // （「仅信任内网来源/网关签名头」）：
 //
-//   - 来源立证：对端地址是回环或落在 TrustedSources 网段（网关/边车同机、
-//     内网直连拓扑）；
+//   - 来源立证：对端地址是回环（可由 TrustLoopback 显式关闭）或落在
+//     TrustedSources 网段（网关/边车同机、内网直连拓扑）；
 //   - 签名立证：Signature 头 = HMAC-SHA256(Secret, GatewayCanonical) 且
 //     Timestamp 在 ReplayWindow 内（防重放）。
 //
@@ -127,9 +127,21 @@ type GatewayTrust struct {
 	ReplayWindow time.Duration
 	// HeaderNames 信任头名集合，零值取 DefaultTrustHeaderNames。
 	HeaderNames TrustHeaderNames
-	// TrustedSources 来源立证的内网网段（netip.Prefix）。回环地址恒可信
-	// （网关/边车同机形态），无须列入。IPv4/IPv6 前缀均可。
+	// TrustedSources 来源立证的内网网段（netip.Prefix）。回环地址缺省可信
+	// （网关/边车同机形态），无须列入；TrustLoopback 显式 false 后回环不再
+	// 自动豁免，若要继续信任回环网段须在此显式声明。IPv4/IPv6 前缀均可。
 	TrustedSources []netip.Prefix
+	// TrustLoopback 控制回环来源是否自动免签名可信（#261）：
+	//   - nil（缺省）或 true：沿用存量语义——回环地址恒可信；
+	//   - 显式 false：关闭回环豁免，回环来源同样必须满足签名立证
+	//     （或显式 TrustedSources 命中）。生产跨容器/同机多租形态下
+	//     「签名是唯一立证」应显式置 false——否则同一 Pod/宿主内的任意进程
+	//     （容器 exec、sidecar、同机调试进程）连回环带身份头即可冒充任意
+	//     用户，回环豁免覆盖掉签名结论。
+	//
+	// 关闭后签名结论不再被来源立证覆盖：无合法签名的回环请求按伪造处理
+	// （VerifyGatewayTrust 返回 false 并剥头）。
+	TrustLoopback *bool
 }
 
 // headerNames 返回填充缺省后的头名集合。
@@ -141,6 +153,12 @@ func (t GatewayTrust) replayWindow() time.Duration {
 		return t.ReplayWindow
 	}
 	return DefaultReplayWindow
+}
+
+// trustLoopback 返回回环来源是否自动可信（nil = 兼容存量语义：恒可信；
+// 显式 false 关闭豁免，#261）。
+func (t GatewayTrust) trustLoopback() bool {
+	return t.TrustLoopback == nil || *t.TrustLoopback
 }
 
 // GatewayCanonical 返回网关签名规范串——信任模型最易漂移的细节，**网关注入
@@ -204,8 +222,8 @@ func GatewaySign(t GatewayTrust, c *app.RequestContext) (string, error) {
 //  1. 任一信任头出现**多值**（同名头注入）⇒ 伪造信号，直接拒；
 //  2. UID 与 Signature 均缺席 ⇒ 未呈现网关立证（false，调用方决定降级路径）；
 //  3. UID 缺席（仅签名头）⇒ 立证不成立（身份是规范串的强绑定行）；
-//  4. 来源立证（回环 / TrustedSources）与签名立证（HMAC-SHA256 + 时间窗）
-//     至少一个成立，否则按伪造处理；
+//  4. 来源立证（回环——TrustLoopback 显式 false 时关闭该豁免 / TrustedSources）
+//     与签名立证（HMAC-SHA256 + 时间窗）至少一个成立，否则按伪造处理；
 //  5. 成功：剥掉已消费的 Signature/Timestamp 头（防下游再解释出第二种
 //     口径），身份头保留，组装 Subject（Roles 按 "," 切分去空项，字符串
 //     精确匹配、无数字强转——与 TrustedClaims 同口径）。
@@ -280,9 +298,10 @@ func gatewayTrustPresented(c *app.RequestContext, n TrustHeaderNames) bool {
 		len(c.GetHeader(n.Signature)) != 0
 }
 
-// sourceTrusted 判定来源立证：对端地址是回环（网关/边车同机形态）或落在
-// TrustedSources 网段。取连接对端地址（c.RemoteAddr）——不读任何转发头，
-// X-Forwarded-For 是客户端可控的（#83 同口径）。
+// sourceTrusted 判定来源立证：对端地址是回环（网关/边车同机形态，可由
+// TrustLoopback 显式关闭）或落在 TrustedSources 网段。取连接对端地址
+// （c.RemoteAddr）——不读任何转发头，X-Forwarded-For 是客户端可控的
+// （#83 同口径）。
 func (t GatewayTrust) sourceTrusted(c *app.RequestContext) bool {
 	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
 	if err != nil {
@@ -293,7 +312,7 @@ func (t GatewayTrust) sourceTrusted(c *app.RequestContext) bool {
 		return false
 	}
 	ip = ip.Unmap()
-	if ip.IsLoopback() {
+	if ip.IsLoopback() && t.trustLoopback() {
 		return true
 	}
 	for _, p := range t.TrustedSources {

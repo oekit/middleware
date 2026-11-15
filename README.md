@@ -66,7 +66,7 @@ h.Use(mw.SmartAuth(
     func(ctx context.Context, token string) (mw.Subject, error) { // 本地 JWT 校验缝
         return kitxToSubject(ctx, token) // 与 kitx/jwt Parse 同形收窄，包一层即得
     },
-    &mw.GatewayTrust{Secret: secret}, // 网关信任头立证（回环/TrustedSources 或签名）
+    &mw.GatewayTrust{Secret: secret}, // 网关信任头立证（回环/TrustedSources 或签名；回环豁免可 TrustLoopback=false 关闭）
     mw.WithSmartAuthSkipPaths("/healthz"),
 ))
 h.Use(mw.SmartRBAC(localRBAC)) // X-Auth-Authorized=1 网关已鉴权跳过，否则本地 RBAC 兜底

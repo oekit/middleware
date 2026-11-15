@@ -102,6 +102,69 @@ func TestVerifyGatewayTrust_LoopbackNoSignature(t *testing.T) {
 	}
 }
 
+// TestVerifyGatewayTrust_LoopbackDisabledRejectsUnsigned 回归（#261 验收①）：
+// TrustLoopback 显式 false 时回环来源不再自动可信——仅 UID 头（无签名）按
+// 伪造处理，返回 false 且剥净全部信任头（同 Pod/宿主内进程冒充面关死）。
+func TestVerifyGatewayTrust_LoopbackDisabledRejectsUnsigned(t *testing.T) {
+	disabled := false
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &disabled}
+	c := newTrustCtx(t, "GET", "/api/admin", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "admin"},
+		ut.Header{Key: "X-Auth-Role-IDs", Value: "9"},
+		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
+	)
+	if _, ok := VerifyGatewayTrust(trust, c); ok {
+		t.Fatal("TrustLoopback=false 时回环仅 UID 头不得立证（#261）")
+	}
+	if left := hasTrustHeaders(c, trust.headerNames()); len(left) != 0 {
+		t.Fatalf("立证失败必须剥掉全部信任头，残留: %v", left)
+	}
+}
+
+// TestVerifyGatewayTrust_LoopbackDisabledSignatureAttests 验收②：关闭回环
+// 豁免后，回环来源带合法签名仍立证成功——签名是唯一立证（生产跨容器形态）。
+func TestVerifyGatewayTrust_LoopbackDisabledSignatureAttests(t *testing.T) {
+	disabled := false
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &disabled}
+	c := signedTrustCtx(t, trust, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+	)
+	sub, ok := VerifyGatewayTrust(trust, c)
+	if !ok || sub.UserID != "u42" {
+		t.Fatalf("关闭回环豁免后合法签名应立证成功: ok=%v sub=%+v", ok, sub)
+	}
+}
+
+// TestVerifyGatewayTrust_LoopbackExplicitTrue 显式 true 与零值同义：回环
+// 免签名立证（存量语义的显式声明形态）。
+func TestVerifyGatewayTrust_LoopbackExplicitTrue(t *testing.T) {
+	enabled := true
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &enabled}
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+	)
+	if _, ok := VerifyGatewayTrust(trust, c); !ok {
+		t.Fatal("TrustLoopback=true 应保留回环免签名立证")
+	}
+}
+
+// TestVerifyGatewayTrust_LoopbackDisabledExplicitTrustedSource 关闭回环豁免
+// 不等于回环永久不可信：TrustedSources 显式命中仍走来源立证（显式声明优先）。
+func TestVerifyGatewayTrust_LoopbackDisabledExplicitTrustedSource(t *testing.T) {
+	disabled := false
+	trust := GatewayTrust{
+		Secret:         []byte("sec"),
+		TrustLoopback:  &disabled,
+		TrustedSources: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+	}
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+	)
+	if _, ok := VerifyGatewayTrust(trust, c); !ok {
+		t.Fatal("TrustedSources 显式命中回环网段时应立证成功")
+	}
+}
+
 // TestVerifyGatewayTrust_ForgedHeadersRejectedAndStripped 头伪造拒绝（核心
 // 安全面）：非可信来源、无签名的 X-Auth-* 头就是客户端自称的身份——必须
 // 拒绝且剥头，任何值都不得进入后续链路。
@@ -393,6 +456,30 @@ func TestSmartAuth_GatewayOnlyForgedRejected401(t *testing.T) {
 	h(context.Background(), c)
 	if !c.IsAborted() || c.Response.StatusCode() != 401 {
 		t.Fatalf("伪造头应 401: status=%d", c.Response.StatusCode())
+	}
+	if left := hasTrustHeaders(c, trust.headerNames()); len(left) != 0 {
+		t.Fatalf("401 前必须剥头，残留: %v", left)
+	}
+	if got := probe.calls(); len(got) != 0 {
+		t.Fatalf("gateway-only 不得调用 parse: %v", got)
+	}
+}
+
+// TestSmartAuth_TrustLoopbackDisabledRejectsLoopbackForgery 回归（#261）：
+// TrustLoopback=false 经 SmartAuth 装配后同样生效——回环来源仅带身份头
+// （无签名）401，且伪造身份头在响应前已被剥净（生产同机冒充路径关死）。
+func TestSmartAuth_TrustLoopbackDisabledRejectsLoopbackForgery(t *testing.T) {
+	disabled := false
+	probe := &parseProbe{sub: Subject{UserID: "jwt-user"}}
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &disabled}
+	h := SmartAuth(probe.parse, &trust, WithSmartAuthMode(AuthModeGatewayOnly))
+	c := newTrustCtx(t, "GET", "/api/admin", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "admin"},
+		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
+	)
+	h(context.Background(), c)
+	if !c.IsAborted() || c.Response.StatusCode() != 401 {
+		t.Fatalf("回环伪造头应 401: status=%d", c.Response.StatusCode())
 	}
 	if left := hasTrustHeaders(c, trust.headerNames()); len(left) != 0 {
 		t.Fatalf("401 前必须剥头，残留: %v", left)
