@@ -90,7 +90,7 @@ type PrometheusMetrics struct {
 	ResponseSize *prom.HistogramVec
 
 	skipPaths   []string // glob 模式清单，pathx.MatchesPath 打原始请求路径（#251）
-	serviceName string    // 存储用于标签构造
+	serviceName string   // 存储用于标签构造
 	enableSize  bool
 }
 

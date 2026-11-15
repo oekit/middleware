@@ -168,4 +168,3 @@ func TestPrometheus_BadGlobPatternPanics(t *testing.T) {
 		SkipPaths: []string{"/api/[admin"}, // 未闭合的 [ = ErrBadPattern
 	})
 }
-
