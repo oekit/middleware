@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/oekit/metrics"
+	"github.com/oekit/pkg/pathx"
 
 	prom "github.com/prometheus/client_golang/prometheus"
 
@@ -25,6 +27,16 @@ type PrometheusConfig struct {
 	ServiceName string
 
 	// SkipPaths 是不需要采集指标的路径列表，如 ["/metrics", "/ping", "/health"]。
+	//
+	// 匹配口径（#251）：pathx.MatchesPath glob 打**原始请求路径**，与同栈
+	// AccessLog/RateLimit 同一源——同一份 StackConfig.SkipPaths 单点传入
+	// 时两侧豁免面一致（此前本字段按 c.FullPath() 路由模板**精确查表**，
+	// glob（"/health*"）与缺省兜底双双失效：AccessLog 跳、指标照采）。
+	// 不再匹配路由模板（"/api/user/:id" 这类写法按字面 glob 匹配原始路径）。
+	//
+	// 缺省语义（#137 同款）：未显式传时用 mw.InfraPaths() 兜底——标准
+	// 探活/监控端点（含 /metrics 自身）缺省零指标；显式传则**完全覆盖**
+	// 缺省（不是追加）。
 	SkipPaths []string
 
 	// Registry 是自定义的 Prometheus 注册器。
@@ -77,8 +89,8 @@ type PrometheusMetrics struct {
 	// ResponseSize 记录响应体大小分布（字节），仅在 EnableSizeMetrics 时注册。
 	ResponseSize *prom.HistogramVec
 
-	skipPaths   map[string]bool
-	serviceName string // 存储用于标签构造
+	skipPaths   []string // glob 模式清单，pathx.MatchesPath 打原始请求路径（#251）
+	serviceName string   // 存储用于标签构造
 	enableSize  bool
 }
 
@@ -88,6 +100,19 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 	ns := cfg.Namespace
 	if ns == "" {
 		ns = "http"
+	}
+
+	// SkipPaths 缺省兜底（#137 同款，#251）：未显式传时豁免 InfraPaths
+	// （含 /metrics 自身——旧实现无兜底，标准装配下抓取流量自采集成环）；
+	// 显式传则完全覆盖缺省。
+	cfg.SkipPaths = withInfraPathsDefault(cfg.SkipPaths)
+	// 构造期预检 SkipPaths glob 语法（#201/#161 同判据 fail-fast）：
+	// pathx.MatchesPath 宽松档把 filepath.ErrBadPattern 吞成「不匹配」，
+	// 一个坏 pattern 让整条豁免判据静默失效、/metrics 自采集复发且零信号。
+	for _, p := range cfg.SkipPaths {
+		if _, err := filepath.Match(p, ""); err != nil {
+			panic(fmt.Sprintf("mw.NewPrometheusMetrics: invalid SkipPaths glob pattern %q: %v", p, err))
+		}
 	}
 
 	reg := cfg.Registry
@@ -142,7 +167,7 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 			},
 			pathLabels,
 		),
-		skipPaths:   make(map[string]bool),
+		skipPaths:   cfg.SkipPaths,
 		serviceName: cfg.ServiceName,
 		enableSize:  cfg.EnableSizeMetrics,
 	}
@@ -166,10 +191,6 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 			},
 			pathLabels,
 		)
-	}
-
-	for _, p := range cfg.SkipPaths {
-		m.skipPaths[p] = true
 	}
 
 	// 用 Register 容忍 AlreadyRegisteredError：DefaultMiddleware 在同一
@@ -220,18 +241,24 @@ func registerReuse[T prom.Collector](reg prom.Registerer, fresh T) T {
 // Middleware 返回 Hertz 中间件，在每个请求结束后记录 Prometheus 指标。
 // SkipPaths 中的路径会被跳过（避免 /metrics 自身被采集）。
 //
-// 路径标签使用 c.FullPath()（路由模板），未匹配路由使用 "unnamed"。
+// 跳过判定（#251）：pathx.MatchesPath glob 打**原始请求路径**（c.Path()），
+// 与同栈 AccessLog/RateLimit 同一源——同一份 StackConfig.SkipPaths 两侧
+// 豁免面一致，glob（"/health*"）与缺省 InfraPaths 兜底均生效。
+//
+// 路径标签使用 c.FullPath()（路由模板），未匹配路由使用 "unnamed"——
+// 标签口径与跳过判定解耦：标签防高基数，跳过判据求与日志一致。
 func (m *PrometheusMetrics) Middleware() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
+		// 跳过判定打原始请求路径（与 AccessLog 同源，#251）
+		if pathx.MatchesPath(m.skipPaths, string(c.Path())) {
+			c.Next(ctx)
+			return
+		}
+
 		// 使用路由模板而非原始路径，避免高基数标签
 		path := c.FullPath()
 		if path == "" {
 			path = "unnamed"
-		}
-
-		if m.skipPaths[path] {
-			c.Next(ctx)
-			return
 		}
 
 		method := string(c.Request.Method())

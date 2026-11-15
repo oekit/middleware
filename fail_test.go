@@ -172,6 +172,33 @@ func TestFail_NoInstances_503(t *testing.T) {
 	}
 }
 
+// TestFail_CheckerBeforeNoInstances 钉住 #254：3-tier 判定顺序按 godoc
+// 编号——tier 2 NotFoundErrChecker 先于 tier 3 ErrNoInstances。同一错误
+// 同时命中 checker 与 ErrNoInstances 包装时 404 说了算（旧实现反序，
+// 文档承诺的 404 被 503 顶掉）；未命中 checker 的 ErrNoInstances 照常 503。
+func TestFail_CheckerBeforeNoInstances(t *testing.T) {
+	wrapped := fmt.Errorf("call dep-svc: %w", registry.ErrNoInstances)
+
+	// 同时命中：checker（tier 2）优先 → 404
+	c := &app.RequestContext{}
+	Fail(context.Background(), c, wrapped, WithNotFoundChecker(func(error) bool {
+		return true
+	}))
+	if c.Response.StatusCode() != 404 {
+		t.Fatalf("★ checker 与 ErrNoInstances 同时命中应 404（godoc tier 2 先于 tier 3，#254）, got %d", c.Response.StatusCode())
+	}
+	if body := string(c.Response.Body()); !strings.Contains(body, "resource not found") {
+		t.Fatalf("body: got %q, want contains 'resource not found'", body)
+	}
+
+	// 只命中 ErrNoInstances（默认 checker 恒 false）→ 503 不回归
+	c2 := &app.RequestContext{}
+	Fail(context.Background(), c2, wrapped)
+	if c2.Response.StatusCode() != 503 {
+		t.Fatalf("仅 ErrNoInstances 应 503, got %d", c2.Response.StatusCode())
+	}
+}
+
 // TestFailWithData_BizError 验证 FailWithData BizError 路径：响应体携带 data，
 // HTTP 状态与封套字段（code/message/trace_id）语义与 Fail 完全一致。
 func TestFailWithData_BizError(t *testing.T) {

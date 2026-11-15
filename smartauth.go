@@ -458,9 +458,11 @@ func WithSmartAuthAdminMatcher(fn func(role string) bool) SmartAuthOption {
 // 构造期校验（fail-fast，#97 同哲学）：
 //
 //	parse 与 trust 均为 nil ⇒ panic（没有任何认证面的「认证中间件」是纯
-//	fail-open）；AuthModeGatewayOnly 配 nil trust / AuthModeLocalOnly 配
-//	nil parse ⇒ panic；trust 非 nil 但 Secret 与 TrustedSources 均空 ⇒
-//	panic（无立证路径）；信任头名两两冲突 ⇒ panic（errors.Join 一次列全）。
+//	fail-open）；AuthModeAuto 配 nil parse（组合模式缺本地兜底入口——
+//	未立证请求无从校验，#250）/ AuthModeGatewayOnly 配 nil trust /
+//	AuthModeLocalOnly 配 nil parse ⇒ panic；trust 非 nil 但 Secret 与
+//	TrustedSources 均空 ⇒ panic（无立证路径）；信任头名两两冲突 ⇒ panic
+//	（errors.Join 一次列全）。
 //
 // 请求流程：
 //
@@ -494,7 +496,12 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 	}
 	switch cfg.Mode {
 	case AuthModeAuto:
-		// 两个入口至少有一个（上面已校验）。
+		// 组合模式承诺「网关立证 + 本地 JWT 兜底」两个入口（#250）：
+		// parse 为 nil 时未立证请求落不到本地校验面，请求期对 nil parse
+		// 调用直接 panic——构造期拦下（仅网关立证的部署显式用 GatewayOnly）。
+		if parse == nil {
+			panic("mw.SmartAuth: AuthModeAuto requires JWTParseFunc (gateway-only deployments should use AuthModeGatewayOnly)")
+		}
 	case AuthModeGatewayOnly:
 		if trust == nil {
 			panic("mw.SmartAuth: AuthModeGatewayOnly requires GatewayTrust")

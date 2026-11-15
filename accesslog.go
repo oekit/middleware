@@ -43,11 +43,15 @@ func InfraPaths() []string {
 	return append([]string(nil), infraPaths...)
 }
 
-// withInfraPathsDefault SkipPaths 缺省兜底（#137）：未显式传时用 InfraPaths；
-// 显式传则**完全覆盖**缺省（不是追加）——显式清单是调用方对豁免面的完整
-// 声明，不存在「补丁式追加」的隐式并集。
+// withInfraPathsDefault SkipPaths 缺省兜底（#137）：未显式传（nil）时用
+// InfraPaths；显式传则**完全覆盖**缺省（不是追加）——显式清单是调用方对
+// 豁免面的完整声明，不存在「补丁式追加」的隐式并集。
+//
+// nil 与空切片语义有别（#252）：nil = 未设置 ⇒ 走 InfraPaths 兜底；
+// 非 nil 空切片 = 显式声明「一条不跳」⇒ 原样返回（WithAccessLogSkipAll
+// 的表达面）。历史判据 len(paths)>0 会让两者都落兜底，「全量记录」无从表达。
 func withInfraPathsDefault(paths []string) []string {
-	if len(paths) > 0 {
+	if paths != nil {
 		return paths
 	}
 	return InfraPaths()
@@ -61,7 +65,7 @@ type AccessLogOptions struct {
 	// 缺省语义（#137）：未显式传时用 mw.InfraPaths() 兜底（标准探活/监控
 	// 端点零日志零 sink）；显式传则**完全覆盖**缺省——不在显式清单内的
 	// 路径（含 InfraPaths 里的）照常记录，不是「InfraPaths + 显式清单」
-	// 的并集。
+	// 的并集。需要**一条不跳**的全量记录时用 WithAccessLogSkipAll（#252）。
 	SkipPaths []string
 
 	// RedactPathPrefixes 是需要脱敏的路径前缀列表。命中前缀的路径只保留
@@ -91,17 +95,29 @@ type AccessLogOptions struct {
 
 	// ClientIPFunc 是客户端 IP 解析缝（#83）：签名与 pkg/convert.ResolveClientIP
 	// 一致（对端地址、XFF 头、可信代理 CIDR 列表 → 客户端 IP），nil 走默认口径。
+	// 第三参（可信代理 CIDR 列表）由 TrustedProxies 字段供给（#253）——
+	// 旧实现恒传 nil，签名一致却拿不到清单，注入 convert.ResolveClientIP
+	// 静默退化为「只取对端地址」。
 	//
 	// ⚠️ 默认口径自 v0.13.9 起**不再采信任意来源的 XFF**（fail-closed）：
 	// 此前走 `c.ClientIP()`——hertz 默认信任任意网段的 X-Forwarded-For，直连方
 	// 可随意伪造，落库消费方（审计/安全分析按 IP 归因）的来源 IP 全被毒化，
 	// 且与同仓 ratelimit 的防伪造口径（defaultIPKey 用直连地址）自相矛盾。
 	// 默认=「对端地址，可信网段为空」；代理拓扑（RemoteAddr=上游网关）下按真实
-	// 客户端 IP 记录：注入本缝，如 `mw.WithAccessLogClientIP(func(remote, xff string, _ []string) string {
-	//     return convert.ResolveClientIP(remote, xff, myTrustedCIDRs)
-	// })`（或直接用 oekit/hertz 的 clientip.GetClientIP 包一层）。字段含义与
-	// 日志 ip 字段、sink 的 AccessRecord.ClientIP 同源同值。
+	// 客户端 IP 记录：注入本缝 + 可信网段清单，
+	//
+	//	mw.AccessLogMiddleware(
+	//	    mw.WithAccessLogClientIP(convert.ResolveClientIP),
+	//	    mw.WithAccessLogTrustedProxies("10.0.0.0/8", "192.168.0.0/16"),
+	//	)
+	//
+	// 字段含义与日志 ip 字段、sink 的 AccessRecord.ClientIP 同源同值。
 	ClientIPFunc func(remoteAddr, xff string, trustedProxies []string) string
+
+	// TrustedProxies 是 ClientIPFunc 第三参（可信代理 CIDR 列表）的数据源
+	// （#253）：WithAccessLogTrustedProxies 设置，缺省 nil（= 默认口径的
+	// 「可信网段为空」fail-closed 不变）。只在注入了 ClientIPFunc 时有意义。
+	TrustedProxies []string
 }
 
 // AccessRecord 是 AccessLogMiddleware 单次请求的 HTTP 采集结果，与日志字段
@@ -160,6 +176,21 @@ type AccessLogOption func(*AccessLogOptions)
 func WithAccessLogSkipPaths(paths ...string) AccessLogOption {
 	return func(o *AccessLogOptions) {
 		o.SkipPaths = append(o.SkipPaths, paths...)
+	}
+}
+
+// WithAccessLogSkipAll 显式全量记录（#252）：豁免面清空，一条不跳——
+// 与缺省（未传任何 SkipPaths 选项 ⇒ InfraPaths 兜底）相反的另一极。
+// 历史上「全量记录」无表达式：WithAccessLogSkipPaths() 空参 append 空、
+// 仍落 InfraPaths 兜底，想按示例字面「不跳过任何路径」做不到。
+//
+// ⚠️ 与 WithAccessLogSkipPaths 同函数内按**调用顺序**生效：后调用者胜
+// （SkipAll 清空此前清单，SkipPaths 追加到 SkipAll 之后的空清单上）。
+//
+//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipAll()))
+func WithAccessLogSkipAll() AccessLogOption {
+	return func(o *AccessLogOptions) {
+		o.SkipPaths = []string{}
 	}
 }
 
@@ -234,12 +265,14 @@ func WithAccessLogLogger(l logx.Logger) AccessLogOption {
 }
 
 // WithAccessLogClientIP 注入客户端 IP 解析函数（#83）：代理拓扑下按可信代理
-// 网段解析真实客户端 IP，推荐直接包一层 pkg/convert.ResolveClientIP（或
-// oekit/hertz clientip.GetClientIP，同源实现）：
+// 网段解析真实客户端 IP。签名与 pkg/convert.ResolveClientIP 一致，第三参
+// （可信代理 CIDR 列表）由 WithAccessLogTrustedProxies 供给（#253），
+// 可直传不再需要闭包手工携带清单：
 //
-//	mw.AccessLogMiddleware(mw.WithAccessLogClientIP(func(remote, xff string, _ []string) string {
-//	    return convert.ResolveClientIP(remote, xff, []string{"10.0.0.0/8"})
-//	}))
+//	mw.AccessLogMiddleware(
+//	    mw.WithAccessLogClientIP(convert.ResolveClientIP),
+//	    mw.WithAccessLogTrustedProxies("10.0.0.0/8"),
+//	)
 //
 // nil 不覆盖既有配置。函数在每请求路径上调用，保持轻量。
 func WithAccessLogClientIP(fn func(remoteAddr, xff string, trustedProxies []string) string) AccessLogOption {
@@ -250,14 +283,24 @@ func WithAccessLogClientIP(fn func(remoteAddr, xff string, trustedProxies []stri
 	}
 }
 
+// WithAccessLogTrustedProxies 设置 ClientIPFunc 第三参（可信代理 CIDR 列表）
+// 的数据源（#253）：如 ["10.0.0.0/8", "192.168.0.0/16"]。不设置时第三参为
+// nil（默认口径 fail-closed 不变）。可多次调用追加；只在注入了 ClientIPFunc
+// 时有意义。
+func WithAccessLogTrustedProxies(proxies ...string) AccessLogOption {
+	return func(o *AccessLogOptions) {
+		o.TrustedProxies = append(o.TrustedProxies, proxies...)
+	}
+}
+
 // resolveClientIP 统一出口（#83）：默认 fail-closed——只取对端地址（去端口），
 // 不采信任何代理头（hertz c.ClientIP() 默认信任任意网段 XFF，直连方可伪造，
 // 与同仓 ratelimit defaultIPKey 的防伪造口径必须一致——审计链的 IP 比限流
 // key 更不能被毒化）。可信网段解析属部署形态知识，经 WithAccessLogClientIP
-// 显式注入。
-func resolveClientIP(c *app.RequestContext, fn func(remoteAddr, xff string, trustedProxies []string) string) string {
+// 显式注入；注入缝的第三参由 trustedProxies（TrustedProxies 字段）透传（#253）。
+func resolveClientIP(c *app.RequestContext, fn func(remoteAddr, xff string, trustedProxies []string) string, trustedProxies []string) string {
 	if fn != nil {
-		return fn(c.RemoteAddr().String(), string(c.Request.Header.Peek("X-Forwarded-For")), nil)
+		return fn(c.RemoteAddr().String(), string(c.Request.Header.Peek("X-Forwarded-For")), trustedProxies)
 	}
 	return hostOnly(c.RemoteAddr().String())
 }
@@ -274,8 +317,9 @@ func newAccessLogOptions(opts ...AccessLogOption) *AccessLogOptions {
 var accessLog = logx.Delegating("access")
 
 // accessRecordOf 由 Hertz 请求上下文与内核采集结果拼出 HTTP 语义的访问记录。
-// clientIPFunc 是 AccessLogOptions.ClientIPFunc 的透传（#83 口径缝）。
-func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFunc func(remoteAddr, xff string, trustedProxies []string) string) AccessRecord {
+// clientIPFunc/trustedProxies 是 AccessLogOptions 同名字段的透传（#83 口径缝，
+// #253 第三参数据源）。
+func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFunc func(remoteAddr, xff string, trustedProxies []string) string, trustedProxies []string) AccessRecord {
 	status := c.Response.StatusCode()
 	if rec.Panic {
 		status = 500 // panic 恢复点状态码尚未写出，按 Recovery 缺省 500 记（#20）
@@ -285,7 +329,7 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 		Path:      rec.Operation,
 		Status:    status,
 		Latency:   rec.Latency,
-		ClientIP:  resolveClientIP(c, clientIPFunc),
+		ClientIP:  resolveClientIP(c, clientIPFunc, trustedProxies),
 		UserAgent: string(c.UserAgent()),
 		TraceID:   hmw.FromRequestContext(c),
 		Panic:     rec.Panic,
@@ -325,11 +369,15 @@ func accessRecordOf(c *app.RequestContext, rec chainmw.AccessRecord, clientIPFun
 //
 // 使用方式:
 //
-//	// 默认配置（不跳过任何路径）
+//	// 缺省按 mw.InfraPaths() 兜底（#137）：/metrics、/healthz 等标准
+//	// 探活/监控端点零日志；显式传 SkipPaths 则完全覆盖缺省
 //	h.Use(mw.AccessLogMiddleware())
 //
 //	// 跳过健康检查和指标端点（支持 glob 模式；"/internal/**" 豁免整棵子树）
 //	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipPaths("/metrics", "/ping", "/health", "/internal/**")))
+//
+//	// 全量记录：显式清空豁免面（连 InfraPaths 缺省也不跳，#252）
+//	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogSkipAll()))
 //
 //	// webhook 凭证路径脱敏
 //	h.Use(mw.AccessLogMiddleware(mw.WithAccessLogRedactPathPrefixes("/api/v2/webhook/alert", "/api/v2/task/trigger")))
@@ -383,7 +431,7 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 				"path", rec.Operation,
 				"status", status,
 				"latency_ms", rec.Latency.Milliseconds(),
-				"ip", resolveClientIP(c, cfg.ClientIPFunc),
+				"ip", resolveClientIP(c, cfg.ClientIPFunc, cfg.TrustedProxies),
 			}
 		}),
 	)
@@ -398,7 +446,7 @@ func AccessLogMiddleware(opts ...AccessLogOption) app.HandlerFunc {
 			if !ok {
 				return nil
 			}
-			return sink(ctx, c, accessRecordOf(c, rec, cfg.ClientIPFunc))
+			return sink(ctx, c, accessRecordOf(c, rec, cfg.ClientIPFunc, cfg.TrustedProxies))
 		}))
 	}
 	kernel := chainmw.AccessLog(kernelOpts...)
