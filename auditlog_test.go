@@ -1046,3 +1046,444 @@ func TestAuditLogMiddleware_HookPanicIsolated(t *testing.T) {
 		t.Fatalf("★ 正常钩子字段必须照常填充: %+v", ev2)
 	}
 }
+
+// —— #267 method 维度过滤（WithAuditLogMethods）——
+
+// TestAuditLogMiddleware_MethodFilterIntersection 路径与 method 取交集：
+// path 命中且 method 命中才产出事件——GET/HEAD 在过滤清单外不产出，写方法
+// 命中；path 未命中的写方法同样不产出（两个维度是 AND，不是 OR）。
+func TestAuditLogMiddleware_MethodFilterIntersection(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/**"),
+		WithAuditLogMethods("POST", "PUT", "PATCH", "DELETE"),
+		WithAuditLogSink(collected.sinkFunc),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	}
+	h.GET("/api/items", handler)
+	h.HEAD("/api/items", handler)
+	h.POST("/api/items", handler)
+	h.PUT("/api/items", handler)
+	h.PATCH("/api/items", handler)
+	h.DELETE("/api/items", handler)
+	h.POST("/public/write", handler) // 写方法但 path 不在审计面
+
+	for _, method := range []string{"GET", "HEAD", "POST", "PUT", "PATCH", "DELETE"} {
+		ut.PerformRequest(h.Engine, method, "/api/items", nil)
+	}
+	ut.PerformRequest(h.Engine, "POST", "/public/write", nil)
+
+	events := collected.snapshot()
+	if len(events) != 4 {
+		t.Fatalf("★ method 过滤应为 path∩method 交集: got %d events (%+v), want 4", len(events), events)
+	}
+	want := map[string]bool{"POST": true, "PUT": true, "PATCH": true, "DELETE": true}
+	for _, ev := range events {
+		if !want[ev.Method] {
+			t.Fatalf("★ 过滤清单外的 method 不得产出事件: %+v", ev)
+		}
+		delete(want, ev.Method)
+	}
+	if len(want) != 0 {
+		t.Fatalf("★ 写方法事件缺失: %v", want)
+	}
+}
+
+// TestAuditLogMiddleware_AllWrites 用 path "/**" + 写方法清单表达「全写操作
+// 审计」（#267 迁移评估的目标形态）：大流量 GET/HEAD 下载不进审计面，
+// 所有写方法命中。
+func TestAuditLogMiddleware_AllWrites(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/**"),
+		WithAuditLogMethods("POST", "PUT", "PATCH", "DELETE"),
+		WithAuditLogSink(collected.sinkFunc),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	}
+	h.GET("/media/download", handler)
+	h.HEAD("/media/download", handler)
+	h.POST("/resources", handler)
+	h.DELETE("/resources/1", handler)
+
+	ut.PerformRequest(h.Engine, "GET", "/media/download", nil)
+	ut.PerformRequest(h.Engine, "HEAD", "/media/download", nil)
+	ut.PerformRequest(h.Engine, "POST", "/resources", nil)
+	ut.PerformRequest(h.Engine, "DELETE", "/resources/1", nil)
+
+	events := collected.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("★ 全写操作审计面: got %d events (%+v), want 2 (POST/DELETE)", len(events), events)
+	}
+	if events[0].Method != "POST" || events[1].Method != "DELETE" {
+		t.Fatalf("★ 全写操作审计面事件不符: %+v", events)
+	}
+}
+
+// TestAuditLogMiddleware_MethodNormalization method 清单构造期大写规范化：
+// 小写/首尾空白输入按规范化后的 method 命中。
+func TestAuditLogMiddleware_MethodNormalization(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/**"),
+		WithAuditLogMethods(" post ", "put"),
+		WithAuditLogSink(collected.sinkFunc),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	}
+	h.POST("/api/items", handler)
+	h.PUT("/api/items", handler)
+	h.GET("/api/items", handler)
+
+	ut.PerformRequest(h.Engine, "POST", "/api/items", nil)
+	ut.PerformRequest(h.Engine, "PUT", "/api/items", nil)
+	ut.PerformRequest(h.Engine, "GET", "/api/items", nil)
+
+	events := collected.snapshot()
+	if len(events) != 2 {
+		t.Fatalf("★ 小写/空白 method 应规范化后命中: got %d events (%+v), want 2", len(events), events)
+	}
+}
+
+// TestAuditLogMiddleware_DefaultNoMethodFilter 缺省不调用
+// WithAuditLogMethods = 不过滤（现有行为逐字不变）：同一路径的 GET 与 POST
+// 都产出事件。
+func TestAuditLogMiddleware_DefaultNoMethodFilter(t *testing.T) {
+	collected := &collectingAuditSink{}
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	h.Use(AuditLogMiddleware(
+		WithAuditLogPaths("/api/**"),
+		WithAuditLogSink(collected.sinkFunc),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]string{"v": "1"})
+	}
+	h.GET("/api/items", handler)
+	h.POST("/api/items", handler)
+
+	ut.PerformRequest(h.Engine, "GET", "/api/items", nil)
+	ut.PerformRequest(h.Engine, "POST", "/api/items", nil)
+
+	if events := collected.snapshot(); len(events) != 2 {
+		t.Fatalf("★ 未配置 method 过滤时不得过滤任何 method: got %d events, want 2", len(events))
+	}
+}
+
+// TestAuditLogMiddleware_MethodFilterFailFast method 清单非法输入构造期
+// fail-fast（不静默）：空参数、空/纯空白项、非 HTTP token 均 panic。
+func TestAuditLogMiddleware_MethodFilterFailFast(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func()
+	}{
+		{"no methods", func() {
+			AuditLogMiddleware(WithAuditLogPaths("/api/**"), WithAuditLogMethods())
+		}},
+		{"empty method", func() {
+			AuditLogMiddleware(WithAuditLogPaths("/api/**"), WithAuditLogMethods(""))
+		}},
+		{"blank method", func() {
+			AuditLogMiddleware(WithAuditLogPaths("/api/**"), WithAuditLogMethods("   "))
+		}},
+		{"space in method", func() {
+			AuditLogMiddleware(WithAuditLogPaths("/api/**"), WithAuditLogMethods("PO ST"))
+		}},
+		{"empty in list", func() {
+			AuditLogMiddleware(WithAuditLogPaths("/api/**"), WithAuditLogMethods("GET", ""))
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("★ %s: 构造必须 panic(fail-loud)", c.name)
+				} else if msg := fmt.Sprint(r); !strings.Contains(strings.ToLower(msg), "method") {
+					t.Fatalf("★ %s: panic 信息应点名 method, got %q", c.name, msg)
+				}
+			}()
+			c.run()
+		})
+	}
+}
+
+// —— #267 缓冲 flush 超时（WithSinkFlushTimeout）——
+
+// TestBufferedAuditSink_FlushTimeoutAttribution inner sink 挂起（无视 ctx）→
+// flush 按配置超时 → 整批按 sink_timeout 丢弃/留痕，而不是等缓冲填满后记成
+// buffer_full（归因错位）；run 循环保持前进。
+func TestBufferedAuditSink_FlushTimeoutAttribution(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	reasons := make(chan string, 8)
+	buf := NewBufferedAuditSink(func(_ context.Context, _ []AuditEvent) error {
+		entered <- struct{}{}
+		<-release // 无视 ctx 的挂起
+		return nil
+	},
+		WithAuditBatchSize(1),
+		WithAuditFlushInterval(time.Hour),
+		WithAuditFlushTimeout(20*time.Millisecond),
+	)
+	// dropDetail 与缺省审计丢弃日志同源：捕获 reason 归因面。
+	buf.dropDetail = func(_ AuditEvent, reason string, _ int64) { reasons <- reason }
+	defer func() {
+		close(release)
+		if err := buf.Close(context.Background()); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "hung", Path: "/t"})
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ inner sink 未抵达 flush 调用")
+	}
+
+	select {
+	case reason := <-reasons:
+		if reason != "sink_timeout" {
+			t.Fatalf("★ 落库挂起必须归因 sink_timeout: got %q", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ flush 超时未按丢弃口径留痕（仍阻塞在 inner sink？）")
+	}
+	if got := buf.Dropped(); got != 1 {
+		t.Fatalf("★ 超时批次必须按事件数计入 Dropped: got %d, want 1", got)
+	}
+}
+
+// TestBufferedAuditSink_FlushTimeoutDeadlinePropagated inner sink 调用带
+// deadline：尊重 ctx 的 sink 在预算耗尽时拿到取消，归因同为 sink_timeout。
+func TestBufferedAuditSink_FlushTimeoutDeadlinePropagated(t *testing.T) {
+	sawDeadline := make(chan struct{}, 1)
+	reasons := make(chan string, 8)
+	buf := NewBufferedAuditSink(func(ctx context.Context, _ []AuditEvent) error {
+		if _, ok := ctx.Deadline(); ok {
+			sawDeadline <- struct{}{}
+		}
+		<-ctx.Done() // 尊重 ctx：预算耗尽即返回
+		return ctx.Err()
+	},
+		WithAuditBatchSize(1),
+		WithAuditFlushInterval(time.Hour),
+		WithAuditFlushTimeout(20*time.Millisecond),
+	)
+	buf.dropDetail = func(_ AuditEvent, reason string, _ int64) { reasons <- reason }
+	defer func() {
+		if err := buf.Close(context.Background()); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "slow", Path: "/d"})
+	select {
+	case <-sawDeadline:
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ inner sink 调用必须带 deadline")
+	}
+	select {
+	case reason := <-reasons:
+		if reason != "sink_timeout" {
+			t.Fatalf("★ ctx 预算耗尽必须归因 sink_timeout: got %q", reason)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ ctx 预算耗尽未按丢弃口径留痕")
+	}
+}
+
+// TestBufferedAuditSink_FlushTimeoutCloseTerminal 挂起的 inner sink 下
+// Close(ctx) 仍在有界预算内返回，并给出「已缓冲事件的实际终态」：final
+// flush 超时 → done 正常闭合 → Close 返回可 errors.Is 的超时终态（而非
+// 永久悬挂）；后续 Close 回读同一终态。
+func TestBufferedAuditSink_FlushTimeoutCloseTerminal(t *testing.T) {
+	release := make(chan struct{})
+	reasons := make(chan string, 8)
+	buf := NewBufferedAuditSink(func(_ context.Context, _ []AuditEvent) error {
+		<-release // 无视 ctx 的挂起，final flush 只能靠超时收口
+		return nil
+	},
+		WithAuditBatchSize(100), // 不触发运行时 flush：事件留在缓冲等 stop-drain
+		WithAuditFlushInterval(time.Hour),
+		WithAuditFlushTimeout(20*time.Millisecond),
+	)
+	buf.dropDetail = func(_ AuditEvent, reason string, _ int64) { reasons <- reason }
+
+	for i := 0; i < 3; i++ {
+		_ = buf.Sink(context.Background(), AuditEvent{Who: fmt.Sprint(i), Path: "/c"})
+	}
+	start := time.Now()
+	err := buf.Close(shortCtx(2 * time.Second))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatal("★ final flush 超时必须返回明确终态错误（不得假报成功）")
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("★ Close 终态应可判定超时: %v", err)
+	}
+	if !strings.Contains(err.Error(), "3") {
+		t.Fatalf("★ 终态信息应带未落盘事件数: %v", err)
+	}
+	if elapsed > time.Second {
+		t.Fatalf("★ Close 必须在有界预算内返回，实际 %s", elapsed)
+	}
+	if got := buf.Dropped(); got != 3 {
+		t.Fatalf("★ final flush 超时批次必须按事件数计入 Dropped: got %d, want 3", got)
+	}
+	for i := 0; i < 3; i++ {
+		select {
+		case reason := <-reasons:
+			if reason != "sink_timeout" {
+				t.Fatalf("★ final flush 超时归因应为 sink_timeout: got %q", reason)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("★ final flush 超时未按丢弃口径留痕")
+		}
+	}
+
+	// 放行在途 inner 调用（避免测试泄漏），done 已闭：后续 Close 回读同一终态。
+	close(release)
+	if again := buf.Close(context.Background()); again == nil || again.Error() != err.Error() {
+		t.Fatalf("★ 后续 Close 必须回读同一终态: first=%v again=%v", err, again)
+	}
+}
+
+// TestBufferedAuditSink_FlushTimeoutFinalSkipTerminal 运行时 flush 已超时且
+// inner 仍悬挂时，stop-drain 尾部不再叠加调用（串行契约）——按 sink_timeout
+// 跳过并在 Close 返回值上留下「尾部未确认落盘」的明确终态，不永久悬挂。
+func TestBufferedAuditSink_FlushTimeoutFinalSkipTerminal(t *testing.T) {
+	release := make(chan struct{})
+	entered := make(chan struct{}, 1)
+	buf := NewBufferedAuditSink(func(_ context.Context, _ []AuditEvent) error {
+		entered <- struct{}{}
+		<-release // 第一次 flush 即挂起且无视 ctx
+		return nil
+	},
+		WithAuditBatchSize(3),
+		WithAuditFlushInterval(time.Hour),
+		WithAuditFlushTimeout(20*time.Millisecond),
+	)
+
+	for i := 0; i < 3; i++ {
+		_ = buf.Sink(context.Background(), AuditEvent{Who: fmt.Sprint(i), Path: "/s"})
+	}
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ inner sink 未抵达首个 flush")
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for buf.Dropped() < 3 {
+		if time.Now().After(deadline) {
+			t.Fatalf("★ 首个 flush 超时未计入丢弃: dropped=%d", buf.Dropped())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// 尾部事件留在攒批中，由 Close 的 stop-drain 触发（此时上一次调用仍悬挂）。
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "tail", Path: "/s"})
+	start := time.Now()
+	err := buf.Close(shortCtx(2 * time.Second))
+	if err == nil || !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("★ final flush 跳过必须返回可判定的超时终态: %v", err)
+	}
+	if elapsed := time.Since(start); elapsed > time.Second {
+		t.Fatalf("★ Close 必须在有界预算内返回，实际 %s", elapsed)
+	}
+	if !strings.Contains(err.Error(), "1") {
+		t.Fatalf("★ 终态信息应带尾部未落盘事件数: %v", err)
+	}
+	if got := buf.Dropped(); got != 4 {
+		t.Fatalf("★ 三事件超时 + 尾部跳过应全部计入 Dropped: got %d, want 4", got)
+	}
+	close(release)
+}
+
+// TestBufferedAuditSink_FlushTimeoutNormalPath 配置超时后的正常全链路回归：
+// 攒批 flush + Close drain 照常落盘，零丢弃、Close 返回 nil。
+func TestBufferedAuditSink_FlushTimeoutNormalPath(t *testing.T) {
+	flushed := make(chan []AuditEvent, 8)
+	buf := NewBufferedAuditSink(func(_ context.Context, events []AuditEvent) error {
+		flushed <- events
+		return nil
+	},
+		WithAuditBatchSize(2),
+		WithAuditFlushInterval(time.Hour),
+		WithAuditFlushTimeout(time.Second),
+	)
+
+	for i := 0; i < 2; i++ {
+		_ = buf.Sink(context.Background(), AuditEvent{Who: fmt.Sprint(i), Path: "/n"})
+	}
+	select {
+	case events := <-flushed:
+		if len(events) != 2 {
+			t.Fatalf("★ 正常 sink 攒批 flush = %d events, want 2", len(events))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ 配置超时后正常攒批未触发 flush")
+	}
+
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "tail", Path: "/n"})
+	if err := buf.Close(context.Background()); err != nil {
+		t.Fatalf("★ 正常 sink Close 必须返回 nil: %v", err)
+	}
+	select {
+	case events := <-flushed:
+		if len(events) != 1 || events[0].Who != "tail" {
+			t.Fatalf("★ Close drain 内容不符: %+v", events)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("★ 配置超时后 Close 未 drain 已缓冲事件")
+	}
+	if got := buf.Dropped(); got != 0 {
+		t.Fatalf("★ 正常链路不得丢弃: dropped=%d", got)
+	}
+}
+
+// TestBufferedSink_FlushTimeoutFailFast 超时选项负值构造期 panic（0=不设
+// 超时保持兼容，是合法值）。
+func TestBufferedSink_FlushTimeoutFailFast(t *testing.T) {
+	cases := []struct {
+		name string
+		run  func()
+	}{
+		{"audit negative timeout", func() {
+			NewBufferedAuditSink(func(context.Context, []AuditEvent) error { return nil },
+				WithAuditFlushTimeout(-time.Second))
+		}},
+		{"generic negative timeout", func() {
+			NewBufferedSink(func(context.Context, []oplogRow) error { return nil },
+				WithSinkFlushTimeout[oplogRow](-time.Second))
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			defer func() {
+				if r := recover(); r == nil {
+					t.Fatalf("★ %s: 构造必须 panic(fail-fast)", c.name)
+				}
+			}()
+			c.run()
+		})
+	}
+}
