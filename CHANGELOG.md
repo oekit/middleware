@@ -1,5 +1,12 @@
 
 
+## [v0.20.0] — 2026-11-16
+
+- - auditlog 新增 method 维度过滤 `WithAuditLogMethods`：与 AuditedPaths 取交集（path 命中且 method 命中才产出事件），构造期 fail-loud 校验；缺省不过滤、现有行为零回归（#267）。
+- auditlog 新增 `WithSinkFlushTimeout`：运行时与收尾 flush 的 inner sink 调用带 deadline，超时归因 `sink_timeout`（不再误记 buffer_full）；Close 在有界预算内返回并给出「已缓冲事件未确认落盘」终态（#267）。
+
+关联问题单：middleware#267。
+
 ## [v0.19.4] — 2026-11-15
 
 - feat: GatewayTrust 新增 TrustLoopback *bool——显式 false 关闭回环恒可信豁免（回环来源必须签名立证，防同机伪造漏写即放行），nil/true 保持既有语义、显式 TrustedSources 命中仍优先（#261）
