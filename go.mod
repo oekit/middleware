@@ -5,7 +5,6 @@ go 1.26.0
 require (
 	github.com/cloudwego/hertz v0.10.6
 	github.com/golang-jwt/jwt/v4 v4.5.2
-	github.com/google/uuid v1.6.0
 	github.com/hertz-contrib/autotls v0.0.1
 	github.com/hertz-contrib/cache v0.0.1
 	github.com/hertz-contrib/csrf v0.1.1
@@ -40,6 +39,7 @@ require (
 	github.com/go-openapi/swag/stringutils v0.28.0 // indirect
 	github.com/go-openapi/swag/typeutils v0.28.0 // indirect
 	github.com/go-openapi/swag/yamlutils v0.28.0 // indirect
+	github.com/google/uuid v1.6.0 // indirect
 	github.com/kr/pretty v0.3.1 // indirect
 	github.com/rogpeppe/go-internal v1.14.1 // indirect
 	go.opentelemetry.io/otel v1.47.0 // indirect
