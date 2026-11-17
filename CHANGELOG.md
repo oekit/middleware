@@ -1,5 +1,11 @@
 
 
+## [v0.20.1] — 2026-11-18
+
+- hmw trace_id 生成收敛 traceid.NewID 单一真相源,生成格式由 8hex-3hex 变 12 位纯 hex(白名单兼容;按第 9 字符写断言的下游需跟进)(#273);prometheus registerReuse 删私有实现改调 metrics.RegisterReuse 单源(#274)
+
+关联问题单：middleware#273、middleware#274。
+
 ## [v0.20.0] — 2026-11-16
 
 - - auditlog 新增 method 维度过滤 `WithAuditLogMethods`：与 AuditedPaths 取交集（path 命中且 method 命中才产出事件），构造期 fail-loud 校验；缺省不过滤、现有行为零回归（#267）。
