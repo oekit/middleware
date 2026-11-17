@@ -2,7 +2,6 @@ package mw
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"path/filepath"
 	"strconv"
@@ -193,49 +192,19 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 		)
 	}
 
-	// 用 Register 容忍 AlreadyRegisteredError：DefaultMiddleware 在同一
-	// registry 上被调两次曾因 MustRegister 直接 panic（与库内"构造失败
-	// 可重试"的基调不符），**复用已注册的 collector**。
-	m.RequestsTotal = registerReuse(reg, m.RequestsTotal)
-	m.RequestDuration = registerReuse(reg, m.RequestDuration)
-	m.RequestsInFlight = registerReuse(reg, m.RequestsInFlight)
+	// 撞名复用注册走 metrics.RegisterReuse 单源（#100 收敛、#274 切换消费；
+	// WithReuseOwner("mw") 令异型 panic 文案与历史私有实现逐字节一致）：
+	// DefaultMiddleware 在同一 registry 上被调两次曾因 MustRegister 直接
+	// panic（与库内"构造失败可重试"的基调不符），**复用已注册的 collector**。
+	m.RequestsTotal = metrics.RegisterReuse(reg, m.RequestsTotal, metrics.WithReuseOwner("mw"))
+	m.RequestDuration = metrics.RegisterReuse(reg, m.RequestDuration, metrics.WithReuseOwner("mw"))
+	m.RequestsInFlight = metrics.RegisterReuse(reg, m.RequestsInFlight, metrics.WithReuseOwner("mw"))
 	if cfg.EnableSizeMetrics {
-		m.RequestSize = registerReuse(reg, m.RequestSize)
-		m.ResponseSize = registerReuse(reg, m.ResponseSize)
+		m.RequestSize = metrics.RegisterReuse(reg, m.RequestSize, metrics.WithReuseOwner("mw"))
+		m.ResponseSize = metrics.RegisterReuse(reg, m.ResponseSize, metrics.WithReuseOwner("mw"))
 	}
 
 	return m
-}
-
-// registerReuse 注册 collector；同名 collector 已注册（同一 Registry +
-// namespace 下构造多个 PrometheusMetrics 是真实场景：一个服务装多套
-// 中间件）时**复用既有实例**，其余注册错误仍 panic（与 MustRegister 语义
-// 一致）。
-//
-// 复用是必须的：此前只吞掉 AlreadyRegisteredError、把**新建的（未注册的）**
-// collector 留在字段里 ⇒ 第二个实例的指标全部丢失（采集端永远看不到它们），
-// 而构造函数却"成功"返回 ⇒ 故障完全静默。
-//
-// 同名同描述符（fqName + help + 标签名都一致）但**类型不同**时，
-// prometheus 返回的是 AlreadyRegisteredError（而非直接拒绝）——此时既有
-// collector 无法当作请求的那个类型复用。直接 `.(T)` 会 panic 成一句
-// 不可定位的 "interface conversion: ..."；改为换成人能读懂的错误
-// （既有类型 vs 请求类型 + 怎么改）。
-func registerReuse[T prom.Collector](reg prom.Registerer, fresh T) T {
-	if err := reg.Register(fresh); err != nil {
-		var are prom.AlreadyRegisteredError
-		if errors.As(err, &are) {
-			existing, ok := are.ExistingCollector.(T)
-			if !ok {
-				panic(fmt.Errorf("mw: 同名 collector 类型不符：已注册 %T，请求 %T"+
-					"（fqName 与描述符相同但类型不同——请改用同一类型的同名指标，或换 namespace）",
-					are.ExistingCollector, fresh))
-			}
-			return existing
-		}
-		panic(err)
-	}
-	return fresh
 }
 
 // Middleware 返回 Hertz 中间件，在每个请求结束后记录 Prometheus 指标。
