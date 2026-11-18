@@ -579,6 +579,85 @@ func TestSmartAuth_AutoDuplicateHeaderRejected401(t *testing.T) {
 	}
 }
 
+// TestGatewayTrustPresented 导出呈现判定（#284，#184 折叠条件单源）：
+// UID/Signature 任一在场或任一信任头多值走私 ⇒ true；全缺席（含仅空白
+// UID）⇒ false。非信任头的多值（如 X-Forwarded-For）不参与判定——折叠
+// 条件只枚举信任头名。自定义头名与 VerifyGatewayTrust 同一解析。
+func TestGatewayTrustPresented(t *testing.T) {
+	trust := GatewayTrust{Secret: []byte("sec")}
+	dup := func(name, v1, v2 string) func(*app.RequestContext) {
+		return func(c *app.RequestContext) {
+			c.Request.Header.Add(name, v1)
+			c.Request.Header.Add(name, v2) // Add 造多值，Set 会覆盖
+		}
+	}
+	custom := GatewayTrust{
+		Secret: []byte("sec"),
+		HeaderNames: TrustHeaderNames{
+			Signature: "X-Gw-Sig", Timestamp: "X-Gw-Ts", UID: "X-Gw-Uid",
+			Username: "X-Gw-Name", RoleIDs: "X-Gw-Roles",
+			Authorized: "X-Gw-Authz", MCP: "X-Gw-Mcp",
+		},
+	}
+	tests := []struct {
+		name  string
+		trust GatewayTrust
+		mut   func(*app.RequestContext)
+		want  bool
+	}{
+		{"nothing presented", trust, nil, false},
+		{"uid present", trust, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-User-ID", "u42")
+		}, true},
+		{"uid whitespace only", trust, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-User-ID", "   ")
+		}, false},
+		{"signature only", trust, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-Signature", "Z2FyYmFnZQ==")
+		}, true},
+		{"multi-value trust header smuggled", trust, dup("X-Auth-MCP", "a", "b"), true},
+		{"multi-value non-trust header ignored", trust, dup("X-Forwarded-For", "a", "b"), false},
+		{"custom uid name", custom, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Gw-Uid", "u42")
+		}, true},
+		{"default names invisible to custom config", custom, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-User-ID", "u42")
+		}, false},
+		{"custom smuggled role ids", custom, dup("X-Gw-Roles", "1", "2"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTrustCtx(t, "GET", "/api/users", "203.0.113.7")
+			if tt.mut != nil {
+				tt.mut(c)
+			}
+			if got := GatewayTrustPresented(tt.trust, c); got != tt.want {
+				t.Fatalf("GatewayTrustPresented = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGatewayTrustPresented_MustCallBeforeVerify 调用序契约（godoc ⚠️ 的
+// 可执行版）：VerifyGatewayTrust 失败路径剥掉全部信任头，之后呈现状态
+// 无从判定——thin wrapper 必须先 Presented 后 Verify。
+func TestGatewayTrustPresented_MustCallBeforeVerify(t *testing.T) {
+	trust := GatewayTrust{Secret: []byte("sec")}
+	c := newTrustCtx(t, "GET", "/api/users", "203.0.113.7",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+		ut.Header{Key: "X-Auth-Signature", Value: "Z2FyYmFnZQ=="},
+	)
+	if !GatewayTrustPresented(trust, c) {
+		t.Fatal("UID+Signature 在场应判定已呈现")
+	}
+	if _, ok := VerifyGatewayTrust(trust, c); ok {
+		t.Fatal("垃圾签名必须验不过")
+	}
+	if GatewayTrustPresented(trust, c) {
+		t.Fatal("剥头后不得再判定为已呈现（必须先 Presented 后 Verify）")
+	}
+}
+
 // TestSmartAuth_LocalOnlyStripsTrustHeaders 本地模式：信任头一律剥除
 // （剥头防伪造的结构性关死），身份只来自令牌。
 func TestSmartAuth_LocalOnlyStripsTrustHeaders(t *testing.T) {
