@@ -280,15 +280,32 @@ func (t GatewayTrust) verify(c *app.RequestContext, n TrustHeaderNames) (Subject
 	return sub, true
 }
 
-// gatewayTrustPresented 判定请求是否**呈现了**网关立证。折叠条件与
-// GatewayTrust.verify 的「未呈现」分支同源（#184）：UID 与 Signature 均
-// 缺席且无任何信任头多值走私 ⇒ 未呈现；任一信任头多值（走私注入）或
-// UID/Signature 任一存在 ⇒ 已呈现——「呈现了但验不过」在 AuthModeAuto
-// 下不再与「未呈现」混同降级，而是 401 + Warn（可疑流量显式拒绝）。
+// GatewayTrustPresented 判定请求是否**呈现了**网关立证（#184 折叠条件单源，
+// #284 导出）：SmartAuth 内部与 thin wrapper 消费方共用同一实现——呈现与否
+// 是「401 可疑流量」vs「放行落兜底」的安全分叉点，消费方不得复刻折叠条件
+// （复刻会在上游调整折叠语义时静默漂移：伪造请求落进「未呈现放行」分支，
+// 不再走 verify 直接带伪造头进身份链）。
+//
+// 折叠条件与 GatewayTrust.verify 的「未呈现」分支同源（#184）：UID 与
+// Signature 均缺席且无任何信任头多值走私 ⇒ 未呈现（false）；任一信任头
+// 多值（走私注入）或 UID/Signature 任一存在 ⇒ 已呈现（true）——「呈现了
+// 但验不过」在 AuthModeAuto 下不再与「未呈现」混同降级，而是 401 + Warn
+// （可疑流量显式拒绝）。
+//
+// 头名取 t.HeaderNames（零值字段回退缺省 X-Auth-* 名，与 VerifyGatewayTrust
+// 同一解析）。
+//
+// 典型消费场景（thin wrapper 组合形态，octopus gatewaytrust.go）：免认证
+// 语义要求「未呈现照旧放行」，只有呈现了才 verify——
+//
+//	if mw.GatewayTrustPresented(trust, c) {
+//	    if _, ok := mw.VerifyGatewayTrust(trust, c); !ok { /* 401，库侧已剥头 */ }
+//	}
 //
 // ⚠️ 必须在剥头前调用：VerifyGatewayTrust 失败路径会把全部信任头剥掉，
 // 剥头后呈现状态无从判定。
-func gatewayTrustPresented(c *app.RequestContext, n TrustHeaderNames) bool {
+func GatewayTrustPresented(t GatewayTrust, c *app.RequestContext) bool {
+	n := t.headerNames()
 	for _, name := range n.all() {
 		if len(c.Request.Header.PeekAll(name)) > 1 {
 			return true // 多值走私：头是呈现了的，只是不成立
@@ -574,8 +591,10 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 		attested := false
 		if trust != nil && cfg.Mode != AuthModeLocalOnly {
 			// presented 判定必须在 VerifyGatewayTrust 之前：其失败路径会把
-			// 全部信任头剥掉，剥头后「呈现过什么」无从判定（#184）。
-			presented := gatewayTrustPresented(c, names)
+			// 全部信任头剥掉，剥头后「呈现过什么」无从判定（#184）。走导出
+			// 版 GatewayTrustPresented——折叠条件单源（#284），thin wrapper
+			// 消费方与本中间件共用同一判定。
+			presented := GatewayTrustPresented(*trust, c)
 			s, ok := VerifyGatewayTrust(*trust, c) // false 路径已剥头
 			if ok {
 				sub, attested = s, true
