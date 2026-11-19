@@ -46,8 +46,11 @@ func WithNotFoundChecker(checker func(error) bool) FailOption {
 // Fail 是 handler 统一错误处理, 跟 fuxi 7 service 'fail()' 同 3-tier 模式:
 //  1. err 是 *ekiterrors.BizError -> writeBizError(c, bizErr, nil) (BizCode 入 body, HTTPCode 决定 HTTP 状态)
 //  2. err 匹配 NotFoundErrChecker -> ErrorResp(c, 404, "resource not found")
-//  3. err 包装 registry.ErrNoInstances -> ErrorResp(c, 503, "service unavailable")
-//     （依赖服务无可用实例是依赖不可用而非本服务 bug，Warn 级日志避免误告警）
+//  3. err 包装 registry.ErrNoInstances -> BizError{BizCode: 50300, HTTPCode: 503}
+//     经 writeBizError 写出（body code=50300；依赖服务无可用实例是依赖不可用
+//     而非本服务 bug，Warn 级日志避免误告警。#291：原先直出 ErrorResp 503 的
+//     body code=503，与 kitex 桥 no-instance / shedding 过载的 50300 分叉，
+//     同一故障被码段监控拆成两个 series——本行为变更见 CHANGELOG 对应版本节）
 //  4. 其他 err -> failLog.CtxError(ctx, "internal error", logx.ErrKey, err) + ErrorResp(c, 500, "internal server error")
 //
 // 500 fallback 路径必 log (unexpected server error), BizError / not-found / 503
@@ -97,10 +100,17 @@ func Fail(ctx context.Context, c *app.RequestContext, err error, opts ...FailOpt
 		ErrorResp(c, 404, "resource not found")
 		return
 	}
-	// 发现类错误：上游无可用实例 → 503（依赖不可用语义）
+	// 发现类错误：上游无可用实例 → BizError 50300 / HTTP 503（依赖不可用语义）。
+	// #291 三轨收敛：kitex 桥 no-instance（BizCode=50300）与 shedding 过载
+	// （BizError 50300）均已按 body code 50300 出码，本 tier 原直出 ErrorResp
+	// 503（body code=503）使同一"依赖无可用实例"故障在码段监控里被拆成两个
+	// series（503 vs 50300）。收编为 BizError 走 writeBizError：HTTP 仍 503、
+	// message 仍 "service unavailable"，仅 body code 503→50300（行为变更，
+	// 见 CHANGELOG 对应版本节）；cause 只进构造的错误对象不回显响应，防止
+	// 内部细节泄漏（与 tier 1 同约定）。
 	if stderrors.Is(err, registry.ErrNoInstances) {
 		failLog.CtxWarn(ctx, "dependency has no instances", logx.ErrKey, err)
-		ErrorResp(c, 503, "service unavailable")
+		writeBizError(c, ekiterrors.WrapBizErrorWithStatus(50300, 503, "service unavailable", err), nil)
 		return
 	}
 	failLog.CtxError(ctx, "internal error", logx.ErrKey, err)

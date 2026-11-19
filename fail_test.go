@@ -156,8 +156,10 @@ func TestFail_BizError_CodeSplit(t *testing.T) {
 	})
 }
 
-// TestFail_NoInstances_503 回归测试（W3-6.6）：依赖服务无可用实例
-// 属于依赖不可用而非本服务 bug，Fail 必须映射为 503 而不是 500。
+// TestFail_NoInstances_503 回归测试（W3-6.6；#291 收敛 body code）：依赖服务
+// 无可用实例属于依赖不可用而非本服务 bug，Fail 必须映射为 HTTP 503 而不是 500。
+// #291 行为变更：body code 由直出的 503 收敛为 BizCode 50300——与 kitex 桥
+// no-instance / shedding 过载同一码段，码段监控不再拆成两个 series。
 func TestFail_NoInstances_503(t *testing.T) {
 	wrapped := fmt.Errorf("call dep-svc: %w", registry.ErrNoInstances)
 
@@ -170,12 +172,17 @@ func TestFail_NoInstances_503(t *testing.T) {
 	if !strings.Contains(body, "service unavailable") {
 		t.Errorf("body: got %q, want contains 'service unavailable'", body)
 	}
+	// #291：body code 必须是 BizCode 50300（原 ErrorResp 直出为 503）
+	if !strings.Contains(body, `"code":50300`) {
+		t.Errorf("body should contain biz_code 50300 (#291), got %q", body)
+	}
 }
 
 // TestFail_CheckerBeforeNoInstances 钉住 #254：3-tier 判定顺序按 godoc
 // 编号——tier 2 NotFoundErrChecker 先于 tier 3 ErrNoInstances。同一错误
 // 同时命中 checker 与 ErrNoInstances 包装时 404 说了算（旧实现反序，
-// 文档承诺的 404 被 503 顶掉）；未命中 checker 的 ErrNoInstances 照常 503。
+// 文档承诺的 404 被 503 顶掉）；未命中 checker 的 ErrNoInstances 照常
+// HTTP 503 + body code 50300（#291 收敛）。
 func TestFail_CheckerBeforeNoInstances(t *testing.T) {
 	wrapped := fmt.Errorf("call dep-svc: %w", registry.ErrNoInstances)
 
@@ -191,11 +198,14 @@ func TestFail_CheckerBeforeNoInstances(t *testing.T) {
 		t.Fatalf("body: got %q, want contains 'resource not found'", body)
 	}
 
-	// 只命中 ErrNoInstances（默认 checker 恒 false）→ 503 不回归
+	// 只命中 ErrNoInstances（默认 checker 恒 false）→ HTTP 503 + body code 50300 不回归
 	c2 := &app.RequestContext{}
 	Fail(context.Background(), c2, wrapped)
 	if c2.Response.StatusCode() != 503 {
 		t.Fatalf("仅 ErrNoInstances 应 503, got %d", c2.Response.StatusCode())
+	}
+	if body := string(c2.Response.Body()); !strings.Contains(body, `"code":50300`) {
+		t.Fatalf("body should contain biz_code 50300 (#291), got %q", body)
 	}
 }
 

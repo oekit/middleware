@@ -51,9 +51,10 @@ func WithShedderCPUThreshold(milli int64) SheddingOption {
 // 行为：
 //   - Allow(ctx) 返回任何 error（ErrServiceOverloaded / ctx 已取消等）
 //     一律按过载拒绝处理：BizError{BizCode: 50300, HTTPCode: 503} 经
-//     Fail 写出 —— HTTP 503 + body code 50300（50300 与 Fail 的
-//     ErrNoInstances 503 "service unavailable" 区分：50300 特指本服务
-//     过载主动丢弃，而非依赖不可用），JSON 响应结构与现有错误路径一致。
+//     Fail 写出 —— HTTP 503 + body code 50300（#291 后 Fail 的
+//     ErrNoInstances 路径同样收敛为 body code 50300，"过载 vs 依赖
+//     不可用"不再靠码段区分、由 message 区分："service is overloaded" /
+//     "service unavailable"），JSON 响应结构与现有错误路径一致。
 //   - 放行 → c.Next(ctx) 后按响应状态码回填 Promise：>= 500 调 Fail()
 //     （4xx 是调用方错误，与服务容量无关，计 Pass），否则 Pass()。
 //   - handler panic：defer 内 recover 后先 Fail() 再原样 re-panic ——
