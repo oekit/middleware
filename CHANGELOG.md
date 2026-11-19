@@ -1,5 +1,12 @@
 
 
+## [v0.22.0] — 2026-11-20
+
+- ⚠ 行为变更：Fail 的 ErrNoInstances tier（依赖无可用实例）body code 由 503 收敛为 BizError 50300（HTTP 仍 503、message "service unavailable" 不变）——与 kitex 桥 no-instance / shedding 过载同一码段，码段监控不再拆双 series（#291）
+docs(shedding): 过时注释同步——收敛后 50300 与 Fail 不再区分「过载 vs 依赖不可用」，两轨同码段由 message 区分（#291）
+
+关联问题单：middleware#291。
+
 ## [v0.21.0] — 2026-11-18
 
 - 导出 GatewayTrustPresented——网关信任头呈现判定单源,thin wrapper 消费方不再复刻 #184 折叠条件;SmartAuth 内部同走导出版(#284)
