@@ -959,14 +959,19 @@ func (b *BufferedSink[T]) getFinalFlushErr() error {
 }
 
 // drop 丢弃一条事件：计数 + OnDrop（或特化缺省/通用缺省 Warn 日志）。
+//
+// 消费方回调（OnDrop/dropDetail）独立 recover（#300）：flush 的 defer recover
+// 分支会调用 dropBatch→drop，若回调在 recover 分支内二次 panic，会直接逃出
+// run()——审计 flush 循环死亡、done 正常闭合（关停看似成功），此后事件全部
+// 按 buffer_full 丢弃。回调 panic 只降级为 Warn，计数与循环继续。
 func (b *BufferedSink[T]) drop(ev T, reason string) {
 	total := b.dropped.Add(1)
 	if b.onDrop != nil {
-		b.onDrop(ev)
+		b.invokeDropCallback("OnDrop", func() { b.onDrop(ev) })
 		return
 	}
 	if b.dropDetail != nil {
-		b.dropDetail(ev, reason, total)
+		b.invokeDropCallback("dropDetail", func() { b.dropDetail(ev, reason, total) })
 		return
 	}
 	bufferedSinkLog.Warn("buffered sink event dropped",
@@ -974,6 +979,20 @@ func (b *BufferedSink[T]) drop(ev T, reason string) {
 		"dropped_total", total,
 		"buffer_size", b.bufferSize,
 	)
+}
+
+// invokeDropCallback 调用消费方丢弃回调并就地收编 panic（#300）：丢弃是
+// 旁路观测动作，回调自身故障不得反向杀死 flush 循环。
+func (b *BufferedSink[T]) invokeDropCallback(kind string, fn func()) {
+	defer func() {
+		if perr := errors.Recovered(recover()); perr != nil {
+			bufferedSinkLog.Warn("buffered sink drop callback panicked (isolated, loop continues)",
+				"callback", kind,
+				logx.ErrKey, perr,
+			)
+		}
+	}()
+	fn()
 }
 
 // dropBatch 整批按丢弃口径留痕（#207/#208）：flush 失败/panic 意味着整批

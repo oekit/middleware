@@ -645,9 +645,26 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 			}
 		}
 
+		// 立证成功标记（#300）：SmartRBAC 默认只认本标记（ctx 内部值，客户端
+		// 无法经请求头伪造）。attested 仅代表网关立证成立——本地 JWT 兜底
+		// 身份不写标记，SmartRBAC 仍须执行本地 RBAC。
+		if attested {
+			ctx = context.WithValue(ctx, smartAuthAttestedCtxKey{}, true)
+		}
 		ctx = injectSmartClaims(ctx, c, sub, admin)
 		c.Next(ctx)
 	}
+}
+
+// smartAuthAttestedCtxKey 是 SmartAuth 网关立证成功标记在 ctx 中的键（#300）。
+// 未导出结构体类型杜绝键碰撞；只有 SmartAuth 在 VerifyGatewayTrust 成功后
+// 写入，SmartRBAC 默认据此判定「网关已集中鉴权」。
+type smartAuthAttestedCtxKey struct{}
+
+// smartAuthAttested 判定 ctx 是否携带 SmartAuth 的网关立证成功标记（#300）。
+func smartAuthAttested(ctx context.Context) bool {
+	attested, _ := ctx.Value(smartAuthAttestedCtxKey{}).(bool)
+	return attested
 }
 
 // injectSmartClaims 把已立证/已校验的 Subject 注入 TrustedClaims 读取面
@@ -672,34 +689,51 @@ func injectSmartClaims(ctx context.Context, c *app.RequestContext, sub Subject, 
 // SmartRBACOptions 是 SmartRBAC 的配置。
 type SmartRBACOptions struct {
 	// AuthorizedHeader 网关「已集中鉴权」标记头。默认 "X-Auth-Authorized"
-	// （TrustHeaderNames.Authorized 缺省同名）。
+	// （TrustHeaderNames.Authorized 缺省同名）。仅在
+	// TrustAuthorizedHeader=true（旧行为兼容档）时参与判定（#300）。
 	AuthorizedHeader string
+	// TrustAuthorizedHeader 为 true 时恢复旧行为：信任裸 Authorized 头
+	// == GatewayAuthorizedValue（不要求 SmartAuth 立证标记）。默认 false
+	// ——只认 SmartAuth 立证后写入 ctx 的标记，客户端直带该头无法跳过
+	// 本地 RBAC。
+	TrustAuthorizedHeader bool
 }
 
 // SmartRBACOption 配置 SmartRBAC。
 type SmartRBACOption func(*SmartRBACOptions)
 
 // WithSmartRBACAuthorizedHeader 覆盖「已集中鉴权」标记头名（网关注入名
-// 非缺省时用）。
+// 非缺省时用）。仅与 WithTrustAuthorizedHeader 配合生效（#300）。
 func WithSmartRBACAuthorizedHeader(name string) SmartRBACOption {
 	return func(o *SmartRBACOptions) { o.AuthorizedHeader = name }
 }
 
-// SmartRBAC 返回「网关已鉴权放行，否则本地 RBAC 兜底」的鉴权中间件（#169，
-// zeus SmartRBAC 同款装配面）：
+// WithTrustAuthorizedHeader 显式恢复旧行为：信任裸 Authorized 头
+// == GatewayAuthorizedValue 即跳过本地 RBAC（#300）。
 //
-//	Authorized 头 == GatewayAuthorizedValue（"1"）⇒ 网关已做过集中鉴权，
-//	直接 c.Next 跳过本地 RBAC；否则调 local 走本地 RBAC（casbin 等）兜底。
+// ⚠️ 安全边界：该头客户端可直带——只有「网关保证覆盖写/剥离客户端同名头」
+// 或 SmartRBAC 严格置于 SmartAuth 之后（立证失败的请求已被剥头）时才可用。
+// 构造期打 WARN 留痕；新装配应使用默认的 SmartAuth 立证标记，不启用本选项。
+func WithTrustAuthorizedHeader() SmartRBACOption {
+	return func(o *SmartRBACOptions) { o.TrustAuthorizedHeader = true }
+}
+
+// SmartRBAC 返回「网关已鉴权放行，否则本地 RBAC 兜底」的鉴权中间件（#169，
+// zeus SmartRBAC 同款装配面；#300 收紧判定）：
+//
+// 默认只认 SmartAuth 的**立证标记**：SmartAuth 在 VerifyGatewayTrust 成功后
+// 把标记写入 ctx（内部值，客户端无法经请求头伪造），SmartRBAC 见到标记即
+// c.Next 跳过本地 RBAC；否则调 local 走本地 RBAC（casbin 等）兜底。
+//
+// 旧行为（裸 Authorized 头 == GatewayAuthorizedValue）需显式
+// WithTrustAuthorizedHeader() 开启——该头客户端可直带，单独挂 SmartRBAC
+// 或挂在 SmartAuth 之前时直带即 fail-open；构造期会打 WARN。
 //
 // # 部署前提（信任边界）
 //
-// Authorized 头必须不可被客户端伪造——直连部署时客户端带
-// X-Auth-Authorized: 1 就能跳过本地 RBAC。两种安全装配：
-//
-//  1. 置于 SmartAuth 之后：立证失败的请求已被剥头（VerifyGatewayTrust /
-//     本地路径同效），Authorized 只可能来自已立证的网关注入；
-//  2. trusted-gateway 形态：网关保证剥掉客户端同名头（同
-//     TrustedHeadersIdentity 的部署契约）。
+// 默认形态要求 SmartRBAC 置于 SmartAuth 之后（立证失败/本地兜底的请求没有
+// 标记，必须走本地 RBAC）。旧行为档另需网关保证剥掉客户端同名头（同
+// TrustedHeadersIdentity 的部署契约）。
 //
 // local 担任本地 RBAC 环节：放行须自行 c.Next(ctx)，拒绝写响应并 Abort
 // （ErrorResp 自动 Abort）。local 为 nil 构造期 panic——nil 会在网关未
@@ -727,10 +761,21 @@ func SmartRBAC(local app.HandlerFunc, opts ...SmartRBACOption) app.HandlerFunc {
 	if cfg.AuthorizedHeader == "" {
 		cfg.AuthorizedHeader = DefaultTrustHeaderNames().Authorized
 	}
+	if cfg.TrustAuthorizedHeader {
+		// 构造期告警：裸头可被客户端直带，跳过本地 RBAC 的判据不再与
+		// SmartAuth 立证结构绑定（#300）。
+		smartAuthLog.Warn("SmartRBAC: WithTrustAuthorizedHeader enabled — trusting bare Authorized header without SmartAuth attestation; ensure the gateway strips client-supplied headers",
+			"authorized_header", cfg.AuthorizedHeader)
+	}
 
 	return func(ctx context.Context, c *app.RequestContext) {
-		if string(c.GetHeader(cfg.AuthorizedHeader)) == GatewayAuthorizedValue {
-			c.Next(ctx) // 网关已集中鉴权：跳过本地 RBAC
+		if smartAuthAttested(ctx) {
+			c.Next(ctx) // SmartAuth 立证成功：网关已集中鉴权，跳过本地 RBAC
+			return
+		}
+		if cfg.TrustAuthorizedHeader &&
+			string(c.GetHeader(cfg.AuthorizedHeader)) == GatewayAuthorizedValue {
+			c.Next(ctx) // 旧行为兼容档：显式信任裸 Authorized 头
 			return
 		}
 		local(ctx, c) // 本地 RBAC 兜底
