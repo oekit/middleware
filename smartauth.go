@@ -243,9 +243,10 @@ func VerifyGatewayTrust(t GatewayTrust, c *app.RequestContext) (Subject, bool) {
 
 // verify 是立证的主体判定（不剥头，由 VerifyGatewayTrust 统一收口）。
 func (t GatewayTrust) verify(c *app.RequestContext, n TrustHeaderNames) (Subject, bool) {
-	// 多值信任头 = 请求走私式头注入的伪造信号，fail-closed。
+	// 多值信任头 = 请求走私式头注入的伪造信号，fail-closed（与
+	// TrustedHeadersIdentity 共用 hasMultiValueHeader，#299 单源）。
 	for _, name := range n.all() {
-		if len(c.Request.Header.PeekAll(name)) > 1 {
+		if hasMultiValueHeader(c, name) {
 			return Subject{}, false
 		}
 	}

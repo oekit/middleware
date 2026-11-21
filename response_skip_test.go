@@ -311,3 +311,45 @@ func TestResponseMiddleware_SkipPrefixesSegmentBoundary(t *testing.T) {
 		}
 	}
 }
+
+// TestResponseMiddleware_SkipPathsGlob 回归 #299：WithSkipPaths 与 AccessLog/
+// Prometheus 同 matcher（pathx.MatchesPath）——"/internal/**" 豁免整棵子树；
+// `*` 单段不跨 "/"，"/internal/*" 不命中嵌套路径；字面精确路径照常命中。
+func TestResponseMiddleware_SkipPathsGlob(t *testing.T) {
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(ResponseMiddleware(WithSkipPaths("/token", "/internal/**", "/direct/*")))
+	h.GET("/token", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"access_token": "tok"})
+	})
+	h.GET("/internal/db/query", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"rows": []any{}})
+	})
+	h.GET("/internal/deep/nested/path", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"deep": true})
+	})
+	h.GET("/direct/one", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"one": true})
+	})
+	h.GET("/direct/one/two", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"two": true})
+	})
+	h.GET("/api/x", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"ok": true})
+	})
+
+	cases := map[string]bool{ // path -> wantWrapped
+		"/token":                     false, // 字面精确
+		"/internal/db/query":         false, // "/**" 跨层
+		"/internal/deep/nested/path": false, // "/**" 跨层
+		"/direct/one":                false, // 单段 "*"
+		"/direct/one/two":            true,  // "*" 不跨 "/"
+		"/api/x":                     true,  // 未声明
+	}
+	for path, wantWrapped := range cases {
+		r := ut.PerformRequest(h, http.MethodGet, path, nil).Result()
+		wrapped := bytes.Contains(r.Body(), []byte(`"code"`))
+		if wrapped != wantWrapped {
+			t.Errorf("GET %s wrapped = %v, want %v (body=%s)", path, wrapped, wantWrapped, r.Body())
+		}
+	}
+}
