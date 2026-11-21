@@ -11,6 +11,11 @@ type StackConfig struct {
 	// SkipPaths 是跳过标准栈处理的路径（如 /metrics、/healthz、OpenAPI）——
 	// v0.8.0 起贯通 AccessLog 与 Response（原实现只作用于 AccessLog，
 	// 导致 /metrics 被包成 {"code":0,...} 信封，Prometheus 解析失败）。
+	//
+	// 匹配口径（#299）：三处（Response/AccessLog/Prometheus）统一走
+	// pathx.MatchesPath glob——`*` 单段不跨 "/"，"/internal/**" 豁免整棵
+	// 子树，"/health*" 匹配同段前缀。同一份清单单点传入，不会出现
+	// AccessLog 跳过而 Response 仍包壳（或反之）。
 	SkipPaths []string
 
 	// Prometheus 指标配置（middleware#16，nil = 维持零指标，行为与现状一致）。

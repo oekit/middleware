@@ -165,3 +165,43 @@ func TestDefaultMiddleware_PerGroup(t *testing.T) {
 		t.Fatalf("组外路由不应受影响，got %s", r.Body())
 	}
 }
+
+// TestDefaultMiddleware_SkipPathsGlobReachResponse 回归 #299/#300：StackConfig.
+// SkipPaths 的 glob 模式（"/internal/**"）必须同时贯通 Response 与 AccessLog
+// ——Response 侧此前只做 map 精确查表，"/internal/**" 不命中，AccessLog 已
+// 跳过的内部端点裸 JSON 仍被包成信封。同时钉住 pathx 的边界语义："/**"
+// 不匹配裸父路径。
+func TestDefaultMiddleware_SkipPathsGlobReachResponse(t *testing.T) {
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	for _, m := range DefaultMiddleware(StackConfig{SkipPaths: []string{"/internal/**"}}) {
+		h.Use(m)
+	}
+	h.GET("/internal/db/query", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"rows": []any{}})
+	})
+	h.GET("/internal", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"ready": true})
+	})
+	h.GET("/api/data", func(ctx context.Context, c *app.RequestContext) {
+		c.JSON(200, map[string]any{"ok": true})
+	})
+
+	r := ut.PerformRequest(h, http.MethodGet, "/internal/db/query", nil).Result()
+	if bytes.Contains(r.Body(), []byte(`"code"`)) {
+		t.Fatalf("/internal/** should not be wrapped, got %s", r.Body())
+	}
+	if !bytes.Contains(r.Body(), []byte(`"rows"`)) {
+		t.Fatalf("/internal/db/query payload lost: %s", r.Body())
+	}
+
+	// pathx 边界："/internal/**" 不匹配裸父（"/internal"），仍走统一包壳。
+	r = ut.PerformRequest(h, http.MethodGet, "/internal", nil).Result()
+	if !bytes.Contains(r.Body(), []byte(`"code"`)) {
+		t.Fatalf("bare /internal is not matched by /internal/** (pathx boundary), got %s", r.Body())
+	}
+
+	r = ut.PerformRequest(h, http.MethodGet, "/api/data", nil).Result()
+	if !bytes.Contains(r.Body(), []byte(`"code"`)) {
+		t.Fatalf("non-skip path should be wrapped: %s", r.Body())
+	}
+}
