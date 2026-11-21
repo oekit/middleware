@@ -1487,3 +1487,76 @@ func TestBufferedSink_FlushTimeoutFailFast(t *testing.T) {
 		})
 	}
 }
+
+// TestBufferedAuditSink_OnDropPanicLoopSurvives 回归 #300：OnDrop 在丢弃
+// 路径（含 flush recover 分支）panic 必须被独立收编——旧实现里 recover
+// 分支再次调用 OnDrop 时二次 panic 会逃出 run()，flush 循环死亡、done 正常
+// 闭合（关停看似成功），后续事件全部按 buffer_full 丢弃。本测试用持续失败
+// 的 inner 触发两批丢弃，断言两批都到达 flush 且循环仍在消费。
+func TestBufferedAuditSink_OnDropPanicLoopSurvives(t *testing.T) {
+	var onDropCalls atomic.Int32
+	releases := make(chan chan struct{}, 8)
+	buf := NewBufferedAuditSink(func(_ context.Context, _ []AuditEvent) error {
+		rel := make(chan struct{})
+		releases <- rel
+		<-rel
+		return errors.New("db down")
+	},
+		WithAuditBatchSize(2),
+		WithAuditFlushInterval(time.Hour),
+		WithAuditOnDrop(func(AuditEvent) {
+			onDropCalls.Add(1)
+			panic("onDrop exploded")
+		}),
+	)
+	defer func() {
+		for {
+			select {
+			case rel := <-releases:
+				close(rel)
+				continue
+			default:
+			}
+			break
+		}
+		if err := buf.Close(context.Background()); err != nil {
+			t.Errorf("close: %v", err)
+		}
+	}()
+
+	waitFlush := func() {
+		select {
+		case rel := <-releases:
+			close(rel)
+		case <-time.After(5 * time.Second):
+			t.Fatal("★ flush 未抵达：run 循环可能已被 OnDrop panic 杀死（#300）")
+		}
+	}
+	waitDropped := func(want int64) {
+		deadline := time.Now().Add(5 * time.Second)
+		for buf.Dropped() < want {
+			if time.Now().After(deadline) {
+				t.Fatalf("★ Dropped = %d, want %d", buf.Dropped(), want)
+			}
+			time.Sleep(5 * time.Millisecond)
+		}
+	}
+
+	// 第一批：flush 失败 → 逐事件 OnDrop panic（必须被隔离）。
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "a", Path: "/a"})
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "b", Path: "/a"})
+	waitFlush()
+	waitDropped(2)
+	if got := onDropCalls.Load(); got != 2 {
+		t.Fatalf("OnDrop calls = %d, want 2（recover 分支不得重复回调）", got)
+	}
+
+	// 第二批：循环仍存活，能再次 flush 并按丢弃留痕。
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "c", Path: "/b"})
+	_ = buf.Sink(context.Background(), AuditEvent{Who: "d", Path: "/b"})
+	waitFlush()
+	waitDropped(4)
+	if got := onDropCalls.Load(); got != 4 {
+		t.Fatalf("OnDrop calls = %d, want 4（OnDrop panic 后循环必须继续消费）", got)
+	}
+}

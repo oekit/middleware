@@ -24,67 +24,57 @@ import (
 
 // TestCache_DefaultReturnsMiddleware 验证 Cache() 默认参数返回有效 middleware。
 func TestCache_DefaultReturnsMiddleware(t *testing.T) {
-	resetCacheState()
-
 	mw := Cache()
 	if mw == nil {
 		t.Fatal("Cache() should return non-nil middleware")
 	}
-	// 第二次调用返回相同函数值(sync.Once)
+	// 每次调用独立实例（#300）：第二次调用同样返回可用 handler。
 	mw2 := Cache()
-	_ = mw2
+	if mw2 == nil {
+		t.Fatal("second Cache() call should return non-nil middleware")
+	}
 }
 
 // TestCache_WithExpiration 应用 WithCacheExpiration。
 func TestCache_WithExpiration(t *testing.T) {
-	resetCacheState()
-
-	_ = Cache(WithCacheExpiration(5 * time.Minute))
-	if globalCacheState.opts.expiration != 5*time.Minute {
-		t.Errorf("expiration = %v, want 5m", globalCacheState.opts.expiration)
+	o := resolveCacheOptions([]CacheOption{WithCacheExpiration(5 * time.Minute)})
+	if o.expiration != 5*time.Minute {
+		t.Errorf("expiration = %v, want 5m", o.expiration)
 	}
 }
 
 // TestCache_WithPrefix 应用 WithCachePrefix。
 func TestCache_WithPrefix(t *testing.T) {
-	resetCacheState()
-
-	_ = Cache(WithCachePrefix("my-svc"))
-	if globalCacheState.opts.prefix != "my-svc" {
-		t.Errorf("prefix = %q, want my-svc", globalCacheState.opts.prefix)
+	o := resolveCacheOptions([]CacheOption{WithCachePrefix("my-svc")})
+	if o.prefix != "my-svc" {
+		t.Errorf("prefix = %q, want my-svc", o.prefix)
 	}
 }
 
 // TestCache_WithStore 应用 WithCacheStore(注入自定义 store)。
 func TestCache_WithStore(t *testing.T) {
-	resetCacheState()
-
 	store := persist.NewMemoryStore(30 * time.Second)
-	_ = Cache(WithCacheStore(store))
-	if globalCacheState.opts.store != store {
+	o := resolveCacheOptions([]CacheOption{WithCacheStore(store)})
+	if o.store != store {
 		t.Fatal("expected store to be the injected one")
 	}
 }
 
 // TestCache_DefaultExpirationApplied 验证默认过期时间 1m 应用。
 func TestCache_DefaultExpirationApplied(t *testing.T) {
-	resetCacheState()
-
-	_ = Cache()
-	if globalCacheState.opts.expiration != time.Minute {
-		t.Errorf("default expiration = %v, want 1m", globalCacheState.opts.expiration)
+	o := resolveCacheOptions(nil)
+	if o.expiration != time.Minute {
+		t.Errorf("default expiration = %v, want 1m", o.expiration)
 	}
-	if globalCacheState.opts.prefix != "ekit" {
-		t.Errorf("default prefix = %q, want ekit", globalCacheState.opts.prefix)
+	if o.prefix != "ekit" {
+		t.Errorf("default prefix = %q, want ekit", o.prefix)
 	}
 }
 
 // TestCache_IgnoreQueryOrder 应用 WithIgnoreQueryOrder。
 func TestCache_IgnoreQueryOrder(t *testing.T) {
-	resetCacheState()
-
-	_ = Cache(WithIgnoreQueryOrder())
-	if !globalCacheState.opts.ignoreOrder {
+	o := resolveCacheOptions([]CacheOption{WithIgnoreQueryOrder()})
+	if !o.ignoreOrder {
 		t.Fatal("expected ignoreOrder = true")
 	}
 }
@@ -117,50 +107,91 @@ func resetCacheState() {
 	globalCacheState = cacheState{}
 }
 
-// TestCache_FrozenInstanceKeepsOptsConsistent 钉住「opts 始终等于实际生效配置」。
-//
-// 缺陷形态（2026-10-31 实测）：cache 是全局单例，实例一旦构造就**冻结**
-// （strategy/expiration/prefix/store 全部不再重建）。但原实现仍把二次调用
-// 的 option **写进 opts** ⇒ opts.prefix 变成 "second"，而实际用的还是
-// "first" ⇒ **状态与实际行为不一致**。
-//
-// 为什么要在意：opts 是「当前配置」的唯一记录，任何读 opts 的代码
-// （新增功能、日志、诊断）都会拿到**错的**值。
-//
-// 本测试断言：冻结后二次调用 Cache(改 prefix) ⇒ opts.prefix **不变**。
-func TestCache_FrozenInstanceKeepsOptsConsistent(t *testing.T) {
+// TestGlobalCache_LaterOptionsPanic 回归 #300：GlobalCache 冻结后二次调用
+// 携带任何 option 必须 panic——旧实现静默忽略并告警，多路由组第二组会
+// 错用第一组 store/prefix 配置且无错误信号。
+func TestGlobalCache_LaterOptionsPanic(t *testing.T) {
 	resetCacheState()
 
-	_ = Cache(WithCachePrefix("first-prefix"))
-	if got := globalCacheState.opts.prefix; got != "first-prefix" {
-		t.Fatalf("首次构造后 opts.prefix = %q，期望 first-prefix", got)
+	if GlobalCache(WithCachePrefix("first-prefix")) == nil {
+		t.Fatal("GlobalCache first call should return handler")
+	}
+	defer func() {
+		if r := recover(); r == nil {
+			t.Fatal("★ GlobalCache 二次带 option 必须 panic（全局实例已冻结，#300）")
+		}
+	}()
+	_ = GlobalCache(WithCachePrefix("second-prefix"))
+}
+
+// TestCache_PerCallInstancesIsolated 回归 #300：Cache 每次调用独立构造——
+// 两个路由组分别配不同 store/prefix/TTL 时各用各的，不再静默共享首个
+// 全局实例（旧实现第二组 option 全被丢弃）。
+func TestCache_PerCallInstancesIsolated(t *testing.T) {
+	resetCacheState()
+	storeA := newRecordingStore(time.Minute)
+	storeB := newRecordingStore(time.Minute)
+	h := server.New(
+		server.WithHostPorts("127.0.0.1:0"),
+		server.WithDisablePrintRoute(true),
+	)
+	var callsA, callsB atomic.Int32
+	h.GET("/a", Cache(
+		WithCacheStore(storeA),
+		WithCachePrefix("svc-a"),
+		WithCacheExpiration(time.Minute),
+	), func(_ context.Context, c *app.RequestContext) {
+		callsA.Add(1)
+		c.JSON(200, map[string]string{"who": "a"})
+	})
+	h.GET("/b", Cache(
+		WithCacheStore(storeB),
+		WithCachePrefix("svc-b"),
+		WithCacheExpiration(5*time.Minute),
+	), func(_ context.Context, c *app.RequestContext) {
+		callsB.Add(1)
+		c.JSON(200, map[string]string{"who": "b"})
+	})
+
+	for i := 0; i < 2; i++ {
+		ut.PerformRequest(h.Engine, http.MethodGet, "/a", nil)
+		ut.PerformRequest(h.Engine, http.MethodGet, "/b", nil)
+	}
+	if got := callsA.Load(); got != 1 {
+		t.Fatalf("route A handler ran %d times, want 1 (own cache)", got)
+	}
+	if got := callsB.Load(); got != 1 {
+		t.Fatalf("route B handler ran %d times, want 1 (own cache)", got)
 	}
 
-	// 二次调用改 prefix —— 实例已冻结，这些 option 永远不会生效。
-	_ = Cache(WithCachePrefix("second-prefix"))
-
-	if got := globalCacheState.opts.prefix; got != "first-prefix" {
-		t.Errorf("★ 冻结后 opts.prefix = %q，期望仍为 first-prefix —— "+
-			"opts 必须始终等于实际生效的配置（已生效的是 first-prefix）", got)
+	// 两组各自落在自己的 store/prefix 上，互不串扰。
+	if !containsKey(storeA.Keys(), "svc-a/a") {
+		t.Fatalf("store A missing key svc-a/a: %v", storeA.Keys())
+	}
+	if !containsKey(storeB.Keys(), "svc-b/b") {
+		t.Fatalf("store B missing key svc-b/b: %v", storeB.Keys())
+	}
+	for _, k := range storeA.Keys() {
+		if !strings.HasPrefix(k, "svc-a/") {
+			t.Fatalf("store A polluted by another instance: %v", storeA.Keys())
+		}
+	}
+	for _, k := range storeB.Keys() {
+		if !strings.HasPrefix(k, "svc-b/") {
+			t.Fatalf("store B polluted by another instance: %v", storeB.Keys())
+		}
 	}
 }
 
-// TestCache_FrozenInstanceReturnsSameHandler 钉住「二次调用返回同一个 handler」。
-//
-// 冻结语义下，二次调用 Cache() 返回的 handler 必须与首次**完全一致**
-// （含 GET 守卫与凭证放行逻辑）⇒ 否则两次注册的路由行为会分叉。
-//
-// 判据用**GET 是否被缓存**（可观测）：带守卫的 handler 对 GET 缓存、
-// 裸 mw 对 GET 也缓存但**不分方法** ⇒ 差异要用「POST 是否被缓存」观测。
-// 两次 POST 各发两次 ⇒ 带守卫时 handler 被调 2 次；裸 mw 时只调 1 次
-// （第二次命中缓存）。
-func TestCache_FrozenInstanceReturnsSameHandler(t *testing.T) {
+// TestGlobalCache_SecondCallWithoutOptsReturnsHandler 兼容档：二次调用不带
+// option 时返回同一全局 handler（含 GET 守卫），行为与首次一致。
+func TestGlobalCache_SecondCallWithoutOptsReturnsHandler(t *testing.T) {
 	resetCacheState()
 
-	first := Cache()
-	second := Cache()
+	first := GlobalCache()
+	second := GlobalCache()
 	if first == nil || second == nil {
-		t.Fatal("Cache() 应返回非 nil handler")
+		t.Fatal("GlobalCache() 应返回非 nil handler")
 	}
 
 	newSrv := func(mw app.HandlerFunc) (*server.Hertz, *atomic.Int32) {
@@ -176,22 +207,14 @@ func TestCache_FrozenInstanceReturnsSameHandler(t *testing.T) {
 		return srv, &hits
 	}
 
-	// 首次注册：POST 两次 ⇒ 守卫放行 ⇒ handler 被调 2 次。
-	h1, hits1 := newSrv(first)
-	ut.PerformRequest(h1.Engine, "POST", "/p", nil)
-	ut.PerformRequest(h1.Engine, "POST", "/p", nil)
-	if got := hits1.Load(); got != 2 {
-		t.Errorf("首次注册的 handler：POST 两次应各调一次 handler，实际 %d 次", got)
-	}
-
-	// 二次注册：必须与首次**同样**带守卫 ⇒ 同样调 2 次。
-	// 若二次调用返回的是**裸 mw**（丢了守卫）⇒ POST 会被缓存 ⇒ 只调 1 次。
-	h2, hits2 := newSrv(second)
-	ut.PerformRequest(h2.Engine, "POST", "/p", nil)
-	ut.PerformRequest(h2.Engine, "POST", "/p", nil)
-	if got := hits2.Load(); got != 2 {
-		t.Errorf("★ 二次调用返回的 handler 与首次语义不一致：POST 两次只调了 %d 次 handler"+
-			"（期望 2 次；少了守卫 ⇒ POST 被缓存）", got)
+	// 两次注册都应带 GET 守卫：POST 不被缓存 ⇒ handler 各调 2 次。
+	for name, mw := range map[string]app.HandlerFunc{"first": first, "second": second} {
+		h, hits := newSrv(mw)
+		ut.PerformRequest(h.Engine, "POST", "/p", nil)
+		ut.PerformRequest(h.Engine, "POST", "/p", nil)
+		if got := hits.Load(); got != 2 {
+			t.Errorf("%s handler: POST twice ran %d times, want 2 (guard lost)", name, got)
+		}
 	}
 }
 

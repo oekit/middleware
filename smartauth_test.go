@@ -817,9 +817,10 @@ func TestSmartAuth_DuplicateHeaderNamesJoinError(t *testing.T) {
 	})
 }
 
-// TestSmartRBAC_GatewayAuthorizedSkipsLocal 网关已鉴权（Authorized=1）跳过
-// 本地 RBAC。
-func TestSmartRBAC_GatewayAuthorizedSkipsLocal(t *testing.T) {
+// TestSmartRBAC_BareAuthorizedHeaderNotTrusted 回归 #300：默认只认 SmartAuth
+// 立证标记——单独挂 SmartRBAC（或挂在 SmartAuth 之前）时客户端直带
+// X-Auth-Authorized: 1 不再跳过本地 RBAC（静默 fail-open 关死）。
+func TestSmartRBAC_BareAuthorizedHeaderNotTrusted(t *testing.T) {
 	localCalled := false
 	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
 		localCalled = true
@@ -829,17 +830,54 @@ func TestSmartRBAC_GatewayAuthorizedSkipsLocal(t *testing.T) {
 		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
 	)
 	h(context.Background(), c)
-	if localCalled {
-		t.Fatal("网关已鉴权不得调用本地 RBAC")
-	}
-	if c.IsAborted() {
-		t.Fatal("网关已鉴权应放行")
+	if !localCalled {
+		t.Fatal("★ 默认不得信任裸 Authorized 头（#300 fail-open）")
 	}
 }
 
-// TestSmartRBAC_LocalFallback 未标记（缺席/非 "1"）走本地 RBAC 兜底。
+// TestSmartRBAC_AttestedMarkerSkipsLocal SmartAuth 立证成功后写入 ctx 的
+// 标记是默认跳过判据（无需 Authorized 头）。
+func TestSmartRBAC_AttestedMarkerSkipsLocal(t *testing.T) {
+	localCalled := false
+	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
+		localCalled = true
+		c.Next(ctx)
+	})
+	ctx := context.WithValue(context.Background(), smartAuthAttestedCtxKey{}, true)
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1")
+	h(ctx, c)
+	if localCalled {
+		t.Fatal("SmartAuth 立证标记命中应跳过本地 RBAC")
+	}
+	if c.IsAborted() {
+		t.Fatal("立证标记命中应放行")
+	}
+}
+
+// TestSmartRBAC_LegacyHeaderOptIn WithTrustAuthorizedHeader 显式兼容旧行为：
+// 裸 Authorized 头命中即跳过本地 RBAC（构造期告警，测试只钉行为面）。
+func TestSmartRBAC_LegacyHeaderOptIn(t *testing.T) {
+	localCalled := false
+	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
+		localCalled = true
+		c.Next(ctx)
+	}, WithTrustAuthorizedHeader())
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
+	)
+	h(context.Background(), c)
+	if localCalled {
+		t.Fatal("WithTrustAuthorizedHeader 显式兼容档：裸头命中应跳过本地 RBAC")
+	}
+	if c.IsAborted() {
+		t.Fatal("旧行为兼容档应放行")
+	}
+}
+
+// TestSmartRBAC_LocalFallback 未标记（缺席/非 "1"）/裸头（默认不信任）
+// 走本地 RBAC 兜底。
 func TestSmartRBAC_LocalFallback(t *testing.T) {
-	for _, header := range []string{"", "0", "true"} {
+	for _, header := range []string{"", "0", "true", GatewayAuthorizedValue} {
 		localCalled := false
 		h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
 			localCalled = true
@@ -851,7 +889,7 @@ func TestSmartRBAC_LocalFallback(t *testing.T) {
 		}
 		h(context.Background(), c)
 		if !localCalled {
-			t.Fatalf("Authorized=%q 应走本地 RBAC 兜底", header)
+			t.Fatalf("Authorized=%q 应走本地 RBAC 兜底（默认不信任裸头，#300）", header)
 		}
 	}
 }
@@ -867,19 +905,19 @@ func TestSmartRBAC_NilLocalPanics(t *testing.T) {
 	_ = SmartRBAC(nil)
 }
 
-// TestSmartRBAC_CustomAuthorizedHeader 自定义标记头名。
+// TestSmartRBAC_CustomAuthorizedHeader 自定义标记头名（旧行为兼容档）。
 func TestSmartRBAC_CustomAuthorizedHeader(t *testing.T) {
 	localCalled := false
 	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
 		localCalled = true
 		c.Next(ctx)
-	}, WithSmartRBACAuthorizedHeader("X-Gw-Authz"))
+	}, WithSmartRBACAuthorizedHeader("X-Gw-Authz"), WithTrustAuthorizedHeader())
 	c := newTrustCtx(t, "GET", "/x", "127.0.0.1",
 		ut.Header{Key: "X-Gw-Authz", Value: GatewayAuthorizedValue},
 	)
 	h(context.Background(), c)
 	if localCalled {
-		t.Fatal("自定义头命中应跳过本地 RBAC")
+		t.Fatal("自定义头命中（显式兼容档）应跳过本地 RBAC")
 	}
 }
 
