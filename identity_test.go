@@ -498,3 +498,63 @@ func TestOverrideTrustedClaims_AdminRecompute(t *testing.T) {
 		t.Errorf("UserID = %q, want key-owner-1", claims.UserID)
 	}
 }
+
+// --- #299：身份头多值检查（网关 append 注入冒充攻击面） ---
+
+// TestTrustedHeadersIdentity_DuplicateUserIDRejected 回归 #299：网关用
+// append 语义注入身份头时，客户端自带的 X-Auth-User-ID 成为首值——多值
+// 身份头必须 fail-closed 401，不能按首值解析成 admin 冒充任意用户。
+func TestTrustedHeadersIdentity_DuplicateUserIDRejected(t *testing.T) {
+	h, probe := newIdentityEngine(t, TrustedIdentityConfig{AdminRoles: []string{"1"}})
+
+	r := ut.PerformRequest(h, http.MethodGet, "/whoami", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "admin"}, // 客户端伪造（首值）
+		ut.Header{Key: "X-Auth-User-ID", Value: "u-42"},  // 网关 append 的真实值
+		ut.Header{Key: "X-Auth-Role-IDs", Value: "1"},
+	).Result()
+
+	if r.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (duplicate UserID header must be rejected), body=%s", r.StatusCode(), r.Body())
+	}
+	if !strings.Contains(string(r.Body()), `"code":401`) {
+		t.Errorf("body should be unified error envelope, got %s", r.Body())
+	}
+	if _, ok := probe.load(); ok {
+		t.Error("handler must not receive claims from duplicate identity headers")
+	}
+}
+
+// TestTrustedHeadersIdentity_DuplicateUsernameRejected 回归 #299：Username
+// 同名多值同样按伪造拒绝（两套身份中间件口径统一）。
+func TestTrustedHeadersIdentity_DuplicateUsernameRejected(t *testing.T) {
+	h, _ := newIdentityEngine(t, TrustedIdentityConfig{})
+
+	r := ut.PerformRequest(h, http.MethodGet, "/whoami", nil,
+		ut.Header{Key: "X-Auth-User-ID", Value: "u-42"},
+		ut.Header{Key: "X-Auth-Username", Value: "admin"},
+		ut.Header{Key: "X-Auth-Username", Value: "alice"},
+	).Result()
+
+	if r.StatusCode() != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401 (duplicate Username header must be rejected), body=%s", r.StatusCode(), r.Body())
+	}
+}
+
+// TestTrustedHeadersIdentity_DuplicateHeaderPolicyIndependent 多值身份头是
+// 伪造信号，不随 BadRoles 的 Drop/Anonymous 策略降级（角色头治理口径不
+// 适用于身份头：丢弃/降级都可能把客户端伪造值当真实身份）。
+func TestTrustedHeadersIdentity_DuplicateHeaderPolicyIndependent(t *testing.T) {
+	for _, policy := range []TrustedBadRolesPolicy{BadRolesDrop, BadRolesAnonymous} {
+		h, probe := newIdentityEngine(t, TrustedIdentityConfig{BadRoles: policy})
+		r := ut.PerformRequest(h, http.MethodGet, "/whoami", nil,
+			ut.Header{Key: "X-Auth-User-ID", Value: "admin"},
+			ut.Header{Key: "X-Auth-User-ID", Value: "u-42"},
+		).Result()
+		if r.StatusCode() != http.StatusUnauthorized {
+			t.Errorf("BadRoles=%d: status = %d, want 401", policy, r.StatusCode())
+		}
+		if _, ok := probe.load(); ok {
+			t.Errorf("BadRoles=%d: handler must not receive claims", policy)
+		}
+	}
+}

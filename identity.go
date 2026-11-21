@@ -168,6 +168,8 @@ const trustedClaimsRequestKey = "oekit_trusted_claims"
 //
 // # 每请求流程
 //
+//  0. UserIDHeader/UsernameHeader 出现同名多值（PeekAll>1）→ 按伪造直接 401
+//     （fail-closed，与 SmartAuth 网关立证同口径；不受 BadRoles 策略影响）
 //  1. UserIDHeader 无值 → Missing 策略（默认 401；AnonymousClaims 则
 //     注入 Anonymous=true 的显式匿名身份放行）
 //  2. RolesHeader 存在但解析出非法项（空值/"1,,2" 形态）→ BadRoles 策略
@@ -212,9 +214,29 @@ func TrustedHeadersIdentity(cfg TrustedIdentityConfig) app.HandlerFunc {
 	}
 }
 
+// hasMultiValueHeader 判定同名头是否出现多值（PeekAll > 1）。多值信任头是
+// 请求走私式头注入的伪造信号：#299 攻击面下网关用 append 语义注入时，客户端
+// 自带的同名头成为首值、网关真实值排第二，只读首值即被冒充。SmartAuth 立证
+// （VerifyGatewayTrust）与 TrustedHeadersIdentity 共用本原语，fail-closed。
+func hasMultiValueHeader(c *app.RequestContext, name string) bool {
+	return len(c.Request.Header.PeekAll(name)) > 1
+}
+
 // parse 每请求一次的身份头解析。reject 为 true 时响应已写好（401），
 // 调用方不得再继续链路。
 func (r *resolvedTrustedIdentityConfig) parse(ctx context.Context, c *app.RequestContext) (TrustedClaims, bool) {
+	// 多值 UserID/Username 头按伪造直接拒（#299，与 SmartAuth 立证同口径）：
+	// 多值身份无法安全「取其一」——BadRoles 的 Drop/Anonymous 策略对身份头
+	// 不适用（丢弃/降级都可能把客户端伪造值当真实身份），因此恒 401。
+	if hasMultiValueHeader(c, r.userIDHeader) || hasMultiValueHeader(c, r.usernameHeader) {
+		identityLog.CtxWarn(ctx, "trusted identity headers have multiple values, rejected",
+			"path", string(c.Path()),
+			"user_id_header", r.userIDHeader,
+			"username_header", r.usernameHeader)
+		ErrorResp(c, 401, "unauthorized")
+		return TrustedClaims{}, true
+	}
+
 	userID := strings.TrimSpace(string(c.GetHeader(r.userIDHeader)))
 	if userID == "" {
 		if r.missing == AnonymousClaims {
