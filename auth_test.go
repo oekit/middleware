@@ -3,12 +3,17 @@ package mw
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
 	"sync"
 	"testing"
 
 	"github.com/cloudwego/hertz/pkg/app"
+	"github.com/cloudwego/hertz/pkg/common/config"
 	"github.com/cloudwego/hertz/pkg/common/test/assert"
+	"github.com/cloudwego/hertz/pkg/common/ut"
 	"github.com/cloudwego/hertz/pkg/protocol/consts"
+	"github.com/cloudwego/hertz/pkg/route"
 )
 
 const testBearerToken = "test-bearer-token-12345"
@@ -330,5 +335,336 @@ func TestBearerTokenAuth_SkipPathsExactMatchNotGlob(t *testing.T) {
 	)
 	if auth2.called != 0 {
 		t.Fatalf("精确命中仍应豁免: called=%d", auth2.called)
+	}
+}
+
+// fakeTokenVerifier 记录调用入参并返回预设结果（#293 verifier 测试桩）。
+type fakeTokenVerifier struct {
+	sub Subject
+	err error
+
+	mu         sync.Mutex
+	called     int
+	lastToken  string
+	lastAPIKey string
+}
+
+func (f *fakeTokenVerifier) Verify(_ context.Context, c *app.RequestContext, token string) (Subject, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.called++
+	f.lastToken = token
+	f.lastAPIKey = string(c.GetHeader("X-API-Key"))
+	return f.sub, f.err
+}
+
+func (f *fakeTokenVerifier) calls() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.called
+}
+
+// subjectProbe 捕获 handler 内两条 Subject 读取出口（ctx / RequestContext）。
+type subjectProbe struct {
+	mu    sync.Mutex
+	sub   Subject
+	ok    bool
+	subRC Subject
+	okRC  bool
+}
+
+func (p *subjectProbe) store(sub Subject, ok bool, subRC Subject, okRC bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.sub, p.ok = sub, ok
+	p.subRC, p.okRC = subRC, okRC
+}
+
+func (p *subjectProbe) load() (Subject, bool, Subject, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.sub, p.ok, p.subRC, p.okRC
+}
+
+// newBearerAuthEngine 构建挂了 BearerTokenAuth 的引擎，/whoami 处捕获
+// SubjectFrom / SubjectFromRequestContext 读到的认证主体。
+func newBearerAuthEngine(t *testing.T, opts ...BearerTokenOption) (*route.Engine, *subjectProbe) {
+	t.Helper()
+	probe := &subjectProbe{}
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(BearerTokenAuth(opts...))
+	h.GET("/whoami", func(ctx context.Context, c *app.RequestContext) {
+		sub, ok := SubjectFrom(ctx)
+		subRC, okRC := SubjectFromRequestContext(c)
+		probe.store(sub, ok, subRC, okRC)
+		c.JSON(http.StatusOK, map[string]string{"uid": sub.UserID})
+	})
+	return h, probe
+}
+
+// TestBearerTokenAuth_VerifierAndStaticMutuallyExclusive 凭证校验单源：
+// 静态 token 与 verifier 同时配置必须在构造期 panic，避免两套口径分叉。
+func TestBearerTokenAuth_VerifierAndStaticMutuallyExclusive(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("BearerTokenAuth(WithBearerToken, WithTokenVerifier) should panic at construction")
+		}
+	}()
+	_ = BearerTokenAuth(
+		WithBearerToken("secret"),
+		WithTokenVerifier(&fakeTokenVerifier{}),
+	)
+}
+
+// TestBearerTokenAuth_VerifierRequired 只有 nil verifier（无静态 token）
+// 等同「未配置凭证源」，沿用 #97 构造期 panic。
+func TestBearerTokenAuth_VerifierRequired(t *testing.T) {
+	defer func() {
+		if r := recover(); r == nil {
+			t.Error("BearerTokenAuth(WithTokenVerifier(nil)) without static token should panic")
+		}
+	}()
+	_ = BearerTokenAuth(WithTokenVerifier(nil))
+}
+
+// TestBearerTokenAuth_StaticTokenAlias WithStaticToken 与 WithBearerToken
+// 等价：静态 token 默认行为保持兼容。
+func TestBearerTokenAuth_StaticTokenAlias(t *testing.T) {
+	h := BearerTokenAuth(WithStaticToken("secret"))
+
+	c := app.NewContext(128)
+	c.Request.SetRequestURI("/test")
+	c.Request.Header.Set("Authorization", "Bearer secret")
+	h(context.Background(), c)
+	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
+
+	c2 := app.NewContext(128)
+	c2.Request.SetRequestURI("/test")
+	c2.Request.Header.Set("Authorization", "Bearer wrong")
+	h(context.Background(), c2)
+	assert.DeepEqual(t, consts.StatusUnauthorized, c2.Response.StatusCode())
+}
+
+// TestBearerTokenAuth_Verifier_AllowInjectsSubject 自定义 verifier 命中：
+// Verify 收到切出的 token 与请求上下文；返回的 Subject 作为唯一主体传给
+// Authorizer，并注入 ctx / RequestContext 供下游读取。
+func TestBearerTokenAuth_Verifier_AllowInjectsSubject(t *testing.T) {
+	v := &fakeTokenVerifier{sub: Subject{
+		UserID: "alice",
+		Roles:  []string{"admin", "user"},
+		Claims: map[string]any{"scope": "read", "tenant": "t-1"},
+	}}
+	auth := &fakeAuthorizer{allowed: true}
+	h, probe := newBearerAuthEngine(t,
+		WithTokenVerifier(v),
+		WithAuthAuthorizer(auth),
+	)
+
+	r := ut.PerformRequest(h, http.MethodGet, "/whoami", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer dynamic-token"},
+		ut.Header{Key: "X-API-Key", Value: "raw-api-key"},
+	).Result()
+
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", r.StatusCode(), r.Body())
+	}
+	if got := v.calls(); got != 1 {
+		t.Fatalf("verifier called = %d, want 1", got)
+	}
+	if v.lastToken != "dynamic-token" {
+		t.Errorf("verifier token = %q, want dynamic-token", v.lastToken)
+	}
+	if v.lastAPIKey != "raw-api-key" {
+		t.Errorf("verifier should see request context (X-API-Key) = %q", v.lastAPIKey)
+	}
+
+	if auth.called != 1 {
+		t.Fatalf("Authorizer called = %d, want 1", auth.called)
+	}
+	if auth.lastSub.UserID != "alice" || len(auth.lastSub.Roles) != 2 {
+		t.Errorf("Authorizer Subject = %+v, want UserID=alice Roles=[admin user]", auth.lastSub)
+	}
+	if auth.lastSub.Claims["scope"] != "read" {
+		t.Errorf("Authorizer Subject.Claims[scope] = %v, want read", auth.lastSub.Claims["scope"])
+	}
+	if auth.lastMethod != "GET" || auth.lastPath != "/whoami" {
+		t.Errorf("Authorizer saw method/path %q/%q, want GET//whoami", auth.lastMethod, auth.lastPath)
+	}
+
+	sub, ok, subRC, okRC := probe.load()
+	if !ok || !okRC {
+		t.Fatalf("SubjectFrom(ctx)=%v SubjectFromRequestContext(c)=%v, want both ok", ok, okRC)
+	}
+	for name, got := range map[string]Subject{"ctx": sub, "request-context": subRC} {
+		if got.UserID != "alice" {
+			t.Errorf("%s Subject.UserID = %q, want alice", name, got.UserID)
+		}
+		if got.Method != "GET" || got.Path != "/whoami" {
+			t.Errorf("%s Subject method/path = %q/%q, want GET//whoami (request wins)", name, got.Method, got.Path)
+		}
+		if got.Claims["tenant"] != "t-1" {
+			t.Errorf("%s Subject.Claims[tenant] = %v, want t-1", name, got.Claims["tenant"])
+		}
+	}
+}
+
+// TestBearerTokenAuth_Verifier_ErrorMapping verifier 错误分类：
+// ErrInvalidToken → 401（含 %w 包装）、ErrForbidden → 403、其他 error → 500；
+// 任一失败都不得调 Authorizer。
+func TestBearerTokenAuth_Verifier_ErrorMapping(t *testing.T) {
+	tests := []struct {
+		name string
+		err  error
+		want int
+	}{
+		{"invalid token", ErrInvalidToken, consts.StatusUnauthorized},
+		{"wrapped invalid token", fmt.Errorf("api key lookup: %w", ErrInvalidToken), consts.StatusUnauthorized},
+		{"forbidden", ErrForbidden, consts.StatusForbidden},
+		{"backend failure", errors.New("idp unavailable"), consts.StatusInternalServerError},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := &fakeTokenVerifier{err: tt.err}
+			auth := &fakeAuthorizer{allowed: true}
+			c := buildCtx("dynamic-token")
+			runBearerAuth(t, c,
+				WithTokenVerifier(v),
+				WithAuthAuthorizer(auth),
+			)
+			assert.DeepEqual(t, tt.want, c.Response.StatusCode())
+			if auth.called != 0 {
+				t.Errorf("Authorizer should NOT be called when verifier fails, got called=%d", auth.called)
+			}
+		})
+	}
+}
+
+// TestBearerTokenAuth_Verifier_NotCalledOnSkipPath 免认证路径不触发校验后端
+// （SkipPaths 与 verifier 的边界：豁免发生在凭证校验之前）。
+func TestBearerTokenAuth_Verifier_NotCalledOnSkipPath(t *testing.T) {
+	v := &fakeTokenVerifier{}
+	c := app.NewContext(128)
+	c.Request.SetRequestURI("/health")
+	runBearerAuth(t, c,
+		WithTokenVerifier(v),
+		WithAuthSkipPaths("/health"),
+	)
+	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
+	if got := v.calls(); got != 0 {
+		t.Errorf("verifier called = %d on skip path, want 0", got)
+	}
+}
+
+// TestBearerTokenAuth_Verifier_NotCalledOnMalformedHeader 头格式非法
+// （非 Bearer scheme / 空 token）直接 401，不把空凭证交给校验后端。
+func TestBearerTokenAuth_Verifier_NotCalledOnMalformedHeader(t *testing.T) {
+	tests := []struct {
+		name   string
+		header string
+	}{
+		{"missing header", ""},
+		{"non-bearer scheme", "Basic dXNlcjpwYXNz"},
+		{"empty token", "Bearer    "},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			v := &fakeTokenVerifier{sub: Subject{UserID: "should-not-happen"}}
+			c := app.NewContext(128)
+			c.Request.SetRequestURI("/test")
+			if tt.header != "" {
+				c.Request.Header.Set("Authorization", tt.header)
+			}
+			runBearerAuth(t, c, WithVerifier(v))
+			assert.DeepEqual(t, consts.StatusUnauthorized, c.Response.StatusCode())
+			if got := v.calls(); got != 0 {
+				t.Errorf("verifier called = %d on malformed header, want 0", got)
+			}
+		})
+	}
+}
+
+// TestBearerTokenAuth_Verifier_IgnoresSubjectExtractor verifier 模式主体
+// 唯一来源是 Verify 返回值：SubjectExtractor 不得运行（防止已校验身份被
+// 客户端可控请求头二次改写）。
+func TestBearerTokenAuth_Verifier_IgnoresSubjectExtractor(t *testing.T) {
+	v := &fakeTokenVerifier{sub: Subject{UserID: "alice"}}
+	auth := &fakeAuthorizer{allowed: true}
+	called := 0
+	c := buildCtx("dynamic-token")
+	runBearerAuth(t, c,
+		WithTokenVerifier(v),
+		WithAuthAuthorizer(auth),
+		WithAuthSubjectExtractor(func(c *app.RequestContext) Subject {
+			called++
+			return Subject{UserID: "mallory"}
+		}),
+	)
+	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
+	if called != 0 {
+		t.Errorf("SubjectExtractor called = %d in verifier mode, want 0", called)
+	}
+	if auth.lastSub.UserID != "alice" {
+		t.Errorf("Authorizer Subject.UserID = %q, want alice", auth.lastSub.UserID)
+	}
+}
+
+// TestBearerTokenAuth_StaticInjectsSubject 静态 token 兼容路径也注入主体：
+// 自定义 SubjectExtractor 的结果对下游可见，Method/Path 以请求为准。
+func TestBearerTokenAuth_StaticInjectsSubject(t *testing.T) {
+	h, probe := newBearerAuthEngine(t,
+		WithStaticToken("secret"),
+		WithAuthSubjectExtractor(func(c *app.RequestContext) Subject {
+			return Subject{
+				UserID: "static-user",
+				Roles:  []string{"svc"},
+				Claims: map[string]any{"source": "static"},
+			}
+		}),
+	)
+
+	r := ut.PerformRequest(h, http.MethodGet, "/whoami", nil,
+		ut.Header{Key: "Authorization", Value: "Bearer secret"},
+	).Result()
+	if r.StatusCode() != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (body=%s)", r.StatusCode(), r.Body())
+	}
+
+	sub, ok, subRC, okRC := probe.load()
+	if !ok || !okRC {
+		t.Fatalf("SubjectFrom(ctx)=%v SubjectFromRequestContext(c)=%v, want both ok", ok, okRC)
+	}
+	if sub.UserID != "static-user" || subRC.UserID != "static-user" {
+		t.Errorf("UserID ctx/rc = %q/%q, want static-user", sub.UserID, subRC.UserID)
+	}
+	if sub.Method != "GET" || sub.Path != "/whoami" {
+		t.Errorf("Subject method/path = %q/%q, want GET//whoami", sub.Method, sub.Path)
+	}
+	if sub.Claims["source"] != "static" {
+		t.Errorf("Subject.Claims[source] = %v, want static", sub.Claims["source"])
+	}
+}
+
+// TestBearerTokenAuth_VerifierFunc TokenVerifierFunc 闭包适配器可直接用。
+func TestBearerTokenAuth_VerifierFunc(t *testing.T) {
+	c := buildCtx("dynamic-token")
+	runBearerAuth(t, c, WithVerifier(TokenVerifierFunc(
+		func(_ context.Context, _ *app.RequestContext, token string) (Subject, error) {
+			if token != "dynamic-token" {
+				return Subject{}, ErrInvalidToken
+			}
+			return Subject{UserID: "bob"}, nil
+		},
+	)))
+	assert.DeepEqual(t, consts.StatusOK, c.Response.StatusCode())
+}
+
+// TestSubjectFrom_UnregisteredContext 未经过 BearerTokenAuth 的 context /
+// RequestContext 返回 ok=false（区分「未认证」与「认证后空主体」）。
+func TestSubjectFrom_UnregisteredContext(t *testing.T) {
+	if _, ok := SubjectFrom(context.Background()); ok {
+		t.Error("SubjectFrom on plain context should return ok=false")
+	}
+	if _, ok := SubjectFromRequestContext(app.NewContext(8)); ok {
+		t.Error("SubjectFromRequestContext on untouched context should return ok=false")
 	}
 }
