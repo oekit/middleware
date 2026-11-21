@@ -1,5 +1,18 @@
 
 
+## [v0.23.0] — 2026-11-21
+
+- 第三轮设计/缺陷审计（2026-11-21）middleware 修复：
+
+- fix: TrustedHeadersIdentity 对身份头多值（PeekAll>1）fail-closed 401，与 SmartAuth 共用 hasMultiValueHeader 原语——网关 append 注入下客户端自带头不再成为首值冒充（#299）
+- fix: Response SkipPaths 补 pathx.MatchesPath glob，三中间件同 matcher（StackConfig.SkipPaths 文档化）——/internal/** 不再只对 AccessLog 生效（#299）
+- feat: SmartAuth 立证成功写 attested 标记，SmartRBAC 默认只认标记（裸 X-Auth-Authorized 失效）；WithTrustAuthorizedHeader 显式兼容旧行为+构造告警（#300）
+- fix: auditlog OnDrop/dropDetail 独立 recover——OnDrop panic 不再杀死后台 flush 循环（#300）
+- feat: contrib.Cache 改每次调用独立实例（旧全局单例改名 GlobalCache 并 Deprecated，二次带 option panic）——多路由组 store/prefix/TTL 可隔离（#300）
+- feat: BearerTokenAuth 可插拔 TokenVerifier（WithTokenVerifier/WithVerifier + TokenVerifierFunc）——动态凭证接入不再手搓；Subject 注入 ctx/RequestContext（SubjectFrom），ErrInvalidToken→401/ErrForbidden→403/其他→500；静态 token 行为保留（#293）
+
+关联问题单：middleware#299、middleware#300、middleware#293。
+
 ## [v0.22.0] — 2026-11-20
 
 - ⚠ 行为变更：Fail 的 ErrNoInstances tier（依赖无可用实例）body code 由 503 收敛为 BizError 50300（HTTP 仍 503、message "service unavailable" 不变）——与 kitex 桥 no-instance / shedding 过载同一码段，码段监控不再拆双 series（#291）
