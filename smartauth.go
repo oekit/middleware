@@ -112,8 +112,8 @@ func validateTrustHeaderNames(n TrustHeaderNames) error {
 // 可信的——客户端直连时可自带同名头冒充任意身份。立证路径二选一或并存
 // （「仅信任内网来源/网关签名头」）：
 //
-//   - 来源立证：对端地址是回环或落在 TrustedSources 网段（网关/边车同机、
-//     内网直连拓扑）；
+//   - 来源立证：对端地址是回环（可由 TrustLoopback 显式关闭）或落在
+//     TrustedSources 网段（网关/边车同机、内网直连拓扑）；
 //   - 签名立证：Signature 头 = HMAC-SHA256(Secret, GatewayCanonical) 且
 //     Timestamp 在 ReplayWindow 内（防重放）。
 //
@@ -127,9 +127,21 @@ type GatewayTrust struct {
 	ReplayWindow time.Duration
 	// HeaderNames 信任头名集合，零值取 DefaultTrustHeaderNames。
 	HeaderNames TrustHeaderNames
-	// TrustedSources 来源立证的内网网段（netip.Prefix）。回环地址恒可信
-	// （网关/边车同机形态），无须列入。IPv4/IPv6 前缀均可。
+	// TrustedSources 来源立证的内网网段（netip.Prefix）。回环地址缺省可信
+	// （网关/边车同机形态），无须列入；TrustLoopback 显式 false 后回环不再
+	// 自动豁免，若要继续信任回环网段须在此显式声明。IPv4/IPv6 前缀均可。
 	TrustedSources []netip.Prefix
+	// TrustLoopback 控制回环来源是否自动免签名可信（#261）：
+	//   - nil（缺省）或 true：沿用存量语义——回环地址恒可信；
+	//   - 显式 false：关闭回环豁免，回环来源同样必须满足签名立证
+	//     （或显式 TrustedSources 命中）。生产跨容器/同机多租形态下
+	//     「签名是唯一立证」应显式置 false——否则同一 Pod/宿主内的任意进程
+	//     （容器 exec、sidecar、同机调试进程）连回环带身份头即可冒充任意
+	//     用户，回环豁免覆盖掉签名结论。
+	//
+	// 关闭后签名结论不再被来源立证覆盖：无合法签名的回环请求按伪造处理
+	// （VerifyGatewayTrust 返回 false 并剥头）。
+	TrustLoopback *bool
 }
 
 // headerNames 返回填充缺省后的头名集合。
@@ -141,6 +153,12 @@ func (t GatewayTrust) replayWindow() time.Duration {
 		return t.ReplayWindow
 	}
 	return DefaultReplayWindow
+}
+
+// trustLoopback 返回回环来源是否自动可信（nil = 兼容存量语义：恒可信；
+// 显式 false 关闭豁免，#261）。
+func (t GatewayTrust) trustLoopback() bool {
+	return t.TrustLoopback == nil || *t.TrustLoopback
 }
 
 // GatewayCanonical 返回网关签名规范串——信任模型最易漂移的细节，**网关注入
@@ -204,8 +222,8 @@ func GatewaySign(t GatewayTrust, c *app.RequestContext) (string, error) {
 //  1. 任一信任头出现**多值**（同名头注入）⇒ 伪造信号，直接拒；
 //  2. UID 与 Signature 均缺席 ⇒ 未呈现网关立证（false，调用方决定降级路径）；
 //  3. UID 缺席（仅签名头）⇒ 立证不成立（身份是规范串的强绑定行）；
-//  4. 来源立证（回环 / TrustedSources）与签名立证（HMAC-SHA256 + 时间窗）
-//     至少一个成立，否则按伪造处理；
+//  4. 来源立证（回环——TrustLoopback 显式 false 时关闭该豁免 / TrustedSources）
+//     与签名立证（HMAC-SHA256 + 时间窗）至少一个成立，否则按伪造处理；
 //  5. 成功：剥掉已消费的 Signature/Timestamp 头（防下游再解释出第二种
 //     口径），身份头保留，组装 Subject（Roles 按 "," 切分去空项，字符串
 //     精确匹配、无数字强转——与 TrustedClaims 同口径）。
@@ -225,9 +243,10 @@ func VerifyGatewayTrust(t GatewayTrust, c *app.RequestContext) (Subject, bool) {
 
 // verify 是立证的主体判定（不剥头，由 VerifyGatewayTrust 统一收口）。
 func (t GatewayTrust) verify(c *app.RequestContext, n TrustHeaderNames) (Subject, bool) {
-	// 多值信任头 = 请求走私式头注入的伪造信号，fail-closed。
+	// 多值信任头 = 请求走私式头注入的伪造信号，fail-closed（与
+	// TrustedHeadersIdentity 共用 hasMultiValueHeader，#299 单源）。
 	for _, name := range n.all() {
-		if len(c.Request.Header.PeekAll(name)) > 1 {
+		if hasMultiValueHeader(c, name) {
 			return Subject{}, false
 		}
 	}
@@ -262,15 +281,32 @@ func (t GatewayTrust) verify(c *app.RequestContext, n TrustHeaderNames) (Subject
 	return sub, true
 }
 
-// gatewayTrustPresented 判定请求是否**呈现了**网关立证。折叠条件与
-// GatewayTrust.verify 的「未呈现」分支同源（#184）：UID 与 Signature 均
-// 缺席且无任何信任头多值走私 ⇒ 未呈现；任一信任头多值（走私注入）或
-// UID/Signature 任一存在 ⇒ 已呈现——「呈现了但验不过」在 AuthModeAuto
-// 下不再与「未呈现」混同降级，而是 401 + Warn（可疑流量显式拒绝）。
+// GatewayTrustPresented 判定请求是否**呈现了**网关立证（#184 折叠条件单源，
+// #284 导出）：SmartAuth 内部与 thin wrapper 消费方共用同一实现——呈现与否
+// 是「401 可疑流量」vs「放行落兜底」的安全分叉点，消费方不得复刻折叠条件
+// （复刻会在上游调整折叠语义时静默漂移：伪造请求落进「未呈现放行」分支，
+// 不再走 verify 直接带伪造头进身份链）。
+//
+// 折叠条件与 GatewayTrust.verify 的「未呈现」分支同源（#184）：UID 与
+// Signature 均缺席且无任何信任头多值走私 ⇒ 未呈现（false）；任一信任头
+// 多值（走私注入）或 UID/Signature 任一存在 ⇒ 已呈现（true）——「呈现了
+// 但验不过」在 AuthModeAuto 下不再与「未呈现」混同降级，而是 401 + Warn
+// （可疑流量显式拒绝）。
+//
+// 头名取 t.HeaderNames（零值字段回退缺省 X-Auth-* 名，与 VerifyGatewayTrust
+// 同一解析）。
+//
+// 典型消费场景（thin wrapper 组合形态，octopus gatewaytrust.go）：免认证
+// 语义要求「未呈现照旧放行」，只有呈现了才 verify——
+//
+//	if mw.GatewayTrustPresented(trust, c) {
+//	    if _, ok := mw.VerifyGatewayTrust(trust, c); !ok { /* 401，库侧已剥头 */ }
+//	}
 //
 // ⚠️ 必须在剥头前调用：VerifyGatewayTrust 失败路径会把全部信任头剥掉，
 // 剥头后呈现状态无从判定。
-func gatewayTrustPresented(c *app.RequestContext, n TrustHeaderNames) bool {
+func GatewayTrustPresented(t GatewayTrust, c *app.RequestContext) bool {
+	n := t.headerNames()
 	for _, name := range n.all() {
 		if len(c.Request.Header.PeekAll(name)) > 1 {
 			return true // 多值走私：头是呈现了的，只是不成立
@@ -280,9 +316,10 @@ func gatewayTrustPresented(c *app.RequestContext, n TrustHeaderNames) bool {
 		len(c.GetHeader(n.Signature)) != 0
 }
 
-// sourceTrusted 判定来源立证：对端地址是回环（网关/边车同机形态）或落在
-// TrustedSources 网段。取连接对端地址（c.RemoteAddr）——不读任何转发头，
-// X-Forwarded-For 是客户端可控的（#83 同口径）。
+// sourceTrusted 判定来源立证：对端地址是回环（网关/边车同机形态，可由
+// TrustLoopback 显式关闭）或落在 TrustedSources 网段。取连接对端地址
+// （c.RemoteAddr）——不读任何转发头，X-Forwarded-For 是客户端可控的
+// （#83 同口径）。
 func (t GatewayTrust) sourceTrusted(c *app.RequestContext) bool {
 	host, _, err := net.SplitHostPort(c.RemoteAddr().String())
 	if err != nil {
@@ -293,7 +330,7 @@ func (t GatewayTrust) sourceTrusted(c *app.RequestContext) bool {
 		return false
 	}
 	ip = ip.Unmap()
-	if ip.IsLoopback() {
+	if ip.IsLoopback() && t.trustLoopback() {
 		return true
 	}
 	for _, p := range t.TrustedSources {
@@ -458,9 +495,11 @@ func WithSmartAuthAdminMatcher(fn func(role string) bool) SmartAuthOption {
 // 构造期校验（fail-fast，#97 同哲学）：
 //
 //	parse 与 trust 均为 nil ⇒ panic（没有任何认证面的「认证中间件」是纯
-//	fail-open）；AuthModeGatewayOnly 配 nil trust / AuthModeLocalOnly 配
-//	nil parse ⇒ panic；trust 非 nil 但 Secret 与 TrustedSources 均空 ⇒
-//	panic（无立证路径）；信任头名两两冲突 ⇒ panic（errors.Join 一次列全）。
+//	fail-open）；AuthModeAuto 配 nil parse（组合模式缺本地兜底入口——
+//	未立证请求无从校验，#250）/ AuthModeGatewayOnly 配 nil trust /
+//	AuthModeLocalOnly 配 nil parse ⇒ panic；trust 非 nil 但 Secret 与
+//	TrustedSources 均空 ⇒ panic（无立证路径）；信任头名两两冲突 ⇒ panic
+//	（errors.Join 一次列全）。
 //
 // 请求流程：
 //
@@ -494,7 +533,12 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 	}
 	switch cfg.Mode {
 	case AuthModeAuto:
-		// 两个入口至少有一个（上面已校验）。
+		// 组合模式承诺「网关立证 + 本地 JWT 兜底」两个入口（#250）：
+		// parse 为 nil 时未立证请求落不到本地校验面，请求期对 nil parse
+		// 调用直接 panic——构造期拦下（仅网关立证的部署显式用 GatewayOnly）。
+		if parse == nil {
+			panic("mw.SmartAuth: AuthModeAuto requires JWTParseFunc (gateway-only deployments should use AuthModeGatewayOnly)")
+		}
 	case AuthModeGatewayOnly:
 		if trust == nil {
 			panic("mw.SmartAuth: AuthModeGatewayOnly requires GatewayTrust")
@@ -548,8 +592,10 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 		attested := false
 		if trust != nil && cfg.Mode != AuthModeLocalOnly {
 			// presented 判定必须在 VerifyGatewayTrust 之前：其失败路径会把
-			// 全部信任头剥掉，剥头后「呈现过什么」无从判定（#184）。
-			presented := gatewayTrustPresented(c, names)
+			// 全部信任头剥掉，剥头后「呈现过什么」无从判定（#184）。走导出
+			// 版 GatewayTrustPresented——折叠条件单源（#284），thin wrapper
+			// 消费方与本中间件共用同一判定。
+			presented := GatewayTrustPresented(*trust, c)
 			s, ok := VerifyGatewayTrust(*trust, c) // false 路径已剥头
 			if ok {
 				sub, attested = s, true
@@ -600,9 +646,26 @@ func SmartAuth(parse JWTParseFunc, trust *GatewayTrust, opts ...SmartAuthOption)
 			}
 		}
 
+		// 立证成功标记（#300）：SmartRBAC 默认只认本标记（ctx 内部值，客户端
+		// 无法经请求头伪造）。attested 仅代表网关立证成立——本地 JWT 兜底
+		// 身份不写标记，SmartRBAC 仍须执行本地 RBAC。
+		if attested {
+			ctx = context.WithValue(ctx, smartAuthAttestedCtxKey{}, true)
+		}
 		ctx = injectSmartClaims(ctx, c, sub, admin)
 		c.Next(ctx)
 	}
+}
+
+// smartAuthAttestedCtxKey 是 SmartAuth 网关立证成功标记在 ctx 中的键（#300）。
+// 未导出结构体类型杜绝键碰撞；只有 SmartAuth 在 VerifyGatewayTrust 成功后
+// 写入，SmartRBAC 默认据此判定「网关已集中鉴权」。
+type smartAuthAttestedCtxKey struct{}
+
+// smartAuthAttested 判定 ctx 是否携带 SmartAuth 的网关立证成功标记（#300）。
+func smartAuthAttested(ctx context.Context) bool {
+	attested, _ := ctx.Value(smartAuthAttestedCtxKey{}).(bool)
+	return attested
 }
 
 // injectSmartClaims 把已立证/已校验的 Subject 注入 TrustedClaims 读取面
@@ -627,34 +690,51 @@ func injectSmartClaims(ctx context.Context, c *app.RequestContext, sub Subject, 
 // SmartRBACOptions 是 SmartRBAC 的配置。
 type SmartRBACOptions struct {
 	// AuthorizedHeader 网关「已集中鉴权」标记头。默认 "X-Auth-Authorized"
-	// （TrustHeaderNames.Authorized 缺省同名）。
+	// （TrustHeaderNames.Authorized 缺省同名）。仅在
+	// TrustAuthorizedHeader=true（旧行为兼容档）时参与判定（#300）。
 	AuthorizedHeader string
+	// TrustAuthorizedHeader 为 true 时恢复旧行为：信任裸 Authorized 头
+	// == GatewayAuthorizedValue（不要求 SmartAuth 立证标记）。默认 false
+	// ——只认 SmartAuth 立证后写入 ctx 的标记，客户端直带该头无法跳过
+	// 本地 RBAC。
+	TrustAuthorizedHeader bool
 }
 
 // SmartRBACOption 配置 SmartRBAC。
 type SmartRBACOption func(*SmartRBACOptions)
 
 // WithSmartRBACAuthorizedHeader 覆盖「已集中鉴权」标记头名（网关注入名
-// 非缺省时用）。
+// 非缺省时用）。仅与 WithTrustAuthorizedHeader 配合生效（#300）。
 func WithSmartRBACAuthorizedHeader(name string) SmartRBACOption {
 	return func(o *SmartRBACOptions) { o.AuthorizedHeader = name }
 }
 
-// SmartRBAC 返回「网关已鉴权放行，否则本地 RBAC 兜底」的鉴权中间件（#169，
-// zeus SmartRBAC 同款装配面）：
+// WithTrustAuthorizedHeader 显式恢复旧行为：信任裸 Authorized 头
+// == GatewayAuthorizedValue 即跳过本地 RBAC（#300）。
 //
-//	Authorized 头 == GatewayAuthorizedValue（"1"）⇒ 网关已做过集中鉴权，
-//	直接 c.Next 跳过本地 RBAC；否则调 local 走本地 RBAC（casbin 等）兜底。
+// ⚠️ 安全边界：该头客户端可直带——只有「网关保证覆盖写/剥离客户端同名头」
+// 或 SmartRBAC 严格置于 SmartAuth 之后（立证失败的请求已被剥头）时才可用。
+// 构造期打 WARN 留痕；新装配应使用默认的 SmartAuth 立证标记，不启用本选项。
+func WithTrustAuthorizedHeader() SmartRBACOption {
+	return func(o *SmartRBACOptions) { o.TrustAuthorizedHeader = true }
+}
+
+// SmartRBAC 返回「网关已鉴权放行，否则本地 RBAC 兜底」的鉴权中间件（#169，
+// zeus SmartRBAC 同款装配面；#300 收紧判定）：
+//
+// 默认只认 SmartAuth 的**立证标记**：SmartAuth 在 VerifyGatewayTrust 成功后
+// 把标记写入 ctx（内部值，客户端无法经请求头伪造），SmartRBAC 见到标记即
+// c.Next 跳过本地 RBAC；否则调 local 走本地 RBAC（casbin 等）兜底。
+//
+// 旧行为（裸 Authorized 头 == GatewayAuthorizedValue）需显式
+// WithTrustAuthorizedHeader() 开启——该头客户端可直带，单独挂 SmartRBAC
+// 或挂在 SmartAuth 之前时直带即 fail-open；构造期会打 WARN。
 //
 // # 部署前提（信任边界）
 //
-// Authorized 头必须不可被客户端伪造——直连部署时客户端带
-// X-Auth-Authorized: 1 就能跳过本地 RBAC。两种安全装配：
-//
-//  1. 置于 SmartAuth 之后：立证失败的请求已被剥头（VerifyGatewayTrust /
-//     本地路径同效），Authorized 只可能来自已立证的网关注入；
-//  2. trusted-gateway 形态：网关保证剥掉客户端同名头（同
-//     TrustedHeadersIdentity 的部署契约）。
+// 默认形态要求 SmartRBAC 置于 SmartAuth 之后（立证失败/本地兜底的请求没有
+// 标记，必须走本地 RBAC）。旧行为档另需网关保证剥掉客户端同名头（同
+// TrustedHeadersIdentity 的部署契约）。
 //
 // local 担任本地 RBAC 环节：放行须自行 c.Next(ctx)，拒绝写响应并 Abort
 // （ErrorResp 自动 Abort）。local 为 nil 构造期 panic——nil 会在网关未
@@ -682,10 +762,21 @@ func SmartRBAC(local app.HandlerFunc, opts ...SmartRBACOption) app.HandlerFunc {
 	if cfg.AuthorizedHeader == "" {
 		cfg.AuthorizedHeader = DefaultTrustHeaderNames().Authorized
 	}
+	if cfg.TrustAuthorizedHeader {
+		// 构造期告警：裸头可被客户端直带，跳过本地 RBAC 的判据不再与
+		// SmartAuth 立证结构绑定（#300）。
+		smartAuthLog.Warn("SmartRBAC: WithTrustAuthorizedHeader enabled — trusting bare Authorized header without SmartAuth attestation; ensure the gateway strips client-supplied headers",
+			"authorized_header", cfg.AuthorizedHeader)
+	}
 
 	return func(ctx context.Context, c *app.RequestContext) {
-		if string(c.GetHeader(cfg.AuthorizedHeader)) == GatewayAuthorizedValue {
-			c.Next(ctx) // 网关已集中鉴权：跳过本地 RBAC
+		if smartAuthAttested(ctx) {
+			c.Next(ctx) // SmartAuth 立证成功：网关已集中鉴权，跳过本地 RBAC
+			return
+		}
+		if cfg.TrustAuthorizedHeader &&
+			string(c.GetHeader(cfg.AuthorizedHeader)) == GatewayAuthorizedValue {
+			c.Next(ctx) // 旧行为兼容档：显式信任裸 Authorized 头
 			return
 		}
 		local(ctx, c) // 本地 RBAC 兜底

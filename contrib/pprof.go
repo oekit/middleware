@@ -234,7 +234,9 @@ func RegisterDebug(h *server.Hertz, opts ...DebugOption) {
 //	admin := h.Group("/admin")
 //	RegisterDebugGroup(admin, "/debug", "secret-token")
 //
-// token 可省略,省略时不启用鉴权(等同于 RegisterPprofWithGroup)。
+// token 可省略,省略时不启用鉴权(等同于把 RegisterPprof 的路由经
+// hertz-contrib/pprof 的 RouteRegister 挂到该 group 上——本包没有
+// RegisterPprofWithGroup 这个符号,勿按名索骥,#255)。
 func RegisterDebugGroup(g *route.RouterGroup, prefix string, token ...string) {
 	cfg := &debugConfig{Prefix: prefix}
 	if len(token) > 0 && token[0] != "" {

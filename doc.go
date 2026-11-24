@@ -19,8 +19,11 @@
 //     WithAccessLogSilent 只采不写 / WithAccessLogLogger 注入宿主 logger 避免双写）
 //   - AuditLogMiddleware — 审计日志（who/what/when/outcome/trace_id 结构化
 //     事件，#141；AuditedPaths 显式声明制——清单为空构造期 panic，漏记比
-//     多记危险；Sink 消费或缺省 logx 结构化日志；NewBufferedAuditSink 缓冲
-//     攒批落库原语：chan 缓冲 + 后台 flush + 背压丢弃 + Close(ctx) 落盘）
+//     多记危险；WithAuditLogMethods 可选 method 维度过滤（与路径取交集，
+//     "/**" + 写方法即全写操作审计，#267）；Sink 消费或缺省 logx 结构化
+//     日志；NewBufferedAuditSink 缓冲攒批落库原语：chan 缓冲 + 后台 flush +
+//     背压丢弃 + WithSinkFlushTimeout 有界交付（超时归因 sink_timeout）+
+//     Close(ctx) 落盘）
 //   - PrometheusMetrics  — Prometheus HTTP 指标采集（请求数 / 延迟 / 并发 / 体积；显式拼装）
 //   - RecoveryMiddleware — panic recovery（可选 SentryReporter 监控钩子）
 //   - RateLimitMiddleware — 令牌桶限流（默认按 RemoteAddr 分键）

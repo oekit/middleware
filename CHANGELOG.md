@@ -1,5 +1,73 @@
 
 
+## [v0.23.1] — 2026-11-23
+
+- build: 依赖地板对齐（矩阵地板波次）——新地板：github.com/oekit/pkg v0.60.0 。零行为变化；已发布产物的 go.mod 地板此前滞后于矩阵登记版本，本版把新地板焊进已发布产物。
+
+## [v0.23.0] — 2026-11-21
+
+- 第三轮设计/缺陷审计（2026-11-21）middleware 修复：
+
+- fix: TrustedHeadersIdentity 对身份头多值（PeekAll>1）fail-closed 401，与 SmartAuth 共用 hasMultiValueHeader 原语——网关 append 注入下客户端自带头不再成为首值冒充（#299）
+- fix: Response SkipPaths 补 pathx.MatchesPath glob，三中间件同 matcher（StackConfig.SkipPaths 文档化）——/internal/** 不再只对 AccessLog 生效（#299）
+- feat: SmartAuth 立证成功写 attested 标记，SmartRBAC 默认只认标记（裸 X-Auth-Authorized 失效）；WithTrustAuthorizedHeader 显式兼容旧行为+构造告警（#300）
+- fix: auditlog OnDrop/dropDetail 独立 recover——OnDrop panic 不再杀死后台 flush 循环（#300）
+- feat: contrib.Cache 改每次调用独立实例（旧全局单例改名 GlobalCache 并 Deprecated，二次带 option panic）——多路由组 store/prefix/TTL 可隔离（#300）
+- feat: BearerTokenAuth 可插拔 TokenVerifier（WithTokenVerifier/WithVerifier + TokenVerifierFunc）——动态凭证接入不再手搓；Subject 注入 ctx/RequestContext（SubjectFrom），ErrInvalidToken→401/ErrForbidden→403/其他→500；静态 token 行为保留（#293）
+
+关联问题单：middleware#299、middleware#300、middleware#293。
+
+## [v0.22.0] — 2026-11-20
+
+- ⚠ 行为变更：Fail 的 ErrNoInstances tier（依赖无可用实例）body code 由 503 收敛为 BizError 50300（HTTP 仍 503、message "service unavailable" 不变）——与 kitex 桥 no-instance / shedding 过载同一码段，码段监控不再拆双 series（#291）
+docs(shedding): 过时注释同步——收敛后 50300 与 Fail 不再区分「过载 vs 依赖不可用」，两轨同码段由 message 区分（#291）
+
+关联问题单：middleware#291。
+
+## [v0.21.0] — 2026-11-18
+
+- 导出 GatewayTrustPresented——网关信任头呈现判定单源,thin wrapper 消费方不再复刻 #184 折叠条件;SmartAuth 内部同走导出版(#284)
+
+关联问题单：middleware#284。
+
+## [v0.20.1] — 2026-11-18
+
+- hmw trace_id 生成收敛 traceid.NewID 单一真相源,生成格式由 8hex-3hex 变 12 位纯 hex(白名单兼容;按第 9 字符写断言的下游需跟进)(#273);prometheus registerReuse 删私有实现改调 metrics.RegisterReuse 单源(#274)
+
+关联问题单：middleware#273、middleware#274。
+
+## [v0.20.0] — 2026-11-16
+
+- - auditlog 新增 method 维度过滤 `WithAuditLogMethods`：与 AuditedPaths 取交集（path 命中且 method 命中才产出事件），构造期 fail-loud 校验；缺省不过滤、现有行为零回归（#267）。
+- auditlog 新增 `WithSinkFlushTimeout`：运行时与收尾 flush 的 inner sink 调用带 deadline，超时归因 `sink_timeout`（不再误记 buffer_full）；Close 在有界预算内返回并给出「已缓冲事件未确认落盘」终态（#267）。
+
+关联问题单：middleware#267。
+
+## [v0.19.4] — 2026-11-15
+
+- feat: GatewayTrust 新增 TrustLoopback *bool——显式 false 关闭回环恒可信豁免（回环来源必须签名立证，防同机伪造漏写即放行），nil/true 保持既有语义、显式 TrustedSources 命中仍优先（#261）
+
+关联问题单：middleware#261。
+
+## [v0.19.3] — 2026-11-15
+
+- SmartAuth AuthModeAuto nil parse 兜底（#250）：parse 为 nil 不再走空指针路径
+- SkipPaths 单源两中间件同口径（#251）：同一份 StackConfig.SkipPaths 不再喂出两套语义
+- AccessLog 用法示例与默认配置一致（#252）：示例宣称的默认行为与实现对齐
+- ClientIPFunc 第三参不再恒传 nil（#253）：按签名约定传递真实参数
+- Fail 三级判定顺序与文档编号对齐（#254）：NotFoundErrChecker 判定序按文档口径实现
+- RegisterDebugGroup 文档指向修正（#255）：不存在的 README 锚点改指真实位置
+
+关联问题单：middleware#250、middleware#251、middleware#252、middleware#253、middleware#254、middleware#255。
+
+## [v0.19.2] — 2026-11-14
+
+- refactor(lark): interface{} → any(1.18 别名),零行为差异
+
+## [v0.19.1] — 2026-11-14
+
+- refactor(i18n,response): sort.Slice/SortStable → slices.SortFunc/SortStableFunc（q 值稳定排序语义保持）+ JSON 深度扫描 for 计数 → range over int——行为等价现代化
+
 ## [v0.19.0] — 2026-11-13
 
 - 关停/审计/I18n 批：legacy 路径删除（#179）、hertz header 单源 core/transport/hertzbridge（#180）、I18n 锁外发布+single-flight+退避（#182）、SmartAuth Auto 立证不降级（#184）、JWT runtime 毒化修复（#185）、WithJWTAlgorithm 文档修正与 errJWT 哨兵导出（#186）、SkipPaths 语义声明统一（#187）、InfraPaths 函数化（#188）、hmw trace_id 注释勘误（#189）、BufferedSink 泛型化（#192）、AuditEvent IP/UA/Extra 缝（#193）、logx.ErrKey 收口（#196）、hook panic 隔离（#207）、Close 超时回归钉（#208）、flush 失败计数（#209）、AuditLog 钩子 panic 隔离（#210）、I18n loader 预算（#211）

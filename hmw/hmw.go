@@ -13,7 +13,6 @@ import (
 	"fmt"
 
 	"github.com/cloudwego/hertz/pkg/app"
-	"github.com/google/uuid"
 	"github.com/hertz-contrib/requestid"
 	"github.com/oekit/tracing/traceid"
 )
@@ -31,21 +30,22 @@ func FromRequestContext(c *app.RequestContext) string {
 
 // Middleware 返回请求 ID 中间件链，负责 trace_id 的生成、透传与桥接。
 //
-// 采用社区标准实现 hertz-contrib/requestid 作为生成核心，并附加一层桥接，
-// 将 requestid 生成的 ID 同步到 ekit 内部的两处存储，保证下游消费者零改动：
+// 采用社区标准实现 hertz-contrib/requestid 承载请求头透传流程，并附加一层
+// 桥接，将生成的 ID 同步到 ekit 内部的两处存储，保证下游消费者零改动：
 //   - Hertz RequestContext: c.Set(Key, ...)（供 FromRequestContext/health/version 读取）
 //   - 标准 context.Context: traceid.ContextWith（供 logx.Ctx* / service 层 / NATS publisher 读取）
 //
 // 流程:
-//  1. requestid.New — 读取请求头 traceid.HeaderKey，缺失则生成 traceid.IDLength 位 ID，写入响应头
+//  1. requestid.New — 读取请求头 traceid.HeaderKey，缺失则经 WithGenerator
+//     调 traceid.NewID 生成 traceid.IDLength 位 ID，写入响应头
 //  2. bridge — 读取 requestid 写入的 ID，同步注入 c.Set 与标准 context
 //
 // # 客户端 trace ID 白名单校验
 //
 // 客户端传入的 X-Trace-Id 经 validTraceID 白名单校验：非空、长度 ≤ 64、
-// 字符集仅 [0-9a-zA-Z-]（本包生成 12 字符——UUID 字符串前缀截断：8 hex +
-// '-' + 3 hex，第 9 字符恒为 '-'，#189 注释勘误；W3C trace-id 为 32 位
-// 十六进制，弹性接受字母数字连字符格式；白名单防日志注入/ID 伪造关联）。
+// 字符集仅 [0-9a-zA-Z-]（本包生成 12 位纯十六进制——traceid.NewID 单一
+// 真相源，#273 收敛；W3C trace-id 为 32 位十六进制，弹性接受字母数字
+// 连字符格式；白名单防日志注入/ID 伪造关联）。
 // 不在白名单的越界 ID（超长/任意字符/空）被静默丢弃并重新生成合法 ID，
 // 三处注入（响应头 / RequestContext / 标准 context）保持一致，该请求 trace 链路不断。
 //
@@ -68,7 +68,8 @@ func Middleware() []app.HandlerFunc {
 	gen := requestid.New(
 		requestid.WithCustomHeaderStrKey(requestid.HeaderStrKey(traceid.HeaderKey)),
 		requestid.WithGenerator(func(ctx context.Context, c *app.RequestContext) string {
-			return newTraceID()
+			// ID 生成唯一入口：traceid.NewID（trace_id 真相源，#273）。
+			return traceid.NewID()
 		}),
 	)
 
@@ -80,7 +81,7 @@ func Middleware() []app.HandlerFunc {
 			// 调用链关联、日志洪水。requestid 只在请求头"缺失"时生成，对
 			// 非空垃圾值不兜底——这里直接替换为新生成的合法 ID 并补齐三处
 			// 注入（c.Header 覆盖残留值），保证该请求 trace 链路不断。
-			rid = newTraceID()
+			rid = traceid.NewID()
 		}
 		c.Header(traceid.HeaderKey, rid)
 		c.Set(traceid.Key, rid)
@@ -91,17 +92,9 @@ func Middleware() []app.HandlerFunc {
 	return []app.HandlerFunc{gen, bridge}
 }
 
-// newTraceID 生成 traceid.IDLength 位随机 ID（与 requestid generator 同源）。
-// 格式为 12 字符：UUID 字符串前缀截断 ⇒ 8 hex + '-' + 3 hex（第 9 字符恒
-// 为 '-'，#189——注释曾失实为「12 位十六进制」，按注释写格式断言的下游
-// 会被钉子测试 TestNewTraceID_Format 的实际格式拦住）。
-func newTraceID() string {
-	return uuid.New().String()[:traceid.IDLength]
-}
-
 // validTraceID 校验客户端提供的 trace ID：非空、长度上限 64，字符白名单
-// [0-9a-zA-Z-]（本包生成 12 字符 = 8 hex + '-' + 3 hex，#189 勘误；
-// W3C trace-id 为 32 位十六进制，弹性接受字母数字连字符格式；
+// [0-9a-zA-Z-]（本包生成 12 位纯十六进制——traceid.NewID 单一真相源，
+// #273 收敛；W3C trace-id 为 32 位十六进制，弹性接受字母数字连字符格式；
 // 白名单防日志注入/洪水）。
 func validTraceID(id string) bool {
 	if id == "" || len(id) > 64 {

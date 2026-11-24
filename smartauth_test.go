@@ -102,6 +102,69 @@ func TestVerifyGatewayTrust_LoopbackNoSignature(t *testing.T) {
 	}
 }
 
+// TestVerifyGatewayTrust_LoopbackDisabledRejectsUnsigned 回归（#261 验收①）：
+// TrustLoopback 显式 false 时回环来源不再自动可信——仅 UID 头（无签名）按
+// 伪造处理，返回 false 且剥净全部信任头（同 Pod/宿主内进程冒充面关死）。
+func TestVerifyGatewayTrust_LoopbackDisabledRejectsUnsigned(t *testing.T) {
+	disabled := false
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &disabled}
+	c := newTrustCtx(t, "GET", "/api/admin", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "admin"},
+		ut.Header{Key: "X-Auth-Role-IDs", Value: "9"},
+		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
+	)
+	if _, ok := VerifyGatewayTrust(trust, c); ok {
+		t.Fatal("TrustLoopback=false 时回环仅 UID 头不得立证（#261）")
+	}
+	if left := hasTrustHeaders(c, trust.headerNames()); len(left) != 0 {
+		t.Fatalf("立证失败必须剥掉全部信任头，残留: %v", left)
+	}
+}
+
+// TestVerifyGatewayTrust_LoopbackDisabledSignatureAttests 验收②：关闭回环
+// 豁免后，回环来源带合法签名仍立证成功——签名是唯一立证（生产跨容器形态）。
+func TestVerifyGatewayTrust_LoopbackDisabledSignatureAttests(t *testing.T) {
+	disabled := false
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &disabled}
+	c := signedTrustCtx(t, trust, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+	)
+	sub, ok := VerifyGatewayTrust(trust, c)
+	if !ok || sub.UserID != "u42" {
+		t.Fatalf("关闭回环豁免后合法签名应立证成功: ok=%v sub=%+v", ok, sub)
+	}
+}
+
+// TestVerifyGatewayTrust_LoopbackExplicitTrue 显式 true 与零值同义：回环
+// 免签名立证（存量语义的显式声明形态）。
+func TestVerifyGatewayTrust_LoopbackExplicitTrue(t *testing.T) {
+	enabled := true
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &enabled}
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+	)
+	if _, ok := VerifyGatewayTrust(trust, c); !ok {
+		t.Fatal("TrustLoopback=true 应保留回环免签名立证")
+	}
+}
+
+// TestVerifyGatewayTrust_LoopbackDisabledExplicitTrustedSource 关闭回环豁免
+// 不等于回环永久不可信：TrustedSources 显式命中仍走来源立证（显式声明优先）。
+func TestVerifyGatewayTrust_LoopbackDisabledExplicitTrustedSource(t *testing.T) {
+	disabled := false
+	trust := GatewayTrust{
+		Secret:         []byte("sec"),
+		TrustLoopback:  &disabled,
+		TrustedSources: []netip.Prefix{netip.MustParsePrefix("127.0.0.0/8")},
+	}
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+	)
+	if _, ok := VerifyGatewayTrust(trust, c); !ok {
+		t.Fatal("TrustedSources 显式命中回环网段时应立证成功")
+	}
+}
+
 // TestVerifyGatewayTrust_ForgedHeadersRejectedAndStripped 头伪造拒绝（核心
 // 安全面）：非可信来源、无签名的 X-Auth-* 头就是客户端自称的身份——必须
 // 拒绝且剥头，任何值都不得进入后续链路。
@@ -402,6 +465,30 @@ func TestSmartAuth_GatewayOnlyForgedRejected401(t *testing.T) {
 	}
 }
 
+// TestSmartAuth_TrustLoopbackDisabledRejectsLoopbackForgery 回归（#261）：
+// TrustLoopback=false 经 SmartAuth 装配后同样生效——回环来源仅带身份头
+// （无签名）401，且伪造身份头在响应前已被剥净（生产同机冒充路径关死）。
+func TestSmartAuth_TrustLoopbackDisabledRejectsLoopbackForgery(t *testing.T) {
+	disabled := false
+	probe := &parseProbe{sub: Subject{UserID: "jwt-user"}}
+	trust := GatewayTrust{Secret: []byte("sec"), TrustLoopback: &disabled}
+	h := SmartAuth(probe.parse, &trust, WithSmartAuthMode(AuthModeGatewayOnly))
+	c := newTrustCtx(t, "GET", "/api/admin", "127.0.0.1",
+		ut.Header{Key: "X-Auth-User-ID", Value: "admin"},
+		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
+	)
+	h(context.Background(), c)
+	if !c.IsAborted() || c.Response.StatusCode() != 401 {
+		t.Fatalf("回环伪造头应 401: status=%d", c.Response.StatusCode())
+	}
+	if left := hasTrustHeaders(c, trust.headerNames()); len(left) != 0 {
+		t.Fatalf("401 前必须剥头，残留: %v", left)
+	}
+	if got := probe.calls(); len(got) != 0 {
+		t.Fatalf("gateway-only 不得调用 parse: %v", got)
+	}
+}
+
 // TestSmartAuth_AutoFallsBackToLocal 组合模式：未呈现网关立证时落本地
 // JWT 兜底。
 func TestSmartAuth_AutoFallsBackToLocal(t *testing.T) {
@@ -489,6 +576,85 @@ func TestSmartAuth_AutoDuplicateHeaderRejected401(t *testing.T) {
 	}
 	if got := probe.calls(); len(got) != 0 {
 		t.Fatalf("走私头请求不得回落本地 parse: %v", got)
+	}
+}
+
+// TestGatewayTrustPresented 导出呈现判定（#284，#184 折叠条件单源）：
+// UID/Signature 任一在场或任一信任头多值走私 ⇒ true；全缺席（含仅空白
+// UID）⇒ false。非信任头的多值（如 X-Forwarded-For）不参与判定——折叠
+// 条件只枚举信任头名。自定义头名与 VerifyGatewayTrust 同一解析。
+func TestGatewayTrustPresented(t *testing.T) {
+	trust := GatewayTrust{Secret: []byte("sec")}
+	dup := func(name, v1, v2 string) func(*app.RequestContext) {
+		return func(c *app.RequestContext) {
+			c.Request.Header.Add(name, v1)
+			c.Request.Header.Add(name, v2) // Add 造多值，Set 会覆盖
+		}
+	}
+	custom := GatewayTrust{
+		Secret: []byte("sec"),
+		HeaderNames: TrustHeaderNames{
+			Signature: "X-Gw-Sig", Timestamp: "X-Gw-Ts", UID: "X-Gw-Uid",
+			Username: "X-Gw-Name", RoleIDs: "X-Gw-Roles",
+			Authorized: "X-Gw-Authz", MCP: "X-Gw-Mcp",
+		},
+	}
+	tests := []struct {
+		name  string
+		trust GatewayTrust
+		mut   func(*app.RequestContext)
+		want  bool
+	}{
+		{"nothing presented", trust, nil, false},
+		{"uid present", trust, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-User-ID", "u42")
+		}, true},
+		{"uid whitespace only", trust, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-User-ID", "   ")
+		}, false},
+		{"signature only", trust, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-Signature", "Z2FyYmFnZQ==")
+		}, true},
+		{"multi-value trust header smuggled", trust, dup("X-Auth-MCP", "a", "b"), true},
+		{"multi-value non-trust header ignored", trust, dup("X-Forwarded-For", "a", "b"), false},
+		{"custom uid name", custom, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Gw-Uid", "u42")
+		}, true},
+		{"default names invisible to custom config", custom, func(c *app.RequestContext) {
+			c.Request.Header.Set("X-Auth-User-ID", "u42")
+		}, false},
+		{"custom smuggled role ids", custom, dup("X-Gw-Roles", "1", "2"), true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			c := newTrustCtx(t, "GET", "/api/users", "203.0.113.7")
+			if tt.mut != nil {
+				tt.mut(c)
+			}
+			if got := GatewayTrustPresented(tt.trust, c); got != tt.want {
+				t.Fatalf("GatewayTrustPresented = %v, want %v", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestGatewayTrustPresented_MustCallBeforeVerify 调用序契约（godoc ⚠️ 的
+// 可执行版）：VerifyGatewayTrust 失败路径剥掉全部信任头，之后呈现状态
+// 无从判定——thin wrapper 必须先 Presented 后 Verify。
+func TestGatewayTrustPresented_MustCallBeforeVerify(t *testing.T) {
+	trust := GatewayTrust{Secret: []byte("sec")}
+	c := newTrustCtx(t, "GET", "/api/users", "203.0.113.7",
+		ut.Header{Key: "X-Auth-User-ID", Value: "u42"},
+		ut.Header{Key: "X-Auth-Signature", Value: "Z2FyYmFnZQ=="},
+	)
+	if !GatewayTrustPresented(trust, c) {
+		t.Fatal("UID+Signature 在场应判定已呈现")
+	}
+	if _, ok := VerifyGatewayTrust(trust, c); ok {
+		t.Fatal("垃圾签名必须验不过")
+	}
+	if GatewayTrustPresented(trust, c) {
+		t.Fatal("剥头后不得再判定为已呈现（必须先 Presented 后 Verify）")
 	}
 }
 
@@ -588,7 +754,8 @@ func TestSmartAuth_AuthorizerRejectAndError(t *testing.T) {
 }
 
 // TestSmartAuth_ConstructionPanics 构造期 fail-fast（#97 同哲学）：没有
-// 认证面/立证面的配置必须在启动期炸响。
+// 认证面/立证面的配置必须在启动期炸响。#250 补 AuthModeAuto 配 nil parse
+// ——组合模式缺本地兜底入口，旧实现构造期放行、请求期对 nil parse 调用 panic。
 func TestSmartAuth_ConstructionPanics(t *testing.T) {
 	trust := &GatewayTrust{Secret: []byte("sec")}
 	noPath := &GatewayTrust{} // Secret 与 TrustedSources 均空
@@ -608,6 +775,7 @@ func TestSmartAuth_ConstructionPanics(t *testing.T) {
 		want  string // panic 信息须包含的子串
 	}{
 		{"both nil", nil, nil, nil, "fail-open"},
+		{"auto without parse (#250)", nil, trust, nil, "AuthModeAuto"},
 		{"gateway-only without trust", probe, nil, []SmartAuthOption{WithSmartAuthMode(AuthModeGatewayOnly)}, "GatewayTrust"},
 		{"local-only without parse", nil, trust, []SmartAuthOption{WithSmartAuthMode(AuthModeLocalOnly)}, "JWTParseFunc"},
 		{"trust without attestation path", probe, noPath, nil, "no attestation path"},
@@ -649,9 +817,10 @@ func TestSmartAuth_DuplicateHeaderNamesJoinError(t *testing.T) {
 	})
 }
 
-// TestSmartRBAC_GatewayAuthorizedSkipsLocal 网关已鉴权（Authorized=1）跳过
-// 本地 RBAC。
-func TestSmartRBAC_GatewayAuthorizedSkipsLocal(t *testing.T) {
+// TestSmartRBAC_BareAuthorizedHeaderNotTrusted 回归 #300：默认只认 SmartAuth
+// 立证标记——单独挂 SmartRBAC（或挂在 SmartAuth 之前）时客户端直带
+// X-Auth-Authorized: 1 不再跳过本地 RBAC（静默 fail-open 关死）。
+func TestSmartRBAC_BareAuthorizedHeaderNotTrusted(t *testing.T) {
 	localCalled := false
 	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
 		localCalled = true
@@ -661,17 +830,54 @@ func TestSmartRBAC_GatewayAuthorizedSkipsLocal(t *testing.T) {
 		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
 	)
 	h(context.Background(), c)
-	if localCalled {
-		t.Fatal("网关已鉴权不得调用本地 RBAC")
-	}
-	if c.IsAborted() {
-		t.Fatal("网关已鉴权应放行")
+	if !localCalled {
+		t.Fatal("★ 默认不得信任裸 Authorized 头（#300 fail-open）")
 	}
 }
 
-// TestSmartRBAC_LocalFallback 未标记（缺席/非 "1"）走本地 RBAC 兜底。
+// TestSmartRBAC_AttestedMarkerSkipsLocal SmartAuth 立证成功后写入 ctx 的
+// 标记是默认跳过判据（无需 Authorized 头）。
+func TestSmartRBAC_AttestedMarkerSkipsLocal(t *testing.T) {
+	localCalled := false
+	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
+		localCalled = true
+		c.Next(ctx)
+	})
+	ctx := context.WithValue(context.Background(), smartAuthAttestedCtxKey{}, true)
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1")
+	h(ctx, c)
+	if localCalled {
+		t.Fatal("SmartAuth 立证标记命中应跳过本地 RBAC")
+	}
+	if c.IsAborted() {
+		t.Fatal("立证标记命中应放行")
+	}
+}
+
+// TestSmartRBAC_LegacyHeaderOptIn WithTrustAuthorizedHeader 显式兼容旧行为：
+// 裸 Authorized 头命中即跳过本地 RBAC（构造期告警，测试只钉行为面）。
+func TestSmartRBAC_LegacyHeaderOptIn(t *testing.T) {
+	localCalled := false
+	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
+		localCalled = true
+		c.Next(ctx)
+	}, WithTrustAuthorizedHeader())
+	c := newTrustCtx(t, "GET", "/api/users", "127.0.0.1",
+		ut.Header{Key: "X-Auth-Authorized", Value: GatewayAuthorizedValue},
+	)
+	h(context.Background(), c)
+	if localCalled {
+		t.Fatal("WithTrustAuthorizedHeader 显式兼容档：裸头命中应跳过本地 RBAC")
+	}
+	if c.IsAborted() {
+		t.Fatal("旧行为兼容档应放行")
+	}
+}
+
+// TestSmartRBAC_LocalFallback 未标记（缺席/非 "1"）/裸头（默认不信任）
+// 走本地 RBAC 兜底。
 func TestSmartRBAC_LocalFallback(t *testing.T) {
-	for _, header := range []string{"", "0", "true"} {
+	for _, header := range []string{"", "0", "true", GatewayAuthorizedValue} {
 		localCalled := false
 		h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
 			localCalled = true
@@ -683,7 +889,7 @@ func TestSmartRBAC_LocalFallback(t *testing.T) {
 		}
 		h(context.Background(), c)
 		if !localCalled {
-			t.Fatalf("Authorized=%q 应走本地 RBAC 兜底", header)
+			t.Fatalf("Authorized=%q 应走本地 RBAC 兜底（默认不信任裸头，#300）", header)
 		}
 	}
 }
@@ -699,19 +905,19 @@ func TestSmartRBAC_NilLocalPanics(t *testing.T) {
 	_ = SmartRBAC(nil)
 }
 
-// TestSmartRBAC_CustomAuthorizedHeader 自定义标记头名。
+// TestSmartRBAC_CustomAuthorizedHeader 自定义标记头名（旧行为兼容档）。
 func TestSmartRBAC_CustomAuthorizedHeader(t *testing.T) {
 	localCalled := false
 	h := SmartRBAC(func(ctx context.Context, c *app.RequestContext) {
 		localCalled = true
 		c.Next(ctx)
-	}, WithSmartRBACAuthorizedHeader("X-Gw-Authz"))
+	}, WithSmartRBACAuthorizedHeader("X-Gw-Authz"), WithTrustAuthorizedHeader())
 	c := newTrustCtx(t, "GET", "/x", "127.0.0.1",
 		ut.Header{Key: "X-Gw-Authz", Value: GatewayAuthorizedValue},
 	)
 	h(context.Background(), c)
 	if localCalled {
-		t.Fatal("自定义头命中应跳过本地 RBAC")
+		t.Fatal("自定义头命中（显式兼容档）应跳过本地 RBAC")
 	}
 }
 

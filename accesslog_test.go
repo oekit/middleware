@@ -266,3 +266,63 @@ func TestInfraPaths_ReturnsIsolatedCopy(t *testing.T) {
 		t.Fatalf("★ InfraPaths() 必须返回独立副本（#188），got %v", second)
 	}
 }
+
+// TestAccessLog_SkipAllRecordsEverything 钉住 #252：WithAccessLogSkipAll 是
+// 「全量记录」的显式表达式——连 InfraPaths 缺省兜底也清空，/metrics 照常
+// 进日志（缺省仍按 InfraPaths 兜底，两极各自显式）。
+func TestAccessLog_SkipAllRecordsEverything(t *testing.T) {
+	// 缺省：/metrics 被 InfraPaths 兜底豁免
+	calls := 0
+	h := route.NewEngine(config.NewOptions([]config.Option{}))
+	h.Use(AccessLogMiddleware(
+		WithAccessLogSink(func(context.Context, *app.RequestContext, AccessRecord) error { calls++; return nil }),
+	))
+	handler := func(ctx context.Context, c *app.RequestContext) { c.String(200, "ok") }
+	h.GET("/metrics", handler)
+	ut.PerformRequest(h, http.MethodGet, "/metrics", nil)
+	if calls != 0 {
+		t.Fatalf("缺省 /metrics 应被 InfraPaths 兜底豁免（#137）, got %d", calls)
+	}
+
+	// SkipAll：同一条 /metrics 照常记录
+	calls = 0
+	h2 := route.NewEngine(config.NewOptions([]config.Option{}))
+	h2.Use(AccessLogMiddleware(
+		WithAccessLogSkipAll(),
+		WithAccessLogSink(func(context.Context, *app.RequestContext, AccessRecord) error { calls++; return nil }),
+	))
+	h2.GET("/metrics", handler)
+	ut.PerformRequest(h2, http.MethodGet, "/metrics", nil)
+	if calls != 1 {
+		t.Fatalf("★ WithAccessLogSkipAll 应全量记录（/metrics 也记，#252）, got %d", calls)
+	}
+}
+
+// TestAccessLog_SkipAllOptionsSemantics 钉住 #252 选项语义：SkipAll 产出
+// 非 nil 空清单（显式「一条不跳」），与 nil（未设置 ⇒ InfraPaths 兜底）可区分；
+// 与 WithAccessLogSkipPaths 混用按调用顺序生效（后调用者胜）。
+func TestAccessLog_SkipAllOptionsSemantics(t *testing.T) {
+	cfg := newAccessLogOptions(WithAccessLogSkipAll())
+	if cfg.SkipPaths == nil {
+		t.Fatal("SkipAll 应产出非 nil 空清单（nil 会被兜底成 InfraPaths）")
+	}
+	if len(cfg.SkipPaths) != 0 {
+		t.Fatalf("SkipAll 清单应为空, got %v", cfg.SkipPaths)
+	}
+
+	// 空参 SkipPaths 不是 SkipAll：仍落 InfraPaths 兜底（#137 不回归）
+	cfg = newAccessLogOptions(WithAccessLogSkipPaths())
+	if len(cfg.SkipPaths) != len(InfraPaths()) {
+		t.Fatalf("空参 WithAccessLogSkipPaths 仍应走 InfraPaths 兜底, got %v", cfg.SkipPaths)
+	}
+
+	// 混用按调用顺序：后调用者胜
+	cfg = newAccessLogOptions(WithAccessLogSkipPaths("/a"), WithAccessLogSkipAll())
+	if len(cfg.SkipPaths) != 0 {
+		t.Fatalf("SkipAll 后调用应清空此前清单, got %v", cfg.SkipPaths)
+	}
+	cfg = newAccessLogOptions(WithAccessLogSkipAll(), WithAccessLogSkipPaths("/a"))
+	if len(cfg.SkipPaths) != 1 || cfg.SkipPaths[0] != "/a" {
+		t.Fatalf("SkipPaths 追加到 SkipAll 之后应为 [/a], got %v", cfg.SkipPaths)
+	}
+}

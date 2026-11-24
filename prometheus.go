@@ -2,12 +2,13 @@ package mw
 
 import (
 	"context"
-	"errors"
 	"fmt"
+	"path/filepath"
 	"strconv"
 	"time"
 
 	"github.com/oekit/metrics"
+	"github.com/oekit/pkg/pathx"
 
 	prom "github.com/prometheus/client_golang/prometheus"
 
@@ -25,6 +26,16 @@ type PrometheusConfig struct {
 	ServiceName string
 
 	// SkipPaths 是不需要采集指标的路径列表，如 ["/metrics", "/ping", "/health"]。
+	//
+	// 匹配口径（#251）：pathx.MatchesPath glob 打**原始请求路径**，与同栈
+	// AccessLog/RateLimit 同一源——同一份 StackConfig.SkipPaths 单点传入
+	// 时两侧豁免面一致（此前本字段按 c.FullPath() 路由模板**精确查表**，
+	// glob（"/health*"）与缺省兜底双双失效：AccessLog 跳、指标照采）。
+	// 不再匹配路由模板（"/api/user/:id" 这类写法按字面 glob 匹配原始路径）。
+	//
+	// 缺省语义（#137 同款）：未显式传时用 mw.InfraPaths() 兜底——标准
+	// 探活/监控端点（含 /metrics 自身）缺省零指标；显式传则**完全覆盖**
+	// 缺省（不是追加）。
 	SkipPaths []string
 
 	// Registry 是自定义的 Prometheus 注册器。
@@ -77,8 +88,8 @@ type PrometheusMetrics struct {
 	// ResponseSize 记录响应体大小分布（字节），仅在 EnableSizeMetrics 时注册。
 	ResponseSize *prom.HistogramVec
 
-	skipPaths   map[string]bool
-	serviceName string // 存储用于标签构造
+	skipPaths   []string // glob 模式清单，pathx.MatchesPath 打原始请求路径（#251）
+	serviceName string   // 存储用于标签构造
 	enableSize  bool
 }
 
@@ -88,6 +99,19 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 	ns := cfg.Namespace
 	if ns == "" {
 		ns = "http"
+	}
+
+	// SkipPaths 缺省兜底（#137 同款，#251）：未显式传时豁免 InfraPaths
+	// （含 /metrics 自身——旧实现无兜底，标准装配下抓取流量自采集成环）；
+	// 显式传则完全覆盖缺省。
+	cfg.SkipPaths = withInfraPathsDefault(cfg.SkipPaths)
+	// 构造期预检 SkipPaths glob 语法（#201/#161 同判据 fail-fast）：
+	// pathx.MatchesPath 宽松档把 filepath.ErrBadPattern 吞成「不匹配」，
+	// 一个坏 pattern 让整条豁免判据静默失效、/metrics 自采集复发且零信号。
+	for _, p := range cfg.SkipPaths {
+		if _, err := filepath.Match(p, ""); err != nil {
+			panic(fmt.Sprintf("mw.NewPrometheusMetrics: invalid SkipPaths glob pattern %q: %v", p, err))
+		}
 	}
 
 	reg := cfg.Registry
@@ -142,7 +166,7 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 			},
 			pathLabels,
 		),
-		skipPaths:   make(map[string]bool),
+		skipPaths:   cfg.SkipPaths,
 		serviceName: cfg.ServiceName,
 		enableSize:  cfg.EnableSizeMetrics,
 	}
@@ -168,70 +192,42 @@ func NewPrometheusMetrics(cfg PrometheusConfig) *PrometheusMetrics {
 		)
 	}
 
-	for _, p := range cfg.SkipPaths {
-		m.skipPaths[p] = true
-	}
-
-	// 用 Register 容忍 AlreadyRegisteredError：DefaultMiddleware 在同一
-	// registry 上被调两次曾因 MustRegister 直接 panic（与库内"构造失败
-	// 可重试"的基调不符），**复用已注册的 collector**。
-	m.RequestsTotal = registerReuse(reg, m.RequestsTotal)
-	m.RequestDuration = registerReuse(reg, m.RequestDuration)
-	m.RequestsInFlight = registerReuse(reg, m.RequestsInFlight)
+	// 撞名复用注册走 metrics.RegisterReuse 单源（#100 收敛、#274 切换消费；
+	// WithReuseOwner("mw") 令异型 panic 文案与历史私有实现逐字节一致）：
+	// DefaultMiddleware 在同一 registry 上被调两次曾因 MustRegister 直接
+	// panic（与库内"构造失败可重试"的基调不符），**复用已注册的 collector**。
+	m.RequestsTotal = metrics.RegisterReuse(reg, m.RequestsTotal, metrics.WithReuseOwner("mw"))
+	m.RequestDuration = metrics.RegisterReuse(reg, m.RequestDuration, metrics.WithReuseOwner("mw"))
+	m.RequestsInFlight = metrics.RegisterReuse(reg, m.RequestsInFlight, metrics.WithReuseOwner("mw"))
 	if cfg.EnableSizeMetrics {
-		m.RequestSize = registerReuse(reg, m.RequestSize)
-		m.ResponseSize = registerReuse(reg, m.ResponseSize)
+		m.RequestSize = metrics.RegisterReuse(reg, m.RequestSize, metrics.WithReuseOwner("mw"))
+		m.ResponseSize = metrics.RegisterReuse(reg, m.ResponseSize, metrics.WithReuseOwner("mw"))
 	}
 
 	return m
 }
 
-// registerReuse 注册 collector；同名 collector 已注册（同一 Registry +
-// namespace 下构造多个 PrometheusMetrics 是真实场景：一个服务装多套
-// 中间件）时**复用既有实例**，其余注册错误仍 panic（与 MustRegister 语义
-// 一致）。
-//
-// 复用是必须的：此前只吞掉 AlreadyRegisteredError、把**新建的（未注册的）**
-// collector 留在字段里 ⇒ 第二个实例的指标全部丢失（采集端永远看不到它们），
-// 而构造函数却"成功"返回 ⇒ 故障完全静默。
-//
-// 同名同描述符（fqName + help + 标签名都一致）但**类型不同**时，
-// prometheus 返回的是 AlreadyRegisteredError（而非直接拒绝）——此时既有
-// collector 无法当作请求的那个类型复用。直接 `.(T)` 会 panic 成一句
-// 不可定位的 "interface conversion: ..."；改为换成人能读懂的错误
-// （既有类型 vs 请求类型 + 怎么改）。
-func registerReuse[T prom.Collector](reg prom.Registerer, fresh T) T {
-	if err := reg.Register(fresh); err != nil {
-		var are prom.AlreadyRegisteredError
-		if errors.As(err, &are) {
-			existing, ok := are.ExistingCollector.(T)
-			if !ok {
-				panic(fmt.Errorf("mw: 同名 collector 类型不符：已注册 %T，请求 %T"+
-					"（fqName 与描述符相同但类型不同——请改用同一类型的同名指标，或换 namespace）",
-					are.ExistingCollector, fresh))
-			}
-			return existing
-		}
-		panic(err)
-	}
-	return fresh
-}
-
 // Middleware 返回 Hertz 中间件，在每个请求结束后记录 Prometheus 指标。
 // SkipPaths 中的路径会被跳过（避免 /metrics 自身被采集）。
 //
-// 路径标签使用 c.FullPath()（路由模板），未匹配路由使用 "unnamed"。
+// 跳过判定（#251）：pathx.MatchesPath glob 打**原始请求路径**（c.Path()），
+// 与同栈 AccessLog/RateLimit 同一源——同一份 StackConfig.SkipPaths 两侧
+// 豁免面一致，glob（"/health*"）与缺省 InfraPaths 兜底均生效。
+//
+// 路径标签使用 c.FullPath()（路由模板），未匹配路由使用 "unnamed"——
+// 标签口径与跳过判定解耦：标签防高基数，跳过判据求与日志一致。
 func (m *PrometheusMetrics) Middleware() app.HandlerFunc {
 	return func(ctx context.Context, c *app.RequestContext) {
+		// 跳过判定打原始请求路径（与 AccessLog 同源，#251）
+		if pathx.MatchesPath(m.skipPaths, string(c.Path())) {
+			c.Next(ctx)
+			return
+		}
+
 		// 使用路由模板而非原始路径，避免高基数标签
 		path := c.FullPath()
 		if path == "" {
 			path = "unnamed"
-		}
-
-		if m.skipPaths[path] {
-			c.Next(ctx)
-			return
 		}
 
 		method := string(c.Request.Method())

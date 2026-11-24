@@ -11,8 +11,6 @@ import (
 	"sync"
 	"time"
 
-	logx "github.com/oekit/logx"
-
 	"github.com/cloudwego/hertz/pkg/app"
 	"github.com/hertz-contrib/cache"
 	"github.com/hertz-contrib/cache/persist"
@@ -23,15 +21,10 @@ const (
 	defaultCachePrefix     = "ekit"
 )
 
-// cacheState 持有懒构造的 store + options,延迟到第一次调用 Cache 时构造。
-// mu 保护全部字段(与 jwt 同款全局态,2026-09-05 复审修复:原实现无锁)。
+// cacheState 是 GlobalCache 的全局单例状态（历史 Cache 行为，已废弃）。
+// 新代码使用 Cache——每次调用独立构造，状态收在调用闭包里。
 type cacheState struct {
 	mu      sync.Mutex
-	mw      app.HandlerFunc
-	getOnly bool // 构造时冻结:是否包 GET-only 守卫
-	opts    cacheOptions
-	// handler 是首次构造出的那一个 handler(含 getOnly 守卫)。
-	// 后续 Cache() 调用直接复用它 ⇒ 返回值语义与首次完全一致。
 	handler app.HandlerFunc
 }
 
@@ -128,8 +121,6 @@ func WithCacheIdentityHeaders(names ...string) CacheOption {
 	}
 }
 
-var cacheLog = logx.Delegating("middleware-cache")
-
 // Cache 返回 hertz HTTP 缓存中间件,默认按 RequestURI 作 key、60s 过期、
 // 内存存储(进程级,重启失效)。Redis 等分布式场景用 WithCacheStore 注入。
 //
@@ -180,56 +171,22 @@ var cacheLog = logx.Delegating("middleware-cache")
 //	    mw.WithCacheExpiration(10*time.Minute),
 //	))
 //
+// # 实例隔离（#300）
+//
+// 每次调用返回独立实例：store/prefix/expiration/strategy 全部收在本次调用
+// 的闭包里，多个路由组可分别配 Redis/内存/不同 prefix/TTL，互不串扰。
+// 历史全局单例形态保留为 GlobalCache（Deprecated），新代码不要使用。
+//
 // 官方依据:https://www.cloudwego.io/zh/docs/hertz/tutorials/third-party/middleware/cache/
 // (上游 strategy 返回 false 时 c.Next(ctx) 直接放行 — 非 GET 走同一通道)
 func Cache(opts ...CacheOption) app.HandlerFunc {
-	globalCacheState.mu.Lock()
-	// 懒构造;失败可重试(无 once 毒化)。守卫与 mw 同帧冻结:
-	// 构造时无自定义 strategy → 本实例永久带 GET 守卫;后续再传
-	// WithCacheStrategyByRequest 不会生效(mw 不重建),守卫也不能按
-	// 调用时的 opts 翻转,否则两次调用返回语义不一致的 handler
-	// (2026-09-06 复审修正)
-	//
-	// ⚠️ **实例已冻结时,不再把新 option 写进 opts**:
-	//    这些 option 永远不会生效(strategy/expiration/prefix/store 全部冻结),
-	//    写进去只会让 `opts` 与**实际生效的配置**不一致
-	//    (2026-10-31 实测:二次调用 Cache(WithCachePrefix("second")) 后
-	//     opts.prefix 变成 "second",而实际用的还是 "first"
-	//     ⇒ 任何读 opts 的代码都会拿到错误的值)。
-	//    ⇒ 冻结后直接忽略并告警,让 opts 始终等于实际生效的配置。
-	if globalCacheState.mw != nil {
-		if len(opts) > 0 {
-			// 实例已冻结：后续 option 全部忽略（静默失效最隐蔽 ⇒ 必须告警）
-			cacheLog.Warn("cache middleware already built; later options are ignored (global singleton)", "ignoredOpts", len(opts))
-		}
-		handler := globalCacheState.handler
-		globalCacheState.mu.Unlock()
-		return handler
-	}
-	for _, opt := range opts {
-		opt(&globalCacheState.opts)
-	}
-	// 应用默认值
-	if globalCacheState.opts.expiration == 0 {
-		globalCacheState.opts.expiration = defaultCacheExpiration
-	}
-	if globalCacheState.opts.prefix == "" {
-		globalCacheState.opts.prefix = defaultCachePrefix
-	}
-	if len(globalCacheState.opts.identityHeaders) == 0 {
-		// 拷贝兜底:不与包级缺省清单共享底层数组(只读约定)。
-		globalCacheState.opts.identityHeaders = append([]string(nil), defaultCacheIdentityHeaders...)
-	}
-	globalCacheState.mw = buildCacheLocked()
-	globalCacheState.getOnly = globalCacheState.opts.strategy == nil
-	mw, getOnly := globalCacheState.mw, globalCacheState.getOnly
-
-	if !getOnly {
-		globalCacheState.handler = mw
-		globalCacheState.mu.Unlock()
+	o := resolveCacheOptions(opts)
+	mw := buildCache(o)
+	if o.strategy != nil {
+		// 业务显式接管缓存判定：方法过滤/凭证守卫由业务负责。
 		return mw
 	}
-	handler := func(ctx context.Context, c *app.RequestContext) {
+	return func(ctx context.Context, c *app.RequestContext) {
 		if string(c.Method()) != http.MethodGet {
 			c.Next(ctx)
 			return
@@ -243,53 +200,92 @@ func Cache(opts ...CacheOption) app.HandlerFunc {
 		//    Cookie 的请求直接放行不缓存——cookie 会话没有稳定可哈希的
 		//    身份头，缓存重放 Set-Cookie 的风险仍在（认证接口建议自定义
 		//    含身份的 CacheKey，见 Cache godoc 的身份维度说明）。
-		if !hasStableCacheIdentity(c, globalCacheState.opts.identityHeaders) &&
+		if !hasStableCacheIdentity(c, o.identityHeaders) &&
 			len(c.Request.Header.Peek("Cookie")) > 0 {
 			c.Next(ctx)
 			return
 		}
 		mw(ctx, c)
 	}
-	// 冻结后复用同一个 handler ⇒ 二次调用 Cache() 返回的 handler
-	// 与首次**完全一致**（含 GET 守卫与凭证放行逻辑）。
+}
+
+// GlobalCache 是历史全局单例形态的缓存中间件（原 Cache 行为），已废弃。
+//
+// Deprecated: 使用 Cache。Cache 每次调用返回独立实例，多路由组可分别配
+// store/prefix/TTL/strategy。GlobalCache 仅用于兼容「进程内只允许一个缓存
+// 实例」的存量装配：
+//
+//   - 首次调用构造全局实例（options 生效）；
+//   - 后续调用不带 option：返回同一 handler；
+//   - 后续调用带**任何** option：panic——全局实例已冻结，option 无法生效。
+//     旧实现静默忽略并告警，多路由组配不同 Redis/prefix 时第二组会错用
+//     第一组配置且无错误信号（#300）。
+func GlobalCache(opts ...CacheOption) app.HandlerFunc {
+	globalCacheState.mu.Lock()
+	defer globalCacheState.mu.Unlock()
+	if globalCacheState.handler != nil {
+		if len(opts) > 0 {
+			panic("contrib.GlobalCache: global cache already built; options on later calls cannot take effect (use Cache for per-call instances)")
+		}
+		return globalCacheState.handler
+	}
+	handler := Cache(opts...)
 	globalCacheState.handler = handler
-	globalCacheState.mu.Unlock()
 	return handler
 }
 
-// buildCacheLocked 构造上游 cache 中间件;调用方必须持有 globalCacheState.mu。
-func buildCacheLocked() app.HandlerFunc {
-	// 默认 store: memory
-	store := globalCacheState.opts.store
+// resolveCacheOptions 应用 option 与缺省值，返回每次调用独立的配置副本。
+func resolveCacheOptions(opts []CacheOption) cacheOptions {
+	var o cacheOptions
+	for _, opt := range opts {
+		opt(&o)
+	}
+	if o.expiration == 0 {
+		o.expiration = defaultCacheExpiration
+	}
+	if o.prefix == "" {
+		o.prefix = defaultCachePrefix
+	}
+	if len(o.identityHeaders) == 0 {
+		// 拷贝兜底:不与包级缺省清单共享底层数组(只读约定)。
+		o.identityHeaders = append([]string(nil), defaultCacheIdentityHeaders...)
+	}
+	return o
+}
+
+// buildCache 按已解析配置构造上游 cache 中间件（无全局状态，#300）。
+func buildCache(o cacheOptions) app.HandlerFunc {
+	// 默认 store: memory（per-call，互不共享）
+	store := o.store
 	if store == nil {
-		store = persist.NewMemoryStore(globalCacheState.opts.expiration)
+		store = persist.NewMemoryStore(o.expiration)
 	}
 	// 构造 hertz-contrib/cache options
 	cOpts := []cache.Option{
-		cache.WithPrefixKey(globalCacheState.opts.prefix),
+		cache.WithPrefixKey(o.prefix),
 	}
 	// strategy:业务自定义优先;缺省走本包默认(含 Authorization 与 X-Auth-*
 	// 身份维度的 key 生成,middleware#106/#142)。不再直接用上游
 	// NewCacheByRequestURI/...WithIgnoreQueryOrder——它们的 key 不含
 	// 身份维度且归一化函数未导出,无法在 URI 基础上追加身份后缀。
-	strategy := globalCacheState.opts.strategy
+	strategy := o.strategy
 	if strategy == nil {
-		strategy = defaultCacheStrategy(globalCacheState.opts.ignoreOrder, globalCacheState.opts.identityHeaders)
+		strategy = defaultCacheStrategy(o.ignoreOrder, o.identityHeaders)
 	}
 	cOpts = append(cOpts, cache.WithCacheStrategyByRequest(strategy))
-	if globalCacheState.opts.onHit != nil {
-		cOpts = append(cOpts, cache.WithOnHitCache(globalCacheState.opts.onHit))
+	if o.onHit != nil {
+		cOpts = append(cOpts, cache.WithOnHitCache(o.onHit))
 	}
-	if globalCacheState.opts.onMiss != nil {
-		cOpts = append(cOpts, cache.WithOnMissCache(globalCacheState.opts.onMiss))
+	if o.onMiss != nil {
+		cOpts = append(cOpts, cache.WithOnMissCache(o.onMiss))
 	}
-	if globalCacheState.opts.onShareSngl != nil {
-		cOpts = append(cOpts, cache.WithOnShareSingleFlight(globalCacheState.opts.onShareSngl))
+	if o.onShareSngl != nil {
+		cOpts = append(cOpts, cache.WithOnShareSingleFlight(o.onShareSngl))
 	}
-	if globalCacheState.opts.beforeReply != nil {
-		cOpts = append(cOpts, cache.WithBeforeReplyWithCache(globalCacheState.opts.beforeReply))
+	if o.beforeReply != nil {
+		cOpts = append(cOpts, cache.WithBeforeReplyWithCache(o.beforeReply))
 	}
-	return cache.NewCache(store, globalCacheState.opts.expiration, cOpts...)
+	return cache.NewCache(store, o.expiration, cOpts...)
 }
 
 // defaultCacheStrategy 默认缓存判定(middleware#106/#142):key 取 RequestURI

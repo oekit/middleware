@@ -1,9 +1,10 @@
 package mw
 
 import (
+	"cmp"
 	"context"
 	"fmt"
-	"sort"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -346,7 +347,7 @@ func pickLang(accept, defaultLang string, catalog Catalog) string {
 	for k := range catalog {
 		available = append(available, langKey{strings.ToLower(k), k})
 	}
-	sort.Slice(available, func(i, j int) bool { return available[i].lower < available[j].lower })
+	slices.SortFunc(available, func(a, b langKey) int { return strings.Compare(a.lower, b.lower) })
 
 	// 解析 Accept-Language: q-value 排序
 	type entry struct {
@@ -375,7 +376,7 @@ func pickLang(accept, defaultLang string, catalog Catalog) string {
 		}
 		entries = append(entries, entry{lang: strings.ToLower(lang), q: q})
 	}
-	sort.SliceStable(entries, func(i, j int) bool { return entries[i].q > entries[j].q })
+	slices.SortStableFunc(entries, func(a, b entry) int { return cmp.Compare(b.q, a.q) })
 
 	for _, e := range entries {
 		// 精确匹配

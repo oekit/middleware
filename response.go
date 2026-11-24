@@ -11,6 +11,7 @@ import (
 	"github.com/oekit/logx"
 	"github.com/oekit/middleware/hmw"
 	"github.com/oekit/pkg/errors"
+	"github.com/oekit/pkg/pathx"
 )
 
 // Response 是所有 HTTP API 的统一响应结构。
@@ -32,7 +33,8 @@ type Response struct {
 //   - 跳过非 JSON 响应、非 200 状态码、空 body
 //
 // 声明式跳过（与 SkipResponseWrap 并存）:
-//   - WithSkipPaths — 路径精确匹配，命中则整请求不包装
+//   - WithSkipPaths — 路径精确匹配 + glob（pathx.MatchesPath，与 AccessLog/
+//     Prometheus 同 matcher：#299 起 "/internal/**" 等子树模式生效），命中则整请求不包装
 //   - WithSkipPrefixes — 路径前缀匹配（段边界："/mcp" 命中 "/mcp" 与 "/mcp/tools"，不命中 "/mcp-v2"），命中则整请求不包装
 //   - SkipResponseWrap — handler 级逃生舱（写响应前调用），单响应跳过包装
 //
@@ -105,13 +107,21 @@ func ResponseMiddleware(opts ...ResponseOption) app.HandlerFunc {
 
 // responseSkipConfig 是 ResponseMiddleware 的声明式跳过配置。
 type responseSkipConfig struct {
-	// skipPaths 精确匹配的路径集合。
-	skipPaths map[string]struct{}
+	// skipPathsExact 是字面路径的精确匹配集合：保留历史「原文 ==」语义
+	// （含 glob 元字符的字面路径也照常命中）。
+	skipPathsExact map[string]struct{}
+	// skipPaths 是 glob 模式清单（pathx.MatchesPath，与 AccessLog/
+	// Prometheus 同一 matcher，#299）。
+	skipPaths []string
 	// skipPrefixes 前缀匹配的路径前缀列表（按声明顺序）。
 	skipPrefixes []string
 }
 
 // skip 判断给定路径是否命中声明式跳过规则。
+//
+// 匹配顺序：精确字面路径 → glob（pathx.MatchesPath）→ 段边界前缀。
+// glob 与同栈 AccessLog/Prometheus 同源（#299）：`*` 单段不跨 "/"，
+// "/internal/**" 豁免整棵子树，"/internal/*" 只命中直接子路径。
 //
 // 前缀命中后做段边界校验（#100）：裸 strings.HasPrefix 会把 "/mcp" 连带到
 // "/mcp-v2/..." 等同字符开头的无关路由——包壳豁免是「静默失败」型错误，
@@ -126,7 +136,10 @@ type responseSkipConfig struct {
 // #126 定版回历史语义；空前缀是「全站豁免」级的高影响配置，误配必须
 // 可观测——WithSkipPrefixes 收到空串时打 WARN（见该函数文档）。
 func (c *responseSkipConfig) skip(path string) bool {
-	if _, ok := c.skipPaths[path]; ok {
+	if _, ok := c.skipPathsExact[path]; ok {
+		return true
+	}
+	if pathx.MatchesPath(c.skipPaths, path) {
 		return true
 	}
 	for _, p := range c.skipPrefixes {
@@ -151,23 +164,28 @@ type ResponseOption func(*responseSkipConfig)
 
 // newResponseOptions 聚合 ResponseOption 列表。
 func newResponseOptions(opts ...ResponseOption) *responseSkipConfig {
-	cfg := &responseSkipConfig{skipPaths: make(map[string]struct{})}
+	cfg := &responseSkipConfig{skipPathsExact: make(map[string]struct{})}
 	for _, opt := range opts {
 		opt(cfg)
 	}
 	return cfg
 }
 
-// WithSkipPaths 声明精确匹配的跳过路径：命中即整请求不做统一包壳。
+// WithSkipPaths 声明跳过统一包壳的路径：字面路径精确命中（历史语义），
+// 同时按 glob 匹配（pathx.MatchesPath，与 AccessLog/Prometheus 同 matcher，
+// #299）——"/internal/**" 豁免整棵子树，"/health*" 命中同段前缀；
+// `*` 单段不跨 "/"，"/internal/*" 只命中直接子路径。要同时豁免裸父路径与
+// 子树时并列声明 {"/internal", "/internal/**"}（pathx "**" 不匹配裸父）。
 // 适合 OIDC/JWKS 等 RFC 标准端点的静态路径清单。
 //
 // 用法:
 //
-//	mw.ResponseMiddleware(mw.WithSkipPaths("/token", "/jwks.json"))
+//	mw.ResponseMiddleware(mw.WithSkipPaths("/token", "/jwks.json", "/internal/**"))
 func WithSkipPaths(paths ...string) ResponseOption {
 	return func(c *responseSkipConfig) {
 		for _, p := range paths {
-			c.skipPaths[p] = struct{}{}
+			c.skipPathsExact[p] = struct{}{}
+			c.skipPaths = append(c.skipPaths, p)
 		}
 	}
 }
@@ -312,7 +330,7 @@ func hasCodeField(body []byte) bool {
 	inString := false
 	escaped := false
 
-	for i := 0; i < len(s); i++ {
+	for i := range len(s) {
 		b := s[i]
 
 		if inString {
